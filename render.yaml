@@ -12,7 +12,6 @@ services:
     dockerContext: .
     autoDeployTrigger: "off"
     healthCheckPath: /health
-    maxShutdownDelaySeconds: 30
     disk:
       name: gmv-max-data
       mountPath: /app/data
