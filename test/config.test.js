@@ -141,7 +141,12 @@ test("dynamic selector requires an exact selector and executable identities", ()
 test("observe-and-pin with chrome-ui telemetry is the only storeless client branch", () => {
   const input = dynamicInput({
     shopBinding: { mode: "observe-and-pin" },
-    telemetry: { source: "chrome-ui", browserProfile: "Whalebuddy Ads", tabGroup: "Ppan" }
+    telemetry: {
+      source: "chrome-ui",
+      browserProfile: "Whalebuddy Ads",
+      tabGroup: "Ppan",
+      businessCenterId: "7627179356976201745"
+    }
   });
   delete input.clients[0].storeId;
   delete input.clients[0].storeAuthorizedBcId;
@@ -151,7 +156,12 @@ test("observe-and-pin with chrome-ui telemetry is the only storeless client bran
   assert.deepEqual(client.telemetry, {
     source: "chrome-ui",
     browserProfile: "Whalebuddy Ads",
-    tabGroup: "Ppan"
+    tabGroup: "Ppan",
+    businessCenterId: "7627179356976201745",
+    sellerMode: "withoutShop",
+    pageType: "live",
+    schemaVersion: 1,
+    maxSnapshotAgeSeconds: 900
   });
   assert.equal(Object.hasOwn(client, "storeId"), false);
   assert.equal(Object.hasOwn(client, "storeAuthorizedBcId"), false);
@@ -171,37 +181,54 @@ test("observe-and-pin schema rejects partial or inexact authority declarations",
     () => validateConfig(dynamicInput({ telemetry: {
       source: "chrome-ui",
       browserProfile: "Whalebuddy Ads",
-      tabGroup: "Ppan"
+      tabGroup: "Ppan",
+      businessCenterId: "7627179356976201745"
     } })),
     /must be configured together/
   );
   assert.throws(
     () => validateConfig(dynamicInput({
       shopBinding: { mode: "manual" },
-      telemetry: { source: "chrome-ui", browserProfile: "Whalebuddy Ads", tabGroup: "Ppan" }
+      telemetry: {
+        source: "chrome-ui",
+        browserProfile: "Whalebuddy Ads",
+        tabGroup: "Ppan",
+        businessCenterId: "7627179356976201745"
+      }
     })),
     /mode must be observe-and-pin/
   );
   assert.throws(
     () => validateConfig(dynamicInput({
       shopBinding: { mode: "observe-and-pin" },
-      telemetry: { source: "tiktok-api", browserProfile: "Whalebuddy Ads", tabGroup: "Ppan" }
+      telemetry: {
+        source: "tiktok-api",
+        browserProfile: "Whalebuddy Ads",
+        tabGroup: "Ppan",
+        businessCenterId: "7627179356976201745"
+      }
     })),
     /source must be chrome-ui/
   );
 
   const partialIdentity = dynamicInput({
     shopBinding: { mode: "observe-and-pin" },
-    telemetry: { source: "chrome-ui", browserProfile: "Whalebuddy Ads", tabGroup: "Ppan" }
+    telemetry: {
+      source: "chrome-ui",
+      browserProfile: "Whalebuddy Ads",
+      tabGroup: "Ppan",
+      businessCenterId: "7627179356976201745"
+    }
   });
   delete partialIdentity.clients[0].storeId;
   assert.throws(() => validateConfig(partialIdentity), /must both be present or both be absent/);
 
-  for (const missing of ["browserProfile", "tabGroup"]) {
+  for (const missing of ["browserProfile", "tabGroup", "businessCenterId"]) {
     const telemetry = {
       source: "chrome-ui",
       browserProfile: "Whalebuddy Ads",
-      tabGroup: "Ppan"
+      tabGroup: "Ppan",
+      businessCenterId: "7627179356976201745"
     };
     delete telemetry[missing];
     assert.throws(
@@ -210,6 +237,29 @@ test("observe-and-pin schema rejects partial or inexact authority declarations",
         telemetry
       })),
       new RegExp(missing)
+    );
+  }
+});
+
+test("chrome telemetry schema is versioned and bounds snapshot freshness", () => {
+  const base = {
+    source: "chrome-ui",
+    browserProfile: "Whalebuddy Ads",
+    tabGroup: "Ppan",
+    businessCenterId: "7627179356976201745"
+  };
+  for (const [field, value, expected] of [
+    ["schemaVersion", 2, /schemaVersion must be 1/],
+    ["maxSnapshotAgeSeconds", 59, /between 60 and 3600/],
+    ["maxSnapshotAgeSeconds", 3601, /between 60 and 3600/],
+    ["maxSnapshotAgeSeconds", 90.5, /between 60 and 3600/]
+  ]) {
+    assert.throws(
+      () => validateConfig(dynamicInput({
+        shopBinding: { mode: "observe-and-pin" },
+        telemetry: { ...base, [field]: value }
+      })),
+      expected
     );
   }
 });

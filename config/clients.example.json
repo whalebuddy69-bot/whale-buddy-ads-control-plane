@@ -39,7 +39,12 @@
       "telemetry": {
         "source": "chrome-ui",
         "browserProfile": "Whalebuddy Ads",
-        "tabGroup": "Ppan"
+        "tabGroup": "Ppan",
+        "businessCenterId": "TIKTOK_BUSINESS_CENTER_ID",
+        "sellerMode": "withoutShop",
+        "pageType": "live",
+        "schemaVersion": 1,
+        "maxSnapshotAgeSeconds": 900
       },
       "timezone": "Asia/Bangkok",
       "liveWindow": {

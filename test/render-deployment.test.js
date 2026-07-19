@@ -41,11 +41,19 @@ test("Render Blueprint is locked to the safe single-instance control plane", () 
     "CONTROL_PLANE_ONLY",
     "EXECUTION_ENABLED",
     "MONITOR_ENABLED",
-    "STARTUP_VALIDATION_ENABLED"
+    "STARTUP_VALIDATION_ENABLED",
+    "CHROME_TELEMETRY_ENABLED"
   ]) {
-    const value = flag === "CONTROL_PLANE_ONLY" ? "true" : "false";
+    const value = ["CONTROL_PLANE_ONLY", "CHROME_TELEMETRY_ENABLED"].includes(flag)
+      ? "true"
+      : "false";
     assert.match(blueprint, new RegExp(`- key: ${flag}\\n\\s+value: [\"']${value}[\"']`));
   }
+
+  assert.match(
+    blueprint,
+    /- key: CHROME_TELEMETRY_MAX_CLOCK_SKEW_SECONDS\n\s+value: [\"']300[\"']/
+  );
 
   assert.match(blueprint, /- key: ADMIN_API_KEY\n\s+generateValue: true/);
   assert.match(blueprint, /- key: LINE_CHANNEL_SECRET\n\s+sync: false/);

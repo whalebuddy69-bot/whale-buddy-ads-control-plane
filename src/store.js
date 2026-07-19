@@ -77,6 +77,17 @@ function leaseDuration(value) {
   return duration;
 }
 
+function safeMinor(value, field, { positive = false } = {}) {
+  if (!Number.isSafeInteger(value) || value < 0 || (positive && value === 0)) {
+    throw new DomainError(
+      'INVALID_REQUEST',
+      `${field} must be a ${positive ? 'positive' : 'non-negative'} safe integer`,
+      { field },
+    );
+  }
+  return value;
+}
+
 /**
  * Synchronous SQLite repository. A BEGIN IMMEDIATE transaction plus a
  * state/version compare-and-set makes approval single-use, including when more
@@ -171,6 +182,89 @@ export class SqliteStore {
         CHECK(invalidated_at IS NULL OR invalidated_at >= created_at)
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS telemetry_enrollments (
+        id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        code_hash TEXT NOT NULL
+          CHECK(length(code_hash) = 64 AND code_hash NOT GLOB '*[^0-9a-f]*'),
+        browser_profile TEXT NOT NULL,
+        tab_group TEXT NOT NULL,
+        business_center_id TEXT NOT NULL,
+        seller_mode TEXT NOT NULL,
+        page_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        invalidated_at TEXT,
+        UNIQUE(client_id, code_hash),
+        CHECK(expires_at > created_at),
+        CHECK(consumed_at IS NULL OR invalidated_at IS NULL)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS telemetry_credentials (
+        credential_id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        installation_id TEXT NOT NULL,
+        public_key_jwk TEXT NOT NULL,
+        browser_profile TEXT NOT NULL,
+        tab_group TEXT NOT NULL,
+        business_center_id TEXT NOT NULL,
+        seller_mode TEXT NOT NULL,
+        page_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        revoked_at TEXT,
+        enrollment_id TEXT NOT NULL,
+        FOREIGN KEY(enrollment_id) REFERENCES telemetry_enrollments(id)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS telemetry_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        advertiser_id TEXT NOT NULL,
+        business_center_id TEXT NOT NULL,
+        seller_mode TEXT NOT NULL,
+        page_type TEXT NOT NULL,
+        tiktok_account_id TEXT NOT NULL,
+        campaign_id TEXT,
+        campaign_ref TEXT NOT NULL,
+        campaign_name TEXT NOT NULL,
+        campaign_type TEXT NOT NULL CHECK(campaign_type = 'LIVE_GMV_MAX'),
+        campaign_status TEXT NOT NULL CHECK(campaign_status = 'ACTIVE'),
+        currency TEXT NOT NULL CHECK(currency = 'THB'),
+        schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+        ui_schema_fingerprint TEXT NOT NULL,
+        daily_budget_minor INTEGER NOT NULL CHECK(daily_budget_minor > 0),
+        total_budget_minor INTEGER NOT NULL CHECK(total_budget_minor > 0),
+        cost_minor INTEGER NOT NULL CHECK(cost_minor >= 0),
+        net_cost_minor INTEGER NOT NULL CHECK(net_cost_minor >= 0),
+        policy_cap_minor INTEGER NOT NULL CHECK(policy_cap_minor > 0),
+        over_policy_cap INTEGER NOT NULL CHECK(over_policy_cap IN (0, 1)),
+        observed_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        source_browser_profile TEXT NOT NULL,
+        source_tab_group TEXT NOT NULL,
+        payload_hash TEXT NOT NULL
+          CHECK(length(payload_hash) = 64 AND payload_hash NOT GLOB '*[^0-9a-f]*'),
+        FOREIGN KEY(credential_id) REFERENCES telemetry_credentials(credential_id)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS telemetry_latest (
+        client_id TEXT PRIMARY KEY,
+        snapshot_id TEXT NOT NULL UNIQUE,
+        observed_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        FOREIGN KEY(snapshot_id) REFERENCES telemetry_snapshots(snapshot_id)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS telemetry_nonces (
+        credential_id TEXT NOT NULL,
+        nonce TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        PRIMARY KEY(credential_id, nonce),
+        FOREIGN KEY(credential_id) REFERENCES telemetry_credentials(credential_id)
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS audit_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         request_id TEXT,
@@ -214,6 +308,19 @@ export class SqliteStore {
         WHERE consumed_at IS NULL AND invalidated_at IS NULL;
       CREATE INDEX IF NOT EXISTS line_pairing_tokens_lookup_idx
         ON line_pairing_tokens(client_id, code_hash);
+      CREATE UNIQUE INDEX IF NOT EXISTS telemetry_enrollments_one_open_idx
+        ON telemetry_enrollments(client_id)
+        WHERE consumed_at IS NULL AND invalidated_at IS NULL;
+      DROP INDEX IF EXISTS telemetry_credentials_one_active_install_idx;
+      CREATE UNIQUE INDEX IF NOT EXISTS telemetry_credentials_one_active_client_idx
+        ON telemetry_credentials(client_id)
+        WHERE revoked_at IS NULL;
+      CREATE INDEX IF NOT EXISTS telemetry_credentials_client_idx
+        ON telemetry_credentials(client_id, revoked_at, created_at);
+      CREATE INDEX IF NOT EXISTS telemetry_snapshots_client_time_idx
+        ON telemetry_snapshots(client_id, observed_at DESC, received_at DESC);
+      CREATE INDEX IF NOT EXISTS telemetry_nonces_received_idx
+        ON telemetry_nonces(received_at);
       CREATE INDEX IF NOT EXISTS audit_events_request_idx
         ON audit_events(request_id, sequence);
     `);
@@ -741,6 +848,438 @@ export class SqliteStore {
       WHERE client_id = ? AND line_user_id = ? AND active = 1
     `).get(normalizedClientId, normalizedLineUserId);
     return Boolean(row);
+  }
+
+  /**
+   * Creates a short-lived, single-use bootstrap code for one Chrome telemetry
+   * client. Only the SHA-256 hash crosses the storage boundary. Creating a new
+   * challenge invalidates any older unused challenge for the same client.
+   */
+  createTelemetryEnrollment({
+    clientId,
+    codeHash,
+    browserProfile,
+    tabGroup,
+    businessCenterId,
+    sellerMode,
+    pageType,
+    createdAt,
+    expiresAt,
+  } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedHash = sha256Hash(codeHash);
+    const normalizedProfile = requiredString(browserProfile, 'browserProfile');
+    const normalizedTabGroup = requiredString(tabGroup, 'tabGroup');
+    const normalizedBusinessCenterId = requiredString(businessCenterId, 'businessCenterId');
+    const normalizedSellerMode = requiredString(sellerMode, 'sellerMode');
+    const normalizedPageType = requiredString(pageType, 'pageType');
+    const created = requiredIsoTime(createdAt, 'createdAt');
+    const expires = requiredIsoTime(expiresAt, 'expiresAt');
+    if (Date.parse(expires) <= Date.parse(created)) {
+      throw new DomainError('INVALID_REQUEST', 'expiresAt must be later than createdAt');
+    }
+
+    return this.#transaction(() => {
+      const invalidated = this.db.prepare(`
+        UPDATE telemetry_enrollments
+        SET invalidated_at = ?
+        WHERE client_id = ? AND consumed_at IS NULL AND invalidated_at IS NULL
+      `).run(created, normalizedClientId);
+      const enrollmentId = `te_${randomUUID()}`;
+      this.db.prepare(`
+        INSERT INTO telemetry_enrollments
+          (id, client_id, code_hash, browser_profile, tab_group,
+           business_center_id, seller_mode, page_type, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        enrollmentId,
+        normalizedClientId,
+        normalizedHash,
+        normalizedProfile,
+        normalizedTabGroup,
+        normalizedBusinessCenterId,
+        normalizedSellerMode,
+        normalizedPageType,
+        created,
+        expires,
+      );
+      this.#insertAudit({
+        eventType: 'TELEMETRY_ENROLLMENT_CREATED',
+        actorType: 'ADMIN',
+        occurredAt: created,
+        details: {
+          enrollmentId,
+          clientId: normalizedClientId,
+          expiresAt: expires,
+          invalidatedCount: Number(invalidated.changes),
+        },
+      });
+      return Object.freeze({
+        enrollmentId,
+        clientId: normalizedClientId,
+        browserProfile: normalizedProfile,
+        tabGroup: normalizedTabGroup,
+        businessCenterId: normalizedBusinessCenterId,
+        sellerMode: normalizedSellerMode,
+        pageType: normalizedPageType,
+        createdAt: created,
+        expiresAt: expires,
+        invalidatedCount: Number(invalidated.changes),
+      });
+    });
+  }
+
+  #mapTelemetryCredential(row) {
+    return Object.freeze({
+      credentialId: row.credential_id,
+      clientId: row.client_id,
+      installationId: row.installation_id,
+      publicKeyJwk: Object.freeze(parseJson(row.public_key_jwk)),
+      browserProfile: row.browser_profile,
+      tabGroup: row.tab_group,
+      businessCenterId: row.business_center_id,
+      sellerMode: row.seller_mode,
+      pageType: row.page_type,
+      createdAt: row.created_at,
+      revokedAt: row.revoked_at,
+    });
+  }
+
+  getTelemetryCredential(credentialId) {
+    const row = this.db.prepare(`
+      SELECT credential_id, client_id, installation_id, public_key_jwk,
+             browser_profile, tab_group, business_center_id, seller_mode,
+             page_type, created_at, revoked_at
+      FROM telemetry_credentials
+      WHERE credential_id = ?
+    `).get(requiredString(credentialId, 'credentialId'));
+    return row ? this.#mapTelemetryCredential(row) : null;
+  }
+
+  /**
+   * Exchanges one bootstrap hash for a public-key credential. The extension's
+   * private P-256 key never leaves Chrome. Re-enrolling a client revokes its
+   * prior collector atomically, preventing competing latest snapshots.
+   */
+  consumeTelemetryEnrollment({
+    clientId,
+    codeHash,
+    installationId,
+    publicKeyJwk,
+    consumedAt,
+  } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedHash = sha256Hash(codeHash);
+    const normalizedInstallationId = requiredString(installationId, 'installationId');
+    const publicKeyJson = json(publicKeyJwk, 'publicKeyJwk');
+    const at = requiredIsoTime(consumedAt, 'consumedAt');
+
+    return this.#transaction(() => {
+      const enrollment = this.db.prepare(`
+        SELECT id, browser_profile, tab_group, business_center_id, seller_mode,
+               page_type, created_at, expires_at,
+               consumed_at, invalidated_at
+        FROM telemetry_enrollments
+        WHERE client_id = ? AND code_hash = ?
+      `).get(normalizedClientId, normalizedHash);
+      if (
+        !enrollment ||
+        enrollment.consumed_at !== null ||
+        enrollment.invalidated_at !== null ||
+        Date.parse(at) < Date.parse(enrollment.created_at) ||
+        Date.parse(at) >= Date.parse(enrollment.expires_at)
+      ) {
+        throw new DomainError(
+          'TELEMETRY_ENROLLMENT_INVALID',
+          'Telemetry enrollment code is invalid or expired',
+          { clientId: normalizedClientId },
+        );
+      }
+      const consumed = this.db.prepare(`
+        UPDATE telemetry_enrollments
+        SET consumed_at = ?
+        WHERE id = ? AND consumed_at IS NULL AND invalidated_at IS NULL
+          AND created_at <= ? AND expires_at > ?
+      `).run(at, enrollment.id, at, at);
+      if (consumed.changes !== 1) {
+        throw new DomainError('CONCURRENT_MODIFICATION', 'Telemetry enrollment changed concurrently');
+      }
+
+      const revoked = this.db.prepare(`
+        UPDATE telemetry_credentials
+        SET revoked_at = ?
+        WHERE client_id = ? AND revoked_at IS NULL
+      `).run(at, normalizedClientId);
+      const credentialId = `tc_${randomUUID()}`;
+      this.db.prepare(`
+        INSERT INTO telemetry_credentials
+          (credential_id, client_id, installation_id, public_key_jwk,
+           browser_profile, tab_group, business_center_id, seller_mode,
+           page_type, created_at, enrollment_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        credentialId,
+        normalizedClientId,
+        normalizedInstallationId,
+        publicKeyJson,
+        enrollment.browser_profile,
+        enrollment.tab_group,
+        enrollment.business_center_id,
+        enrollment.seller_mode,
+        enrollment.page_type,
+        at,
+        enrollment.id,
+      );
+      this.#insertAudit({
+        eventType: 'TELEMETRY_CREDENTIAL_ENROLLED',
+        actorType: 'CHROME_EXTENSION',
+        actorId: credentialId,
+        occurredAt: at,
+        details: {
+          enrollmentId: enrollment.id,
+          clientId: normalizedClientId,
+          installationId: normalizedInstallationId,
+          replacedCredentialCount: Number(revoked.changes),
+        },
+      });
+      return this.getTelemetryCredential(credentialId);
+    });
+  }
+
+  #mapTelemetrySnapshot(row) {
+    return Object.freeze({
+      snapshotId: row.snapshot_id,
+      clientId: row.client_id,
+      advertiserId: row.advertiser_id,
+      businessCenterId: row.business_center_id,
+      sellerMode: row.seller_mode,
+      pageType: row.page_type,
+      tiktokAccountId: row.tiktok_account_id,
+      campaignId: row.campaign_id,
+      campaignRef: row.campaign_ref,
+      campaignName: row.campaign_name,
+      campaignType: row.campaign_type,
+      campaignStatus: row.campaign_status,
+      currency: row.currency,
+      schemaVersion: row.schema_version,
+      uiSchemaFingerprint: row.ui_schema_fingerprint,
+      dailyBudgetMinor: row.daily_budget_minor,
+      totalBudgetMinor: row.total_budget_minor,
+      costMinor: row.cost_minor,
+      netCostMinor: row.net_cost_minor,
+      observedAt: row.observed_at,
+      receivedAt: row.received_at,
+      source: Object.freeze({
+        browserProfile: row.source_browser_profile,
+        tabGroup: row.source_tab_group,
+      }),
+      policy: Object.freeze({
+        maxDailyBudgetMinor: row.policy_cap_minor,
+        overDailyBudgetCap: row.over_policy_cap === 1,
+      }),
+    });
+  }
+
+  #telemetrySnapshotSelect() {
+    return `
+      SELECT snapshot_id, client_id, advertiser_id, business_center_id,
+             seller_mode, page_type, tiktok_account_id, campaign_id,
+             campaign_ref, campaign_name, campaign_type, campaign_status,
+             currency, schema_version, ui_schema_fingerprint,
+             daily_budget_minor, total_budget_minor, cost_minor, net_cost_minor,
+             policy_cap_minor, over_policy_cap, observed_at, received_at,
+             source_browser_profile, source_tab_group
+      FROM telemetry_snapshots
+    `;
+  }
+
+  getTelemetrySnapshot(snapshotId) {
+    const row = this.db.prepare(`${this.#telemetrySnapshotSelect()} WHERE snapshot_id = ?`)
+      .get(requiredString(snapshotId, 'snapshotId'));
+    return row ? this.#mapTelemetrySnapshot(row) : null;
+  }
+
+  getLatestTelemetry({ clientId } = {}) {
+    const row = this.db.prepare(`
+      ${this.#telemetrySnapshotSelect()}
+      WHERE snapshot_id = (
+        SELECT snapshot_id FROM telemetry_latest WHERE client_id = ?
+      )
+    `).get(requiredString(clientId, 'clientId'));
+    return row ? this.#mapTelemetrySnapshot(row) : null;
+  }
+
+  listLatestTelemetry({ clientId, limit = 100 } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new DomainError('INVALID_REQUEST', 'limit must be an integer between 1 and 1000');
+    }
+    const where = clientId === undefined ? '' : 'WHERE l.client_id = ?';
+    const parameters = clientId === undefined ? [] : [requiredString(clientId, 'clientId')];
+    return this.db.prepare(`
+      SELECT s.snapshot_id, s.client_id, s.advertiser_id, s.business_center_id,
+             s.seller_mode, s.page_type, s.tiktok_account_id, s.campaign_id,
+             s.campaign_ref, s.campaign_name, s.campaign_type, s.campaign_status,
+             s.currency, s.schema_version, s.ui_schema_fingerprint,
+             s.daily_budget_minor, s.total_budget_minor, s.cost_minor, s.net_cost_minor,
+             s.policy_cap_minor, s.over_policy_cap, s.observed_at, s.received_at,
+             s.source_browser_profile, s.source_tab_group
+      FROM telemetry_latest l
+      JOIN telemetry_snapshots s ON s.snapshot_id = l.snapshot_id
+      ${where}
+      ORDER BY s.observed_at DESC, s.client_id ASC
+      LIMIT ?
+    `).all(...parameters, limit).map((row) => this.#mapTelemetrySnapshot(row));
+  }
+
+  listTelemetrySnapshots({ clientId, limit = 100 } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new DomainError('INVALID_REQUEST', 'limit must be an integer between 1 and 1000');
+    }
+    const where = clientId === undefined ? '' : 'WHERE client_id = ?';
+    const parameters = clientId === undefined ? [] : [requiredString(clientId, 'clientId')];
+    return this.db.prepare(`
+      ${this.#telemetrySnapshotSelect()}
+      ${where}
+      ORDER BY observed_at DESC, received_at DESC, snapshot_id DESC
+      LIMIT ?
+    `).all(...parameters, limit).map((row) => this.#mapTelemetrySnapshot(row));
+  }
+
+  /**
+   * Records a verified snapshot and one request nonce atomically. The latest
+   * pointer advances only by observation time; an older collector retry is
+   * retained for audit but cannot roll monitoring state backwards.
+   */
+  recordTelemetrySnapshot({
+    snapshot,
+    credentialId,
+    nonce,
+    payloadHash,
+    receivedAt,
+    pruneNoncesBefore,
+  } = {}) {
+    if (!snapshot || typeof snapshot !== 'object') {
+      throw new DomainError('INVALID_REQUEST', 'snapshot must be an object');
+    }
+    const normalizedCredentialId = requiredString(credentialId, 'credentialId');
+    const normalizedNonce = requiredString(nonce, 'nonce');
+    const normalizedHash = sha256Hash(payloadHash, 'payloadHash');
+    const received = requiredIsoTime(receivedAt, 'receivedAt');
+    const pruneBefore = requiredIsoTime(pruneNoncesBefore, 'pruneNoncesBefore');
+
+    return this.#transaction(() => {
+      const credential = this.getTelemetryCredential(normalizedCredentialId);
+      if (!credential || credential.revokedAt !== null || credential.clientId !== snapshot.clientId) {
+        throw new DomainError('TELEMETRY_CREDENTIAL_REVOKED', 'Telemetry credential is not active');
+      }
+      this.db.prepare('DELETE FROM telemetry_nonces WHERE received_at < ?').run(pruneBefore);
+      const nonceResult = this.db.prepare(`
+        INSERT OR IGNORE INTO telemetry_nonces (credential_id, nonce, received_at)
+        VALUES (?, ?, ?)
+      `).run(normalizedCredentialId, normalizedNonce, received);
+      if (nonceResult.changes !== 1) {
+        throw new DomainError('TELEMETRY_REPLAY', 'Telemetry nonce has already been used');
+      }
+
+      const existing = this.db.prepare(`
+        SELECT payload_hash FROM telemetry_snapshots WHERE snapshot_id = ?
+      `).get(requiredString(snapshot.snapshotId, 'snapshot.snapshotId'));
+      if (existing) {
+        if (existing.payload_hash !== normalizedHash) {
+          throw new DomainError(
+            'TELEMETRY_SNAPSHOT_CONFLICT',
+            'snapshotId was already used for a different payload',
+          );
+        }
+        return Object.freeze({
+          accepted: true,
+          duplicate: true,
+          latest: this.getLatestTelemetry({ clientId: snapshot.clientId })?.snapshotId === snapshot.snapshotId,
+          snapshot: this.getTelemetrySnapshot(snapshot.snapshotId),
+        });
+      }
+
+      this.db.prepare(`
+        INSERT INTO telemetry_snapshots
+          (snapshot_id, credential_id, client_id, advertiser_id, business_center_id,
+           seller_mode, page_type, tiktok_account_id, campaign_id, campaign_ref,
+           campaign_name, campaign_type, campaign_status, currency,
+           schema_version, ui_schema_fingerprint, daily_budget_minor,
+           total_budget_minor, cost_minor, net_cost_minor, policy_cap_minor,
+           over_policy_cap, observed_at, received_at, source_browser_profile,
+           source_tab_group, payload_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        snapshot.snapshotId,
+        normalizedCredentialId,
+        snapshot.clientId,
+        snapshot.advertiserId,
+        snapshot.businessCenterId,
+        snapshot.sellerMode,
+        snapshot.pageType,
+        snapshot.tiktokAccountId,
+        snapshot.campaignId,
+        snapshot.campaignRef,
+        snapshot.campaignName,
+        snapshot.campaignType,
+        snapshot.campaignStatus,
+        snapshot.currency,
+        snapshot.schemaVersion,
+        snapshot.uiSchemaFingerprint,
+        safeMinor(snapshot.dailyBudgetMinor, 'snapshot.dailyBudgetMinor', { positive: true }),
+        safeMinor(snapshot.totalBudgetMinor, 'snapshot.totalBudgetMinor', { positive: true }),
+        safeMinor(snapshot.costMinor, 'snapshot.costMinor'),
+        safeMinor(snapshot.netCostMinor, 'snapshot.netCostMinor'),
+        safeMinor(snapshot.policy?.maxDailyBudgetMinor, 'snapshot.policy.maxDailyBudgetMinor', { positive: true }),
+        snapshot.policy?.overDailyBudgetCap === true ? 1 : 0,
+        requiredIsoTime(snapshot.observedAt, 'snapshot.observedAt'),
+        received,
+        requiredString(snapshot.source?.browserProfile, 'snapshot.source.browserProfile'),
+        requiredString(snapshot.source?.tabGroup, 'snapshot.source.tabGroup'),
+        normalizedHash,
+      );
+
+      this.db.prepare(`
+        INSERT INTO telemetry_latest (client_id, snapshot_id, observed_at, received_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(client_id) DO UPDATE SET
+          snapshot_id = excluded.snapshot_id,
+          observed_at = excluded.observed_at,
+          received_at = excluded.received_at
+        WHERE excluded.observed_at > telemetry_latest.observed_at
+           OR (
+             excluded.observed_at = telemetry_latest.observed_at
+             AND excluded.received_at > telemetry_latest.received_at
+           )
+      `).run(snapshot.clientId, snapshot.snapshotId, snapshot.observedAt, received);
+      const isLatest = this.getLatestTelemetry({ clientId: snapshot.clientId })?.snapshotId === snapshot.snapshotId;
+      this.#insertAudit({
+        eventType: isLatest ? 'CHROME_TELEMETRY_ACCEPTED' : 'CHROME_TELEMETRY_OLDER_ACCEPTED',
+        actorType: 'CHROME_EXTENSION',
+        actorId: normalizedCredentialId,
+        occurredAt: received,
+        details: {
+          snapshotId: snapshot.snapshotId,
+          clientId: snapshot.clientId,
+          advertiserId: snapshot.advertiserId,
+          businessCenterId: snapshot.businessCenterId,
+          campaignId: snapshot.campaignId,
+          campaignRef: snapshot.campaignRef,
+          dailyBudgetMinor: snapshot.dailyBudgetMinor,
+          totalBudgetMinor: snapshot.totalBudgetMinor,
+          costMinor: snapshot.costMinor,
+          netCostMinor: snapshot.netCostMinor,
+          observedAt: snapshot.observedAt,
+          latest: isLatest,
+        },
+      });
+      return Object.freeze({
+        accepted: true,
+        duplicate: false,
+        latest: isLatest,
+        snapshot: this.getTelemetrySnapshot(snapshot.snapshotId),
+      });
+    });
   }
 
   #mapExecutionJob(row) {

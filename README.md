@@ -2,7 +2,7 @@
 
 ระบบ MVP สำหรับเฝ้าระวังงบ TikTok Shop LIVE GMV Max, ขออนุมัติผ่าน LINE และแก้ daily budget ผ่าน TikTok API for Business โดยตรง
 
-สถานะปัจจุบัน: LINE control plane และ guardrails พร้อม deploy แบบปลอดภัย แต่ Chrome background telemetry adapter ยังอยู่ในขั้นถัดไป ค่าเริ่มต้น **ไม่อนุญาตให้ monitor หรือแก้งบจริง**
+สถานะปัจจุบัน: LINE control plane, backend รับ Chrome telemetry แบบ signed/read-only และ MV3 extension สำหรับอ่านหน้า TikTok พร้อมทดสอบแล้ว ค่าเริ่มต้น **ยังไม่อนุญาตให้ monitor หรือแก้งบจริง** จนกว่าจะ deploy, enroll และผ่านการตรวจ snapshot จริง
 
 ## Flow
 
@@ -24,7 +24,9 @@ flowchart LR
 
 สำหรับแคมเปญ LIVE ที่ TikTok สร้างใหม่ทุกวัน ระบบรองรับ dynamic selector:
 
-`client → Chrome profile + tab group → advertiser_id → TikTok account ID → Active LIVE GMV Max ของวันนั้น (ต้องตรงเพียง 1 แคมเปญ)`
+`client → Chrome profile + tab group → Business Center + advertiser_id → TikTok account ID → Active LIVE GMV Max ของวันนั้น`
+
+หน้า Chrome ไม่เปิดเผย campaign ID ของแถว LIVE จึงเก็บ `campaignId=null` และใช้ `campaignRef` ที่ hash จาก advertiser + ชื่อแคมเปญแทน ห้ามเดา ID; ขั้น API execution ในอนาคตต้อง resolve ID จริงและยืนยันว่าแคมเปญตรงเพียงหนึ่งรายการอีกครั้ง
 
 client แบบ `observe-and-pin` ไม่ต้องให้ผู้ใช้กรอก Store ID หรือเปิด Seller Center ระบบจะอ่าน Shop identity จาก campaign detail เมื่อมี TikTok API แล้วและ pin ค่าไว้ภายใน; Shop context ยังไม่ถูกละทิ้งจากการตรวจ API
 
@@ -154,6 +156,9 @@ curl -X POST https://YOUR_PUBLIC_HOST/admin/requests \
 - สถานะ reconcile สำหรับ timeout/ผลเขียนที่ยังไม่แน่ชัด ป้องกันรายงานล้มเหลวผิดและเพิ่มซ้ำ
 - notification retry key คงที่สำหรับ LINE push และ background retry
 - ตีความ LINE `409` + `x-line-accepted-request-id` เป็นคำขอที่รับไว้แล้ว ป้องกัน retry ซ้ำแบบผิดพลาด
+- Chrome extension enrollment ใช้รหัสครั้งเดียวและ P-256 ต่อ installation; private key ไม่ออกจาก Chrome
+- signed telemetry มี timestamp + nonce ป้องกัน replay และล็อก client/profile/tab/BC/advertiser/account
+- fingerprint ของ UI header map ป้องกัน parser drift และแยก daily budget, total budget, Cost, Net Cost ชัดเจน
 
 ## ข้อจำกัด monitoring ที่ต้องรู้
 
@@ -177,6 +182,11 @@ npm start
 ```
 
 Endpoints:
+
+- `POST /admin/telemetry/enrollments` ออกรหัส enrollment ครั้งเดียว (ต้องใช้ admin bearer)
+- `POST /telemetry/chrome/enroll` ลงทะเบียน public key ของ extension
+- `POST /telemetry/chrome/snapshots` รับ snapshot ที่เซ็นแล้วเท่านั้น
+- `GET /admin/telemetry/latest?clientId=...` อ่าน snapshot ล่าสุด (ต้องใช้ admin bearer)
 
 - `GET /health`
 - `POST /webhooks/line`

@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Whale Buddy LIVE GMV</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body class="popup-page">
+    <main class="popup-shell">
+      <header class="brand-row">
+        <div class="brand-mark" aria-hidden="true">W</div>
+        <div>
+          <h1>Whale Buddy LIVE</h1>
+          <p class="eyebrow">GMV Max Telemetry</p>
+        </div>
+        <span id="status-dot" class="status-dot" aria-hidden="true"></span>
+      </header>
+
+      <section class="safety-strip" aria-label="โหมดการทำงาน">
+        <span aria-hidden="true">👁</span>
+        อ่านอย่างเดียว · ไม่มีสิทธิ์แก้งบ
+      </section>
+
+      <section class="status-card" aria-live="polite">
+        <span id="status-label" class="status-pill">กำลังตรวจสอบ</span>
+        <h2 id="status-message">กำลังอ่านสถานะ…</h2>
+        <p id="status-code" class="technical-code" hidden></p>
+      </section>
+
+      <dl class="binding-grid">
+        <div>
+          <dt>ลูกค้า</dt>
+          <dd id="client-id">punpan_020</dd>
+        </div>
+        <div>
+          <dt>Chrome profile</dt>
+          <dd id="profile-name">Whalebuddy Ads</dd>
+        </div>
+        <div>
+          <dt>กลุ่มแท็บ</dt>
+          <dd id="tab-group">Ppan</dd>
+        </div>
+      </dl>
+
+      <section id="snapshot-card" class="snapshot-card" hidden>
+        <div>
+          <span>ใช้ไป (Cost)</span>
+          <strong id="cost-value">—</strong>
+        </div>
+        <div>
+          <span>งบรายวัน</span>
+          <strong id="budget-value">—</strong>
+        </div>
+        <p id="observed-at">—</p>
+      </section>
+
+      <div class="button-stack">
+        <button id="check-now" class="primary-button" type="button">ตรวจตอนนี้</button>
+        <button id="open-options" class="secondary-button" type="button">ตั้งค่าการเชื่อมต่อ</button>
+      </div>
+    </main>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

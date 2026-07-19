@@ -1,0 +1,42 @@
+{
+  "manifest_version": 3,
+  "name": "Whale Buddy LIVE GMV Telemetry",
+  "version": "0.1.0",
+  "description": "อ่านสถานะ LIVE GMV Max แบบ read-only และส่งข้อมูลไป Whale Buddy Ads",
+  "minimum_chrome_version": "120",
+  "incognito": "not_allowed",
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "permissions": [
+    "alarms",
+    "storage",
+    "tabGroups"
+  ],
+  "host_permissions": [
+    "https://ads.tiktok.com/*",
+    "https://whale-buddy-ads-control-plane.onrender.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://ads.tiktok.com/i18n/gmv-max/dashboard*"
+      ],
+      "js": [
+        "lib/tiktok-parser.js",
+        "content/tiktok-live-gmv-max.js"
+      ],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "action": {
+    "default_title": "Whale Buddy LIVE GMV",
+    "default_popup": "ui/popup.html"
+  },
+  "options_ui": {
+    "page": "ui/options.html",
+    "open_in_tab": true
+  }
+}

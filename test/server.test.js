@@ -7,7 +7,8 @@ import {
   createHttpServer,
   lineWebhookHttpStatus,
   requiredEnvironmentVariables,
-  resolveRuntimeMode
+  resolveRuntimeMode,
+  resolveTelemetryOptions
 } from "../src/server.js";
 
 const adminKey = "x".repeat(43);
@@ -69,7 +70,7 @@ test("control-plane mode overrides mutation flags and does not require TikTok cr
   assert.deepEqual(runtime.adapters.chromeTelemetry, {
     enabled: false,
     source: null,
-    status: "not-implemented"
+    status: "disabled"
   });
   assert.deepEqual(requiredEnvironmentVariables(runtime), [
     "LINE_CHANNEL_SECRET",
@@ -79,6 +80,24 @@ test("control-plane mode overrides mutation flags and does not require TikTok cr
 
   const fullRuntime = resolveRuntimeMode({});
   assert.equal(requiredEnvironmentVariables(fullRuntime).includes("TIKTOK_ACCESS_TOKEN"), true);
+
+  const telemetryRuntime = resolveRuntimeMode({
+    CONTROL_PLANE_ONLY: "true",
+    CHROME_TELEMETRY_ENABLED: "true"
+  });
+  assert.deepEqual(telemetryRuntime.adapters.chromeTelemetry, {
+    enabled: true,
+    source: "signed-http-p256",
+    status: "waiting-for-snapshot"
+  });
+  assert.equal(requiredEnvironmentVariables(telemetryRuntime).includes("CHROME_TELEMETRY_SHARED_SECRET"), false);
+  assert.deepEqual(resolveTelemetryOptions({
+    CHROME_TELEMETRY_MAX_CLOCK_SKEW_SECONDS: "180"
+  }), { maxClockSkewSeconds: 180 });
+  assert.throws(
+    () => resolveTelemetryOptions({ CHROME_TELEMETRY_MAX_CLOCK_SKEW_SECONDS: "10" }),
+    /between 30 and 900/
+  );
 });
 
 test("chrome-ui clients cannot start a runtime monitor before that adapter exists", () => {
@@ -93,7 +112,7 @@ test("chrome-ui clients cannot start a runtime monitor before that adapter exist
   ));
   assert.throws(
     () => assertRuntimeCompatibility(config, resolveRuntimeMode({ CONTROL_PLANE_ONLY: "false" })),
-    /chrome-ui telemetry is not implemented/
+    /cannot drive TikTok runtime monitoring/
   );
 });
 
@@ -141,7 +160,7 @@ test("control-plane HTTP keeps health, LINE webhook, and pairing available", asy
   assert.equal(health.executionEnabled, false);
   assert.equal(health.monitorEnabled, false);
   assert.equal(health.adapters.tiktok.enabled, false);
-  assert.equal(health.adapters.chromeTelemetry.status, "not-implemented");
+  assert.equal(health.adapters.chromeTelemetry.status, "disabled");
 
   const body = JSON.stringify({ events: [{ type: "message" }] });
   const signature = crypto.createHmac("sha256", channelSecret).update(body).digest("base64");

@@ -34,7 +34,7 @@ Policy revision ปัจจุบันคือ `1`: เมื่อยอด�
 
 ## ต้องทำก่อนสร้าง config ใช้งานจริง
 
-1. ทำ Chrome UI telemetry adapter และทดสอบ `observe-and-pin` โดยล็อก profile, tab group, advertiser, campaign และ TikTok account
+1. Deploy backend รุ่น telemetry, ติดตั้ง/enroll MV3 Chrome collector และทดสอบ `observe-and-pin` โดยล็อก profile, tab group, BC, advertiser, TikTok account และ campaignRef (UI ไม่เปิดเผย campaign ID จึงห้ามเดา)
 2. Deploy HTTPS webhook ก่อนเปิด `Use webhook`
 3. จับคู่ LINE user ID ของผู้อนุมัติแบบ one-time pairing
 4. สมัคร TikTok API for Business developer app และ authorize advertiser ก่อนเปิด API write; ระหว่างนี้คง execution เป็น read-only/dry-run

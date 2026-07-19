@@ -72,13 +72,13 @@ Pilot ตรวจหน้า Ads แบบ read-only ผ่าน tab group `P
 1. สร้าง/เลือก Chrome profile สำหรับ TikTok Ads โดยเฉพาะ
 2. ให้ผู้ใช้ login และจัดการ 2FA ด้วยตนเองครั้งแรก
 3. ติดตั้งตัวเชื่อมใน profile นั้น หรือรัน local Playwright/CDP worker ที่เชื่อม outbound ไป control plane
-4. worker อ่านเฉพาะ advertiser ID, campaign ID, spend, budget และ status
+4. worker อ่านเฉพาะ BC/advertiser/TikTok account, ชื่อแคมเปญ, status, daily/total budget และ Cost/Net Cost; ห้ามสร้าง campaign ID ที่ UI ไม่ได้แสดง
 5. approval และ budget mutation ยังใช้ control plane + TikTok API
 6. ถ้า UI แสดง account/shop/currency ไม่ตรง config ให้หยุดทันที
 
 ไม่ควร expose Chrome DevTools port หรือ Mac port ออกอินเทอร์เน็ตโดยตรง
 
-ระหว่างยังไม่มี TikTok Developer App ให้ deploy ด้วย `CONTROL_PLANE_ONLY=true`: LINE webhook, health และ pairing ทำงาน แต่ monitor/execution/TikTok workers ถูกบังคับปิด และ Chrome adapter รายงาน `not-implemented` อย่างชัดเจน
+ระหว่างยังไม่มี TikTok Developer App ให้ deploy ด้วย `CONTROL_PLANE_ONLY=true`: LINE webhook, health, pairing และ backend รับ signed Chrome telemetry ทำงานได้ แต่ monitor/execution/TikTok workers ถูกบังคับปิด Snapshot จึงบันทึก latest/audit เท่านั้นและไม่สร้างคำของบหรือเขียน TikTok
 
 ## Monitoring policy
 

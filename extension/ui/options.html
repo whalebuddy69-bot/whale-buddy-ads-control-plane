@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="th">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>ตั้งค่า Whale Buddy LIVE GMV</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body class="options-page">
+    <main class="options-shell">
+      <header class="options-header">
+        <div class="brand-mark large" aria-hidden="true">W</div>
+        <div>
+          <p class="eyebrow">WHALE BUDDY ADS</p>
+          <h1>เชื่อมต่อ LIVE GMV Max</h1>
+          <p>ตั้งค่าครั้งเดียวใน Chrome profile <strong>Whalebuddy Ads</strong></p>
+        </div>
+      </header>
+
+      <section class="safety-panel">
+        <strong>ปลอดภัยในระยะ Pilot</strong>
+        <p>ส่วนขยายนี้อ่านตัวเลขที่มองเห็นบนหน้า TikTok เท่านั้น ไม่คลิกปุ่ม ไม่อ่านรหัสผ่าน และไม่มีสิทธิ์แก้งบ</p>
+      </section>
+
+      <section class="setup-card">
+        <div class="card-heading">
+          <div>
+            <p class="step-label">ขั้นตอนที่ 1</p>
+            <h2>ตรวจตำแหน่งที่ติดตั้ง</h2>
+          </div>
+          <span id="connection-badge" class="status-pill">กำลังตรวจสอบ</span>
+        </div>
+        <dl class="binding-grid wide">
+          <div><dt>ลูกค้า</dt><dd>punpan_020</dd></div>
+          <div><dt>Chrome profile</dt><dd>Whalebuddy Ads</dd></div>
+          <div><dt>กลุ่มแท็บ TikTok</dt><dd>Ppan</dd></div>
+        </dl>
+        <p class="hint">Chrome ไม่อนุญาตให้ส่วนขยายตรวจชื่อ profile อัตโนมัติ กรุณาดูรูปโปรไฟล์มุมขวาบนว่าเปิดอยู่ใน “Whalebuddy Ads” จริง</p>
+      </section>
+
+      <section class="setup-card">
+        <div class="card-heading">
+          <div>
+            <p class="step-label">ขั้นตอนที่ 2</p>
+            <h2>ใส่รหัสเชื่อมต่อ</h2>
+          </div>
+        </div>
+        <form id="enrollment-form" novalidate>
+          <label for="enrollment-code">รหัสจากผู้ดูแล Whale Buddy Ads</label>
+          <div class="input-row">
+            <input
+              id="enrollment-code"
+              name="enrollmentCode"
+              type="password"
+              inputmode="text"
+              autocomplete="off"
+              spellcheck="false"
+              minlength="43"
+              maxlength="43"
+              placeholder="วางรหัส 43 ตัวอักษร"
+              required
+            >
+            <button id="connect-button" class="primary-button" type="submit">เชื่อมต่อ</button>
+          </div>
+          <p class="hint">รหัสใช้ได้ครั้งเดียวและหมดอายุเร็ว อย่าส่งรหัสผ่านหรือ OTP ของ TikTok</p>
+        </form>
+        <div id="form-result" class="form-result" aria-live="polite" hidden></div>
+      </section>
+
+      <section class="setup-card">
+        <div class="card-heading">
+          <div>
+            <p class="step-label">ขั้นตอนที่ 3</p>
+            <h2>เตรียมแท็บ TikTok</h2>
+          </div>
+        </div>
+        <ol class="plain-steps">
+          <li>เปิดหน้า LIVE GMV Max ของบัญชี punpan_020</li>
+          <li>นำแท็บไว้ในกลุ่มชื่อ <strong>Ppan</strong> เพียงกลุ่มเดียว</li>
+          <li>รีโหลดแท็บหนึ่งครั้งหลังติดตั้งส่วนขยาย</li>
+          <li>กดไอคอนส่วนขยาย แล้วเลือก “ตรวจตอนนี้”</li>
+        </ol>
+      </section>
+
+      <footer class="options-footer">
+        <span id="current-status">กำลังอ่านสถานะ…</span>
+        <button id="manual-check" class="secondary-button" type="button">ตรวจหน้า TikTok ตอนนี้</button>
+      </footer>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

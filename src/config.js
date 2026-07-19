@@ -122,10 +122,35 @@ function normalizeTelemetry(value, label) {
   if (value.source !== "chrome-ui") {
     throw new Error(`${label}.source must be chrome-ui`);
   }
+  const schemaVersion = value.schemaVersion ?? 1;
+  if (schemaVersion !== 1) {
+    throw new Error(`${label}.schemaVersion must be 1`);
+  }
+  const maxSnapshotAgeSeconds = value.maxSnapshotAgeSeconds ?? 900;
+  if (
+    !Number.isInteger(maxSnapshotAgeSeconds) ||
+    maxSnapshotAgeSeconds < 60 ||
+    maxSnapshotAgeSeconds > 3600
+  ) {
+    throw new Error(`${label}.maxSnapshotAgeSeconds must be an integer between 60 and 3600`);
+  }
+  const sellerMode = requiredString(value.sellerMode ?? "withoutShop", `${label}.sellerMode`);
+  if (sellerMode !== "withoutShop") {
+    throw new Error(`${label}.sellerMode must be withoutShop for the storeless pilot`);
+  }
+  const pageType = requiredString(value.pageType ?? "live", `${label}.pageType`);
+  if (pageType !== "live") {
+    throw new Error(`${label}.pageType must be live`);
+  }
   return {
     source: "chrome-ui",
     browserProfile: requiredString(value.browserProfile, `${label}.browserProfile`),
-    tabGroup: requiredString(value.tabGroup, `${label}.tabGroup`)
+    tabGroup: requiredString(value.tabGroup, `${label}.tabGroup`),
+    businessCenterId: requiredString(value.businessCenterId, `${label}.businessCenterId`),
+    sellerMode,
+    pageType,
+    schemaVersion,
+    maxSnapshotAgeSeconds
   };
 }
 

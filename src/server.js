@@ -9,6 +9,15 @@ import { BudgetGuardService } from "./service.js";
 import { SqliteStore } from "./store.js";
 import { TikTokClient } from "./tiktok.js";
 import { LineClient } from "./line.js";
+import {
+  TelemetryError,
+  telemetryCredentialIdFromHeaders,
+  telemetryEnrollmentCodeHash,
+  telemetryPayloadHash,
+  validateTelemetryEnrollmentRequest,
+  validateTelemetrySnapshot,
+  verifyTelemetryRequest
+} from "./telemetry.js";
 
 const MAX_BODY_BYTES = 1_000_000;
 
@@ -20,6 +29,7 @@ function environmentFlag(environment, name, fallback = false) {
 
 export function resolveRuntimeMode(environment = process.env) {
   const controlPlaneOnly = environmentFlag(environment, "CONTROL_PLANE_ONLY", false);
+  const chromeTelemetryEnabled = environmentFlag(environment, "CHROME_TELEMETRY_ENABLED", false);
   return {
     controlPlaneOnly,
     executionEnabled: controlPlaneOnly
@@ -38,12 +48,20 @@ export function resolveRuntimeMode(environment = process.env) {
         source: controlPlaneOnly ? null : "business-api"
       },
       chromeTelemetry: {
-        enabled: false,
-        source: null,
-        status: "not-implemented"
+        enabled: chromeTelemetryEnabled,
+        source: chromeTelemetryEnabled ? "signed-http-p256" : null,
+        status: chromeTelemetryEnabled ? "waiting-for-snapshot" : "disabled"
       }
     }
   };
+}
+
+export function resolveTelemetryOptions(environment = process.env) {
+  const maxClockSkewSeconds = Number(environment.CHROME_TELEMETRY_MAX_CLOCK_SKEW_SECONDS ?? 300);
+  if (!Number.isInteger(maxClockSkewSeconds) || maxClockSkewSeconds < 30 || maxClockSkewSeconds > 900) {
+    throw new Error("CHROME_TELEMETRY_MAX_CLOCK_SKEW_SECONDS must be an integer between 30 and 900");
+  }
+  return Object.freeze({ maxClockSkewSeconds });
 }
 
 export function requiredEnvironmentVariables(runtime) {
@@ -58,14 +76,63 @@ export function assertRuntimeCompatibility(config, runtime) {
     .map((client) => client.id);
   if (!runtime.controlPlaneOnly && chromeUiClients.length > 0) {
     throw new Error(
-      `chrome-ui telemetry is not implemented for runtime monitoring; set CONTROL_PLANE_ONLY=true for clients: ${chromeUiClients.join(", ")}`
+      `chrome-ui telemetry ingestion cannot drive TikTok runtime monitoring; set CONTROL_PLANE_ONLY=true for clients: ${chromeUiClients.join(", ")}`
     );
+  }
+  if (runtime.adapters.chromeTelemetry.enabled && chromeUiClients.length === 0) {
+    throw new Error("CHROME_TELEMETRY_ENABLED requires at least one client with telemetry.source=chrome-ui");
   }
 }
 
 function jsonResponse(response, status, body) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   response.end(JSON.stringify(body));
+}
+
+function telemetryHttpStatus(error) {
+  if (error instanceof TelemetryError) return error.status;
+  if (["TELEMETRY_REPLAY", "TELEMETRY_SNAPSHOT_CONFLICT"].includes(error?.code)) return 409;
+  if (error?.code === "TELEMETRY_CREDENTIAL_REVOKED") return 401;
+  if (error?.code === "INVALID_REQUEST") return 400;
+  return null;
+}
+
+function telemetryHealth({ runtimeStatus, config, store, now }) {
+  const adapter = runtimeStatus.adapters.chromeTelemetry;
+  if (!adapter.enabled) return adapter;
+  const clients = (config?.clients ?? []).filter((client) => client.telemetry?.source === "chrome-ui");
+  const latest = store.listLatestTelemetry({ limit: 1000 });
+  const latestByClient = new Map(latest.map((snapshot) => [snapshot.clientId, snapshot]));
+  const nowMilliseconds = new Date(now).getTime();
+  let freshClients = 0;
+  let staleClients = 0;
+  let reportingClients = 0;
+  let latestObservedAt = null;
+  for (const client of clients) {
+    const snapshot = latestByClient.get(client.id);
+    if (!snapshot) continue;
+    reportingClients += 1;
+    if (latestObservedAt === null || snapshot.observedAt > latestObservedAt) {
+      latestObservedAt = snapshot.observedAt;
+    }
+    const age = nowMilliseconds - Date.parse(snapshot.observedAt);
+    if (age <= client.telemetry.maxSnapshotAgeSeconds * 1000) freshClients += 1;
+    else staleClients += 1;
+  }
+  const status = reportingClients === 0
+    ? "waiting-for-snapshot"
+    : staleClients > 0 || freshClients < clients.length
+      ? "degraded"
+      : "healthy";
+  return {
+    ...adapter,
+    status,
+    configuredClients: clients.length,
+    reportingClients,
+    freshClients,
+    staleClients,
+    latestObservedAt
+  };
 }
 
 async function readBody(request) {
@@ -97,8 +164,19 @@ export function lineWebhookHttpStatus(results) {
   return (results ?? []).some((result) => ["FAILED", "IN_PROGRESS"].includes(result?.status)) ? 500 : 200;
 }
 
-export function createHttpServer({ service, store, channelSecret, adminApiKey, runtime, logger = console }) {
+export function createHttpServer({
+  service,
+  store,
+  channelSecret,
+  adminApiKey,
+  runtime,
+  config = { clients: [] },
+  telemetryOptions = { maxClockSkewSeconds: 300 },
+  clock = () => new Date(),
+  logger = console
+}) {
   const adminRateWindows = new Map();
+  const enrollmentRateWindows = new Map();
   const runtimeStatus = runtime ?? {
     controlPlaneOnly: false,
     executionEnabled: Boolean(service.executionEnabled),
@@ -107,20 +185,24 @@ export function createHttpServer({ service, store, channelSecret, adminApiKey, r
     adapters: {
       line: { enabled: true, source: "messaging-api" },
       tiktok: { enabled: true, source: "business-api" },
-      chromeTelemetry: { enabled: false, source: null, status: "not-implemented" }
+      chromeTelemetry: { enabled: false, source: null, status: "disabled" }
     }
   };
   return http.createServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
     try {
       if (request.method === "GET" && url.pathname === "/health") {
+        const adapters = {
+          ...runtimeStatus.adapters,
+          chromeTelemetry: telemetryHealth({ runtimeStatus, config, store, now: clock() })
+        };
         return jsonResponse(response, 200, {
           ok: true,
           service: "live-gmv-max-guard",
           controlPlaneOnly: runtimeStatus.controlPlaneOnly,
           executionEnabled: runtimeStatus.executionEnabled,
           monitorEnabled: runtimeStatus.monitorEnabled,
-          adapters: runtimeStatus.adapters
+          adapters
         });
       }
 
@@ -138,6 +220,95 @@ export function createHttpServer({ service, store, channelSecret, adminApiKey, r
         const results = await service.handleLineEvents(payload.events);
         const status = lineWebhookHttpStatus(results);
         return jsonResponse(response, status, { ok: status === 200, results });
+      }
+
+      if (request.method === "POST" && url.pathname === "/telemetry/chrome/enroll") {
+        if (!runtimeStatus.adapters.chromeTelemetry.enabled) {
+          return jsonResponse(response, 503, { ok: false, error: "TELEMETRY_DISABLED" });
+        }
+        const remote = request.socket.remoteAddress ?? "unknown";
+        const nowMilliseconds = new Date(clock()).getTime();
+        const bucket = enrollmentRateWindows.get(remote);
+        if (!bucket || nowMilliseconds - bucket.startedAt >= 60_000) {
+          enrollmentRateWindows.set(remote, { startedAt: nowMilliseconds, count: 1 });
+        } else {
+          bucket.count += 1;
+          if (bucket.count > 20) return jsonResponse(response, 429, { ok: false, error: "rate_limited" });
+        }
+        const rawBody = await readBody(request);
+        const input = validateTelemetryEnrollmentRequest(JSON.parse(rawBody.toString("utf8")));
+        let credential;
+        try {
+          credential = store.consumeTelemetryEnrollment({
+            clientId: input.clientId,
+            codeHash: telemetryEnrollmentCodeHash(input.enrollmentCode),
+            installationId: input.installationId,
+            publicKeyJwk: input.publicKeyJwk,
+            consumedAt: clock()
+          });
+        } catch (error) {
+          if (error?.code === "TELEMETRY_ENROLLMENT_INVALID") {
+            return jsonResponse(response, 401, {
+              ok: false,
+              error: "TELEMETRY_ENROLLMENT_INVALID",
+              message: "Enrollment code is invalid or expired"
+            });
+          }
+          throw error;
+        }
+        return jsonResponse(response, 201, {
+          ok: true,
+          credentialId: credential.credentialId,
+          clientId: credential.clientId,
+          binding: {
+            browserProfile: credential.browserProfile,
+            tabGroup: credential.tabGroup,
+            businessCenterId: credential.businessCenterId,
+            sellerMode: credential.sellerMode,
+            pageType: credential.pageType
+          }
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/telemetry/chrome/snapshots") {
+        if (!runtimeStatus.adapters.chromeTelemetry.enabled) {
+          return jsonResponse(response, 503, { ok: false, error: "TELEMETRY_DISABLED" });
+        }
+        const rawBody = await readBody(request);
+        const credentialId = telemetryCredentialIdFromHeaders(request.headers);
+        const credential = credentialId ? store.getTelemetryCredential(credentialId) : null;
+        const auth = verifyTelemetryRequest({
+          rawBody,
+          headers: request.headers,
+          credential,
+          now: clock(),
+          maxClockSkewSeconds: telemetryOptions.maxClockSkewSeconds
+        });
+        const snapshot = validateTelemetrySnapshot(JSON.parse(rawBody.toString("utf8")), {
+          config,
+          credential,
+          now: clock(),
+          maxFutureSkewSeconds: telemetryOptions.maxClockSkewSeconds
+        });
+        const receivedAt = new Date(clock());
+        const recorded = store.recordTelemetrySnapshot({
+          snapshot,
+          credentialId: auth.credentialId,
+          nonce: auth.nonce,
+          payloadHash: telemetryPayloadHash(rawBody),
+          receivedAt,
+          pruneNoncesBefore: new Date(
+            receivedAt.getTime() - (telemetryOptions.maxClockSkewSeconds * 2 + 60) * 1000
+          )
+        });
+        return jsonResponse(response, recorded.duplicate ? 200 : 202, {
+          ok: true,
+          accepted: true,
+          duplicate: recorded.duplicate,
+          latest: recorded.latest,
+          snapshotId: recorded.snapshot.snapshotId,
+          observedAt: recorded.snapshot.observedAt
+        });
       }
 
       if (url.pathname.startsWith("/admin/")) {
@@ -183,6 +354,82 @@ export function createHttpServer({ service, store, channelSecret, adminApiKey, r
         });
       }
 
+      if (request.method === "POST" && url.pathname === "/admin/telemetry/enrollments") {
+        if (!runtimeStatus.adapters.chromeTelemetry.enabled) {
+          return jsonResponse(response, 503, { ok: false, error: "TELEMETRY_DISABLED" });
+        }
+        const rawBody = await readBody(request);
+        const input = JSON.parse(rawBody.toString("utf8"));
+        const clientId = String(input.clientId ?? "");
+        const client = config.clients.find((candidate) =>
+          candidate.id === clientId && candidate.telemetry?.source === "chrome-ui"
+        );
+        if (!client) {
+          return jsonResponse(response, 404, { ok: false, error: "TELEMETRY_CLIENT_NOT_FOUND" });
+        }
+        const ttlMinutes = input.ttlMinutes == null ? 10 : Number(input.ttlMinutes);
+        if (!Number.isInteger(ttlMinutes) || ttlMinutes < 2 || ttlMinutes > 60) {
+          return jsonResponse(response, 400, {
+            ok: false,
+            error: "INVALID_REQUEST",
+            message: "ttlMinutes must be an integer between 2 and 60"
+          });
+        }
+        const enrollmentCode = crypto.randomBytes(32).toString("base64url");
+        const createdAt = new Date(clock());
+        const enrollment = store.createTelemetryEnrollment({
+          clientId,
+          codeHash: telemetryEnrollmentCodeHash(enrollmentCode),
+          browserProfile: client.telemetry.browserProfile,
+          tabGroup: client.telemetry.tabGroup,
+          businessCenterId: client.telemetry.businessCenterId,
+          sellerMode: client.telemetry.sellerMode,
+          pageType: client.telemetry.pageType,
+          createdAt,
+          expiresAt: new Date(createdAt.getTime() + ttlMinutes * 60_000)
+        });
+        return jsonResponse(response, 201, {
+          ok: true,
+          enrollmentId: enrollment.enrollmentId,
+          clientId,
+          enrollmentCode,
+          expiresAt: enrollment.expiresAt,
+          binding: {
+            browserProfile: enrollment.browserProfile,
+            tabGroup: enrollment.tabGroup,
+            businessCenterId: enrollment.businessCenterId,
+            sellerMode: enrollment.sellerMode,
+            pageType: enrollment.pageType
+          }
+        });
+      }
+
+      if (request.method === "GET" && url.pathname === "/admin/telemetry/latest") {
+        const clientId = url.searchParams.get("clientId") ?? undefined;
+        const limitText = url.searchParams.get("limit");
+        const limit = limitText == null ? 100 : Number(limitText);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
+          return jsonResponse(response, 400, { ok: false, error: "INVALID_REQUEST" });
+        }
+        if (clientId !== undefined && !config.clients.some((client) => client.id === clientId)) {
+          return jsonResponse(response, 404, { ok: false, error: "TELEMETRY_CLIENT_NOT_FOUND" });
+        }
+        const snapshots = store.listLatestTelemetry({ clientId, limit });
+        store.appendAuditEvent({
+          eventType: "CHROME_TELEMETRY_ADMIN_READ",
+          actorType: "ADMIN",
+          occurredAt: clock(),
+          details: { clientId: clientId ?? null, resultCount: snapshots.length }
+        });
+        return jsonResponse(response, 200, {
+          ok: true,
+          snapshots: snapshots.map((snapshot) => ({
+            ...snapshot,
+            spendRatio: snapshot.costMinor / snapshot.dailyBudgetMinor
+          }))
+        });
+      }
+
       if (request.method === "POST" && url.pathname === "/admin/requests") {
         if (runtimeStatus.controlPlaneOnly) {
           return jsonResponse(response, 503, {
@@ -224,7 +471,7 @@ export function createHttpServer({ service, store, channelSecret, adminApiKey, r
 
       return jsonResponse(response, 404, { ok: false, error: "not found" });
     } catch (error) {
-      const status = error.status ?? (error instanceof SyntaxError ? 400 : 500);
+      const status = error.status ?? telemetryHttpStatus(error) ?? (error instanceof SyntaxError ? 400 : 500);
       logger.error("http error", { method: request.method, path: url.pathname, status, code: error.code, message: error.message });
       return jsonResponse(response, status, { ok: false, error: error.code ?? "internal_error", message: status < 500 ? error.message : "Internal error" });
     }
@@ -233,6 +480,7 @@ export function createHttpServer({ service, store, channelSecret, adminApiKey, r
 
 export async function startFromEnvironment() {
   const runtime = resolveRuntimeMode(process.env);
+  const telemetryOptions = resolveTelemetryOptions(process.env);
   const required = requiredEnvironmentVariables(runtime);
   const missing = required.filter((name) => !process.env[name]);
   if (missing.length) throw new Error(`Missing required environment variables: ${missing.join(", ")}`);
@@ -269,7 +517,9 @@ export async function startFromEnvironment() {
     store,
     channelSecret: process.env.LINE_CHANNEL_SECRET,
     adminApiKey: process.env.ADMIN_API_KEY,
-    runtime
+    runtime,
+    config,
+    telemetryOptions
   });
 
   if (!runtime.controlPlaneOnly) {
