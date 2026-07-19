@@ -1,0 +1,67 @@
+{
+  "agencyId": "my-agency",
+  "pollIntervalSeconds": 300,
+  "requestTtlMinutes": 15,
+  "warningThreshold": 0.7,
+  "cooldownMinutes": 30,
+  "reconciliationWindowMinutes": 15,
+  "clients": [
+    {
+      "id": "client-example",
+      "name": "ชื่อลูกค้า",
+      "lineApproverUserIds": ["U_LINE_USER_ID"],
+      "linePairingEnabled": false,
+      "advertiserId": "TIKTOK_ADVERTISER_ID",
+      "storeId": "TIKTOK_SHOP_ID",
+      "storeAuthorizedBcId": "TIKTOK_BUSINESS_CENTER_ID",
+      "timezone": "Asia/Bangkok",
+      "campaigns": [
+        {
+          "id": "LIVE_GMV_MAX_CAMPAIGN_ID",
+          "name": "LIVE GMV Max - Main",
+          "currency": "THB",
+          "maxDailyBudget": 50000,
+          "maxIncreasePercent": 100,
+          "suggestionMultiplier": 1.5,
+          "minIncrease": 1000
+        }
+      ]
+    },
+    {
+      "id": "dynamic-live-example",
+      "name": "ชื่อลูกค้า LIVE แบบค้นหาแคมเปญรายวัน",
+      "lineApproverUserIds": [],
+      "linePairingEnabled": true,
+      "advertiserId": "DYNAMIC_TIKTOK_ADVERTISER_ID",
+      "shopBinding": {
+        "mode": "observe-and-pin"
+      },
+      "telemetry": {
+        "source": "chrome-ui",
+        "browserProfile": "Whalebuddy Ads",
+        "tabGroup": "Ppan"
+      },
+      "timezone": "Asia/Bangkok",
+      "liveWindow": {
+        "start": "06:00",
+        "end": "23:00"
+      },
+      "warningThreshold": 0.8,
+      "campaignSelector": {
+        "kind": "active-live-gmv-max",
+        "currency": "THB",
+        "expectedTikTokAccountId": "TIKTOK_ACCOUNT_ID",
+        "requireExactlyOne": true
+      },
+      "budgetIncrease": {
+        "presetPercent": 20,
+        "allowManualTarget": true
+      },
+      "budgetPolicy": {
+        "maxDailyBudget": 6000,
+        "effectiveFrom": "2026-07-19",
+        "revision": 1
+      }
+    }
+  ]
+}

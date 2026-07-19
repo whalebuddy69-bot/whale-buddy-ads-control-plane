@@ -1,0 +1,42 @@
+previews:
+  generation: "off"
+
+services:
+  - type: web
+    name: whale-buddy-ads-control-plane
+    runtime: docker
+    plan: starter
+    region: singapore
+    numInstances: 1
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    autoDeployTrigger: "off"
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 30
+    disk:
+      name: gmv-max-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: CONFIG_PATH
+        value: /app/config/punpan_020.control-plane.json
+      - key: DATABASE_PATH
+        value: /app/data/gmv-max.sqlite
+      - key: CONTROL_PLANE_ONLY
+        value: "true"
+      - key: EXECUTION_ENABLED
+        value: "false"
+      - key: MONITOR_ENABLED
+        value: "false"
+      - key: STARTUP_VALIDATION_ENABLED
+        value: "false"
+      - key: ADMIN_API_KEY
+        generateValue: true
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false

@@ -1,0 +1,46 @@
+{
+  "agencyId": "whalebuddy-ads",
+  "pollIntervalSeconds": 300,
+  "requestTtlMinutes": 15,
+  "warningThreshold": 0.7,
+  "cooldownMinutes": 30,
+  "reconciliationWindowMinutes": 15,
+  "clients": [
+    {
+      "id": "punpan_020",
+      "name": "punpan_020",
+      "lineApproverUserIds": [],
+      "linePairingEnabled": true,
+      "advertiserId": "7646832328389263378",
+      "shopBinding": {
+        "mode": "observe-and-pin"
+      },
+      "telemetry": {
+        "source": "chrome-ui",
+        "browserProfile": "Whalebuddy Ads",
+        "tabGroup": "Ppan"
+      },
+      "timezone": "Asia/Bangkok",
+      "liveWindow": {
+        "start": "06:00",
+        "end": "23:00"
+      },
+      "warningThreshold": 0.8,
+      "campaignSelector": {
+        "kind": "active-live-gmv-max",
+        "currency": "THB",
+        "expectedTikTokAccountId": "7285935731820920833",
+        "requireExactlyOne": true
+      },
+      "budgetIncrease": {
+        "presetPercent": 20,
+        "allowManualTarget": true
+      },
+      "budgetPolicy": {
+        "maxDailyBudget": 6000,
+        "effectiveFrom": "2026-07-19",
+        "revision": 1
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+.git
+.gitignore
+.env
+.env.*
+node_modules
+data
+coverage
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+config/clients.json
+config/*.local.json
+config/punpan_020.discovery.json
+test
+docs
+.DS_Store
