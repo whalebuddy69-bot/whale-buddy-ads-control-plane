@@ -188,6 +188,10 @@ Endpoints:
 - `POST /telemetry/chrome/snapshots` รับ snapshot ที่เซ็นแล้วเท่านั้น
 - `GET /admin/telemetry/latest?clientId=...` อ่าน snapshot ล่าสุด (ต้องใช้ admin bearer)
 
+ตั้ง `CHROME_TELEMETRY_ALERTS_ENABLED=true` ได้เฉพาะเมื่อเปิด signed Chrome telemetry และใช้
+`CONTROL_PLANE_ONLY=true` เท่านั้น โหมดนี้ส่ง LINE approval แบบ **DRY-RUN** จาก Cost ≥ 80%
+และจบคำขอโดยไม่เข้าคิว TikTok หรือเปลี่ยนงบจริง ค่าใน Render Blueprint ยังคงเป็น `false`.
+
 - `GET /health`
 - `POST /webhooks/line`
 - `POST /admin/line-pairings` (Bearer admin key; คืนคำสั่งจับคู่แบบใช้ครั้งเดียว)

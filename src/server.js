@@ -30,8 +30,16 @@ function environmentFlag(environment, name, fallback = false) {
 export function resolveRuntimeMode(environment = process.env) {
   const controlPlaneOnly = environmentFlag(environment, "CONTROL_PLANE_ONLY", false);
   const chromeTelemetryEnabled = environmentFlag(environment, "CHROME_TELEMETRY_ENABLED", false);
+  const telemetryAlertsEnabled = environmentFlag(environment, "CHROME_TELEMETRY_ALERTS_ENABLED", false);
+  if (telemetryAlertsEnabled && !chromeTelemetryEnabled) {
+    throw new Error("CHROME_TELEMETRY_ALERTS_ENABLED requires CHROME_TELEMETRY_ENABLED=true");
+  }
+  if (telemetryAlertsEnabled && !controlPlaneOnly) {
+    throw new Error("CHROME_TELEMETRY_ALERTS_ENABLED requires CONTROL_PLANE_ONLY=true");
+  }
   return {
     controlPlaneOnly,
+    telemetryAlertsEnabled,
     executionEnabled: controlPlaneOnly
       ? false
       : environmentFlag(environment, "EXECUTION_ENABLED", false),
@@ -179,6 +187,7 @@ export function createHttpServer({
   const enrollmentRateWindows = new Map();
   const runtimeStatus = runtime ?? {
     controlPlaneOnly: false,
+    telemetryAlertsEnabled: false,
     executionEnabled: Boolean(service.executionEnabled),
     monitorEnabled: false,
     startupValidationEnabled: false,
@@ -200,6 +209,7 @@ export function createHttpServer({
           ok: true,
           service: "live-gmv-max-guard",
           controlPlaneOnly: runtimeStatus.controlPlaneOnly,
+          telemetryAlertsEnabled: runtimeStatus.telemetryAlertsEnabled,
           executionEnabled: runtimeStatus.executionEnabled,
           monitorEnabled: runtimeStatus.monitorEnabled,
           adapters
@@ -478,6 +488,15 @@ export function createHttpServer({
   });
 }
 
+export async function runNotificationCycle({ service, telemetryAlertsEnabled = false } = {}) {
+  if (telemetryAlertsEnabled) {
+    await service.processLatestTelemetryDryRunAlerts({ limit: 100 });
+  }
+  await service.recoverLineWebhookEvents({ maxEvents: 20 });
+  await service.retryPendingAlerts({ limit: 100 });
+  await service.retryPendingResults({ limit: 1000 });
+}
+
 export async function startFromEnvironment() {
   const runtime = resolveRuntimeMode(process.env);
   const telemetryOptions = resolveTelemetryOptions(process.env);
@@ -510,7 +529,8 @@ export async function startFromEnvironment() {
     store,
     line,
     tiktok,
-    executionEnabled: runtime.executionEnabled
+    executionEnabled: runtime.executionEnabled,
+    telemetryAlertsEnabled: runtime.telemetryAlertsEnabled
   });
   const server = createHttpServer({
     service,
@@ -568,9 +588,7 @@ export async function startFromEnvironment() {
     if (notificationWorkerBusy) return;
     notificationWorkerBusy = true;
     try {
-      await service.recoverLineWebhookEvents({ maxEvents: 20 });
-      await service.retryPendingAlerts({ limit: 100 });
-      await service.retryPendingResults({ limit: 1000 });
+      await runNotificationCycle({ service, telemetryAlertsEnabled: runtime.telemetryAlertsEnabled });
     } catch (error) {
       console.error(JSON.stringify({ event: "notification_worker_error", code: error?.code, message: error?.message }));
     } finally {
@@ -607,6 +625,7 @@ export async function startFromEnvironment() {
     host,
     port,
     controlPlaneOnly: runtime.controlPlaneOnly,
+    telemetryAlertsEnabled: runtime.telemetryAlertsEnabled,
     monitorEnabled: Boolean(monitorTimer),
     executionEnabled: service.executionEnabled,
     adapters: runtime.adapters

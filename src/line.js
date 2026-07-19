@@ -83,6 +83,7 @@ export function buildBudgetAlertMessage(request) {
   const manualExampleBudget = request.manualExampleBudget ?? request.maxBudget ?? request.proposedBudget;
   const presetLabel = request.presetLabel ?? "ใช้งบแนะนำ";
   const allowManualTarget = request.allowManualTarget !== false;
+  const dryRun = request.telemetryOnly === true || request.dryRun === true;
   const expires = new Date(request.expiresAt).toLocaleTimeString("th-TH", {
     timeZone: request.timezone ?? "Asia/Bangkok",
     hour: "2-digit",
@@ -93,6 +94,11 @@ export function buildBudgetAlertMessage(request) {
     : "—";
 
   const bodyContents = [
+    ...(dryRun ? [lineText("🧪 ทดสอบการอนุมัติเท่านั้น — ไม่มีการเปลี่ยนงบจริงบน TikTok", {
+      size: "sm",
+      weight: "bold",
+      color: "#8A4B00"
+    })] : []),
     detailRow("Campaign", request.campaignName),
     detailRow("Ad account", accountSuffix(request.advertiserId)),
     detailRow("ใช้ไป", request.spend == null ? "รอข้อมูล" : formatMoney(request.spend, request.currency)),
@@ -131,7 +137,7 @@ export function buildBudgetAlertMessage(request) {
 
   return {
     type: "flex",
-    altText: `LIVE GMV Max ใกล้เต็มงบ: ${request.clientName}`,
+    altText: `${dryRun ? "ทดสอบ — " : ""}LIVE GMV Max ใกล้เต็มงบ: ${request.clientName}`,
     contents: {
       type: "bubble",
       header: {
@@ -139,7 +145,7 @@ export function buildBudgetAlertMessage(request) {
         layout: "vertical",
         backgroundColor: "#FFF4E5",
         contents: [
-          lineText("⚠️ LIVE GMV Max ใกล้เต็มงบ", { weight: "bold", size: "lg", color: "#8A4B00" }),
+          lineText(dryRun ? "🧪 DRY-RUN: LIVE GMV Max ใกล้เต็มงบ" : "⚠️ LIVE GMV Max ใกล้เต็มงบ", { weight: "bold", size: "lg", color: "#8A4B00" }),
           lineText(request.clientName, { size: "sm", color: "#8A4B00", margin: "sm" })
         ]
       },
@@ -160,16 +166,17 @@ export function buildBudgetAlertMessage(request) {
 }
 
 export function buildBudgetConfirmationMessage(request) {
+  const dryRun = request.telemetryOnly === true || request.dryRun === true;
   return {
     type: "flex",
-    altText: `ยืนยันงบใหม่ ${request.clientName}`,
+    altText: `${dryRun ? "ทดสอบ " : ""}ยืนยันงบใหม่ ${request.clientName}`,
     contents: {
       type: "bubble",
       header: {
         type: "box",
         layout: "vertical",
         backgroundColor: "#EAF4FF",
-        contents: [lineText("ยืนยันการเพิ่มงบ", { weight: "bold", size: "lg", color: "#0B4F8A" })]
+        contents: [lineText(dryRun ? "ยืนยันการทดสอบ (ไม่แก้งบจริง)" : "ยืนยันการเพิ่มงบ", { weight: "bold", size: "lg", color: "#0B4F8A" })]
       },
       body: {
         type: "box",
@@ -182,7 +189,9 @@ export function buildBudgetConfirmationMessage(request) {
           detailRow("งบเดิม", formatMoney(request.currentBudget, request.currency)),
           detailRow("งบใหม่", formatMoney(request.proposedBudget, request.currency)),
           detailRow("เพิ่ม", formatMoney(request.proposedBudget - request.currentBudget, request.currency)),
-          lineText("ระบบจะอ่านบัญชีและงบจริงซ้ำก่อนแก้ หากข้อมูลเปลี่ยนไปคำสั่งนี้จะถูกยกเลิก", {
+          lineText(dryRun
+            ? "DRY-RUN เท่านั้น: เมื่อยืนยัน ระบบจะบันทึกผลทดสอบและจะไม่เรียก TikTok หรือเปลี่ยนงบจริง"
+            : "ระบบจะอ่านบัญชีและงบจริงซ้ำก่อนแก้ หากข้อมูลเปลี่ยนไปคำสั่งนี้จะถูกยกเลิก", {
             size: "xs",
             color: "#666666",
             margin: "md"
@@ -198,7 +207,12 @@ export function buildBudgetConfirmationMessage(request) {
             type: "button",
             style: "primary",
             color: "#06C755",
-            action: { type: "postback", label: "ยืนยันเพิ่มงบ", data: `a=confirm&id=${request.id}&v=${request.version}`, displayText: "ยืนยันเพิ่มงบ" }
+            action: {
+              type: "postback",
+              label: dryRun ? "ยืนยันการทดสอบ" : "ยืนยันเพิ่มงบ",
+              data: `a=confirm&id=${request.id}&v=${request.version}`,
+              displayText: dryRun ? "ยืนยันการทดสอบ" : "ยืนยันเพิ่มงบ"
+            }
           },
           {
             type: "button",

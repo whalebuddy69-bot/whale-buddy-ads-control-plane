@@ -154,6 +154,16 @@ test("verified telemetry persists latest state, audit history, and replay nonces
       { accepted: true, duplicate: false, latest: true }
     );
     assert.equal(store.getLatestTelemetry({ clientId: "punpan_020" }).snapshotId, newest.snapshotId);
+    assert.equal(store.isTelemetrySnapshotCredentialActive(newest.snapshotId), true);
+    assert.equal(store.isTelemetrySnapshotCredentialActive("ts_missing-aaaa-aaaa-aaaa-aaaaaaaaaaaa"), null);
+    const evaluation = store.recordTelemetryAlertEvaluation({
+      snapshotId: newest.snapshotId,
+      status: "BELOW_THRESHOLD",
+      evaluatedAt: "2026-07-20T12:00:00.000Z",
+      details: { utilization: 0 }
+    });
+    assert.equal(evaluation.status, "BELOW_THRESHOLD");
+    assert.equal(store.getTelemetryAlertEvaluation(newest.snapshotId).details.utilization, 0);
 
     assert.throws(() => store.recordTelemetrySnapshot({
       snapshot: snapshot("ts_22222222-2222-2222-2222-222222222222", "2026-07-20T11:59:40.000Z"),
@@ -202,6 +212,9 @@ test("verified telemetry persists latest state, audit history, and replay nonces
       "CHROME_TELEMETRY_ACCEPTED",
       "CHROME_TELEMETRY_OLDER_ACCEPTED"
     ]);
+
+    enroll(store, { code: "replacement-bootstrap-code", installationId: "install_replacement_123" });
+    assert.equal(store.isTelemetrySnapshotCredentialActive(newest.snapshotId), false);
 
     const raw = new DatabaseSync(filename, { readOnly: true });
     try {

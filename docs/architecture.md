@@ -78,7 +78,12 @@ Pilot ตรวจหน้า Ads แบบ read-only ผ่าน tab group `P
 
 ไม่ควร expose Chrome DevTools port หรือ Mac port ออกอินเทอร์เน็ตโดยตรง
 
-ระหว่างยังไม่มี TikTok Developer App ให้ deploy ด้วย `CONTROL_PLANE_ONLY=true`: LINE webhook, health, pairing และ backend รับ signed Chrome telemetry ทำงานได้ แต่ monitor/execution/TikTok workers ถูกบังคับปิด Snapshot จึงบันทึก latest/audit เท่านั้นและไม่สร้างคำของบหรือเขียน TikTok
+ระหว่างยังไม่มี TikTok Developer App ให้ deploy ด้วย `CONTROL_PLANE_ONLY=true`: LINE webhook, health, pairing และ backend รับ signed Chrome telemetry ทำงานได้ แต่ monitor/execution/TikTok workers ถูกบังคับปิด โดยค่าเริ่มต้น Snapshot จึงบันทึก latest/audit เท่านั้นและไม่สร้างคำของบหรือเขียน TikTok
+
+มี opt-in `CHROME_TELEMETRY_ALERTS_ENABLED=true` สำหรับทดสอบ LINE approval จาก snapshot ล่าสุด
+โดยเฉพาะ ค่านี้ต้องใช้ signed telemetry และ control-plane-only; คำขอถูกทำเครื่องหมาย
+`telemetryOnly + dryRun + APPROVAL_ONLY` และเมื่อยืนยันจะปิดเป็นผลทดสอบทันทีโดยไม่เรียก TikTok
+ค่าเริ่มต้นและ Render Blueprint ยังปิดไว้ (`false`).
 
 ## Monitoring policy
 

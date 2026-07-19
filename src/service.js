@@ -10,6 +10,10 @@ import {
   requestCodeFor
 } from "./line.js";
 import { fromMinor, toMinor } from "./money.js";
+import {
+  TELEMETRY_UI_SCHEMA_FINGERPRINT_V1,
+  telemetryUiCampaignRef
+} from "./telemetry.js";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -202,13 +206,35 @@ function dynamicAuthorityDigest(canonical) {
   return crypto.createHash("sha256").update(canonical).digest("hex");
 }
 
+function telemetryOnlyRequest(request) {
+  return request?.metadata?.telemetryOnly === true
+    || request?.metadata?.executionMode === "APPROVAL_ONLY"
+    || request?.metadata?.source === "CHROME_TELEMETRY_DRY_RUN";
+}
+
+function thresholdReached(costMinor, budgetMinor, threshold) {
+  const scale = 1_000_000;
+  const scaledThreshold = Math.round(threshold * scale);
+  return BigInt(costMinor) * BigInt(scale) >= BigInt(budgetMinor) * BigInt(scaledThreshold);
+}
+
 export class BudgetGuardService {
-  constructor({ config, store, tiktok, line, executionEnabled = false, logger = console, now = () => new Date() }) {
+  constructor({
+    config,
+    store,
+    tiktok,
+    line,
+    executionEnabled = false,
+    telemetryAlertsEnabled = false,
+    logger = console,
+    now = () => new Date()
+  }) {
     this.config = config;
     this.store = store;
     this.tiktok = tiktok;
     this.line = line;
     this.executionEnabled = executionEnabled;
+    this.telemetryAlertsEnabled = telemetryAlertsEnabled;
     this.logger = logger;
     this.now = now;
   }
@@ -271,6 +297,8 @@ export class BudgetGuardService {
       maxBudget: fromMinor(request.guardrails.maxBudgetMinor, request.currency),
       presetLabel: request.metadata.presetLabel ?? "ใช้งบแนะนำ",
       allowManualTarget: allowsManualTarget(request),
+      telemetryOnly: request.metadata.telemetryOnly === true,
+      dryRun: request.metadata.dryRun === true,
       spend: request.metadata.spendMinor == null ? null : fromMinor(request.metadata.spendMinor, request.currency),
       expiresAt: request.expiresAt
     };
@@ -426,6 +454,12 @@ export class BudgetGuardService {
   }
 
   #requestMapping(request) {
+    if (telemetryOnlyRequest(request)) {
+      throw new DomainError(
+        "TELEMETRY_ONLY_REQUEST",
+        "A telemetry dry-run request has no TikTok execution authority"
+      );
+    }
     const client = this.#clientById(request.clientId);
     if (!client || String(client.advertiserId) !== String(request.adAccountId)) {
       throw new DomainError("CONFIG_MAPPING_REVOKED", "The client/advertiser mapping is no longer approved");
@@ -625,6 +659,230 @@ export class BudgetGuardService {
     const latest = this.store.getLatestBudgetRequest({ adAccountId: String(adAccountId), campaignId: String(campaignId) });
     if (!latest || [RequestState.PENDING_INPUT, RequestState.PENDING_APPROVAL, RequestState.EXECUTING].includes(latest.state)) return null;
     return new Date(Date.parse(latest.updatedAt) + this.config.cooldownMinutes * 60_000);
+  }
+
+  async processTelemetrySnapshotForDryRunAlert({ snapshot, latest = true } = {}) {
+    const skip = (status, details = {}) => ({
+      clientId: snapshot?.clientId ?? null,
+      snapshotId: snapshot?.snapshotId ?? null,
+      status,
+      ...details
+    });
+    if (!this.telemetryAlertsEnabled) return skip("SKIP_TELEMETRY_ALERTS_DISABLED");
+    if (latest !== true) return skip("SKIP_NOT_LATEST");
+    if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
+      return skip("SKIP_INVALID_SNAPSHOT");
+    }
+    if (
+      snapshot.schemaVersion !== 1
+      || snapshot.uiSchemaFingerprint !== TELEMETRY_UI_SCHEMA_FINGERPRINT_V1
+    ) {
+      return skip("SKIP_TELEMETRY_SCHEMA_MISMATCH");
+    }
+    if (
+      typeof this.store.isTelemetrySnapshotCredentialActive === "function"
+      && this.store.isTelemetrySnapshotCredentialActive(snapshot.snapshotId) === false
+    ) {
+      return skip("SKIP_REVOKED_TELEMETRY_CREDENTIAL");
+    }
+
+    const client = this.#clientById(snapshot.clientId);
+    if (!client || client.telemetry?.source !== "chrome-ui" || !client.campaignSelector) {
+      return skip("SKIP_CLIENT_BINDING_MISMATCH");
+    }
+    const exactBindings = [
+      [snapshot.advertiserId, client.advertiserId],
+      [snapshot.businessCenterId, client.telemetry.businessCenterId],
+      [snapshot.sellerMode, client.telemetry.sellerMode],
+      [snapshot.pageType, client.telemetry.pageType],
+      [snapshot.tiktokAccountId, client.campaignSelector.expectedTikTokAccountId],
+      [snapshot.source?.browserProfile, client.telemetry.browserProfile],
+      [snapshot.source?.tabGroup, client.telemetry.tabGroup],
+      [snapshot.campaignType, "LIVE_GMV_MAX"],
+      [snapshot.campaignStatus, "ACTIVE"],
+      [snapshot.currency, client.campaignSelector.currency]
+    ];
+    if (exactBindings.some(([actual, expected]) => actual !== expected)) {
+      return skip("SKIP_CLIENT_BINDING_MISMATCH");
+    }
+    if (snapshot.campaignId !== null) return skip("SKIP_OBSERVED_CAMPAIGN_ID_PRESENT");
+
+    const observedAt = new Date(snapshot.observedAt);
+    const now = this.now();
+    if (Number.isNaN(observedAt.getTime()) || Number.isNaN(now.getTime())) {
+      return skip("SKIP_INVALID_OBSERVATION_TIME");
+    }
+    const ageMilliseconds = now.getTime() - observedAt.getTime();
+    if (
+      ageMilliseconds < -60_000
+      || ageMilliseconds > client.telemetry.maxSnapshotAgeSeconds * 1000
+    ) {
+      return skip("SKIP_STALE_SNAPSHOT");
+    }
+
+    const policyLocalDate = localDateFor(now, client.timezone);
+    const observedLocalDate = localDateFor(observedAt, client.timezone);
+    if (policyLocalDate !== observedLocalDate) return skip("SKIP_LOCAL_DATE_MISMATCH");
+    if (
+      !isWithinLiveWindow(now, client.timezone, client.liveWindow)
+      || !isWithinLiveWindow(observedAt, client.timezone, client.liveWindow)
+    ) {
+      return skip("SKIP_OUTSIDE_LIVE_WINDOW");
+    }
+    if (policyLocalDate < client.budgetPolicy.effectiveFrom) {
+      return skip("SKIP_POLICY_NOT_EFFECTIVE");
+    }
+
+    const expectedCampaignName = `${policyLocalDate} ${client.liveWindow.start}:00`;
+    if (snapshot.campaignName !== expectedCampaignName) return skip("SKIP_CAMPAIGN_NAME_MISMATCH");
+    const expectedCampaignRef = telemetryUiCampaignRef({
+      advertiserId: String(client.advertiserId),
+      campaignName: expectedCampaignName
+    });
+    if (snapshot.campaignRef !== expectedCampaignRef) return skip("SKIP_CAMPAIGN_REF_MISMATCH");
+
+    const moneyFields = [
+      snapshot.dailyBudgetMinor,
+      snapshot.totalBudgetMinor,
+      snapshot.costMinor,
+      snapshot.netCostMinor
+    ];
+    if (
+      moneyFields.some((value) => !Number.isSafeInteger(value) || value < 0)
+      || snapshot.dailyBudgetMinor <= 0
+      || snapshot.totalBudgetMinor <= 0
+    ) {
+      return skip("SKIP_INVALID_MONEY");
+    }
+    const capMinor = toMinor(client.budgetPolicy.maxDailyBudget, client.campaignSelector.currency);
+    if (
+      snapshot.policy?.maxDailyBudgetMinor !== capMinor
+      || snapshot.policy?.overDailyBudgetCap === true
+      || snapshot.dailyBudgetMinor > capMinor
+    ) {
+      return skip("SKIP_OVER_POLICY_CAP");
+    }
+    if (snapshot.dailyBudgetMinor >= capMinor) return skip("SKIP_NO_SAFE_INCREASE");
+    if (!thresholdReached(snapshot.costMinor, snapshot.dailyBudgetMinor, client.warningThreshold)) {
+      return skip("BELOW_THRESHOLD", {
+        costMinor: snapshot.costMinor,
+        dailyBudgetMinor: snapshot.dailyBudgetMinor
+      });
+    }
+
+    const active = this.#activeRequestFor(client.advertiserId, snapshot.campaignRef);
+    if (active) return skip("SKIP_ACTIVE_REQUEST", { requestId: active.id });
+    const cooldownUntil = this.#cooldownUntil(client.advertiserId, snapshot.campaignRef);
+    if (cooldownUntil && cooldownUntil.getTime() > now.getTime()) {
+      return skip("SKIP_COOLDOWN", { cooldownUntil: cooldownUntil.toISOString() });
+    }
+
+    const campaign = {
+      // This is a logical observation/dedupe key, never a TikTok campaign ID.
+      id: snapshot.campaignRef,
+      name: snapshot.campaignName,
+      currency: client.campaignSelector.currency,
+      maxDailyBudget: client.budgetPolicy.maxDailyBudget,
+      dynamicPolicy: dynamicAuthoritySnapshot(client, policyLocalDate)
+    };
+    const currentBudget = fromMinor(snapshot.dailyBudgetMinor, snapshot.currency);
+    const spend = fromMinor(snapshot.costMinor, snapshot.currency);
+    const proposedBudget = fromMinor(
+      Math.min(
+        capMinor,
+        Math.floor(snapshot.dailyBudgetMinor * (100 + client.budgetIncrease.presetPercent) / 100)
+      ),
+      snapshot.currency
+    );
+    const value = this.#createSnapshotRequest({
+      client,
+      campaign,
+      currentBudget,
+      spend,
+      proposedBudget
+    });
+    let request;
+    try {
+      request = this.store.createBudgetRequest({
+        ...value,
+        metadata: {
+          ...value.metadata,
+          source: "CHROME_TELEMETRY_DRY_RUN",
+          telemetryOnly: true,
+          dryRun: true,
+          executionMode: "APPROVAL_ONLY",
+          observedCampaignId: null,
+          campaignRef: snapshot.campaignRef,
+          presetLabel: `ทดสอบเพิ่มงบ ${client.budgetIncrease.presetPercent}%`,
+          storeId: null,
+          storeAuthorizedBcId: null,
+          telemetrySnapshot: {
+            snapshotId: snapshot.snapshotId,
+            observedAt: snapshot.observedAt,
+            advertiserId: snapshot.advertiserId,
+            businessCenterId: snapshot.businessCenterId,
+            tiktokAccountId: snapshot.tiktokAccountId,
+            browserProfile: snapshot.source.browserProfile,
+            tabGroup: snapshot.source.tabGroup,
+            dailyBudgetMinor: snapshot.dailyBudgetMinor,
+            costMinor: snapshot.costMinor
+          }
+        }
+      });
+    } catch (error) {
+      if (error?.code === "ACTIVE_REQUEST_EXISTS") {
+        return skip("SKIP_ACTIVE_REQUEST");
+      }
+      throw error;
+    }
+    const delivery = await this.retryUndeliveredAlert(request);
+    return skip(delivery.status, {
+      requestId: request.id,
+      utilization: snapshot.costMinor / snapshot.dailyBudgetMinor
+    });
+  }
+
+  async processLatestTelemetryDryRunAlerts({ limit = 100 } = {}) {
+    if (!this.telemetryAlertsEnabled) return [];
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new DomainError("INVALID_REQUEST", "limit must be an integer between 1 and 1000");
+    }
+    const outcomes = [];
+    for (const snapshot of this.store.listLatestTelemetry({ limit })) {
+      if (this.store.getTelemetryAlertEvaluation(snapshot.snapshotId)) continue;
+      let outcome;
+      try {
+        outcome = await this.processTelemetrySnapshotForDryRunAlert({ snapshot, latest: true });
+      } catch (error) {
+        const safe = safeError(error);
+        outcome = {
+          clientId: snapshot.clientId,
+          snapshotId: snapshot.snapshotId,
+          status: "ERROR",
+          errorCode: safe.code
+        };
+        this.logger.error("telemetry dry-run alert evaluation failed", {
+          clientId: snapshot.clientId,
+          snapshotId: snapshot.snapshotId,
+          code: safe.code,
+          message: safe.message
+        });
+      }
+      this.store.recordTelemetryAlertEvaluation({
+        snapshotId: snapshot.snapshotId,
+        status: outcome.status,
+        requestId: outcome.requestId ?? null,
+        evaluatedAt: this.now(),
+        details: {
+          clientId: outcome.clientId,
+          utilization: outcome.utilization ?? null,
+          cooldownUntil: outcome.cooldownUntil ?? null,
+          errorCode: outcome.errorCode ?? null
+        }
+      });
+      outcomes.push(outcome);
+    }
+    return outcomes;
   }
 
   expireOldRequests() {
@@ -916,13 +1174,41 @@ export class BudgetGuardService {
     }
 
     if (parsed.action === "confirm" && request.state === RequestState.PENDING_APPROVAL) {
+      const now = this.now();
+      if (now.getTime() >= Date.parse(request.expiresAt)) {
+        try {
+          this.store.expireBudgetRequest(request.id, { now });
+        } catch (error) {
+          if (!new Set(["CONCURRENT_MODIFICATION", "INVALID_STATE"]).has(error?.code)) throw error;
+        }
+        return this.#replySafely(event.replyToken, {
+          type: "text",
+          text: "คำขอนี้หมดอายุแล้ว ไม่มีการเปลี่ยนงบจริง"
+        }, request.id);
+      }
       if (parsed.version !== request.version) {
         return this.#replySafely(event.replyToken, { type: "text", text: "ข้อความยืนยันนี้เป็นเวอร์ชันเก่า กรุณาใช้ข้อความสรุปล่าสุด" }, request.id);
+      }
+      if (telemetryOnlyRequest(request)) {
+        const completed = this.store.cancelBudgetRequest(request.id, {
+          actorLineUserId: userId,
+          reason: "Dry run: telemetry-only LINE confirmation",
+          now
+        });
+        await this.#pushResult(userId, completed, {
+          ok: true,
+          dryRun: true,
+          detail: "ยืนยันการทดสอบแล้ว—ไม่มีการเปลี่ยนงบจริงบน TikTok"
+        });
+        return this.#replySafely(event.replyToken, {
+          type: "text",
+          text: "จบการทดสอบแล้ว ✅ ไม่มีการเปลี่ยนงบจริงบน TikTok"
+        }, request.id);
       }
       const queued = this.store.enqueueExecutionJob({
         requestId: request.id,
         actorLineUserId: userId,
-        createdAt: this.now()
+        createdAt: now
       });
       return this.#replySafely(event.replyToken, {
         type: "text",
@@ -1209,6 +1495,20 @@ export class BudgetGuardService {
     let request = this.store.requireBudgetRequest(requestId);
     if (request.state !== RequestState.PENDING_APPROVAL) return request;
 
+    if (telemetryOnlyRequest(request)) {
+      request = this.store.cancelBudgetRequest(request.id, {
+        actorLineUserId: userId,
+        reason: "Dry run: telemetry-only execution blocked",
+        now: this.now()
+      });
+      await this.#pushResult(userId, request, {
+        ok: true,
+        dryRun: true,
+        detail: "คำขอ telemetry ไม่มีสิทธิ์เข้าถึง TikTok"
+      });
+      return request;
+    }
+
     if (!this.executionEnabled) {
       request = this.store.cancelBudgetRequest(request.id, { actorLineUserId: userId, reason: "Dry run: EXECUTION_ENABLED=false", now: this.now() });
       await this.#pushResult(userId, request, { ok: true, dryRun: true, detail: "เปิด EXECUTION_ENABLED หลังผ่าน sandbox/low-budget test" });
@@ -1429,6 +1729,21 @@ export class BudgetGuardService {
     const results = [];
     for (const request of this.store.listBudgetRequests({ state: RequestState.EXECUTING, limit: 1000 })) {
       try {
+        if (telemetryOnlyRequest(request)) {
+          const failed = this.store.failBudgetRequest(request.id, {
+            code: "TELEMETRY_ONLY_REQUEST",
+            message: "Telemetry dry-run request cannot reach TikTok",
+            retryable: false,
+            now: this.now()
+          });
+          await this.#pushResult(request.execution.approvedByLineUserId, failed, {
+            ok: false,
+            dryRun: true,
+            detail: "ปิดคำขอ telemetry ที่เข้าสถานะ execution โดยไม่มีการเรียก TikTok"
+          });
+          results.push({ requestId: request.id, status: "FAILED_TELEMETRY_ONLY" });
+          continue;
+        }
         const mapping = this.#requestMapping(request);
         const info = await this.tiktok.getCampaignInfo({ advertiserId: request.adAccountId, campaignId: request.campaignId });
         this.#assertCampaignIdentity(info, mapping.client, mapping.campaign);

@@ -265,6 +265,16 @@ export class SqliteStore {
         FOREIGN KEY(credential_id) REFERENCES telemetry_credentials(credential_id)
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS telemetry_alert_evaluations (
+        snapshot_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        request_id TEXT,
+        evaluated_at TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        FOREIGN KEY(snapshot_id) REFERENCES telemetry_snapshots(snapshot_id),
+        FOREIGN KEY(request_id) REFERENCES budget_requests(id)
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS audit_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         request_id TEXT,
@@ -321,6 +331,8 @@ export class SqliteStore {
         ON telemetry_snapshots(client_id, observed_at DESC, received_at DESC);
       CREATE INDEX IF NOT EXISTS telemetry_nonces_received_idx
         ON telemetry_nonces(received_at);
+      CREATE INDEX IF NOT EXISTS telemetry_alert_evaluations_time_idx
+        ON telemetry_alert_evaluations(evaluated_at);
       CREATE INDEX IF NOT EXISTS audit_events_request_idx
         ON audit_events(request_id, sequence);
     `);
@@ -1099,6 +1111,16 @@ export class SqliteStore {
     return row ? this.#mapTelemetrySnapshot(row) : null;
   }
 
+  isTelemetrySnapshotCredentialActive(snapshotId) {
+    const row = this.db.prepare(`
+      SELECT c.revoked_at
+      FROM telemetry_snapshots s
+      JOIN telemetry_credentials c ON c.credential_id = s.credential_id
+      WHERE s.snapshot_id = ?
+    `).get(requiredString(snapshotId, 'snapshotId'));
+    return row ? row.revoked_at === null : null;
+  }
+
   getLatestTelemetry({ clientId } = {}) {
     const row = this.db.prepare(`
       ${this.#telemetrySnapshotSelect()}
@@ -1143,6 +1165,42 @@ export class SqliteStore {
       ORDER BY observed_at DESC, received_at DESC, snapshot_id DESC
       LIMIT ?
     `).all(...parameters, limit).map((row) => this.#mapTelemetrySnapshot(row));
+  }
+
+  getTelemetryAlertEvaluation(snapshotId) {
+    const row = this.db.prepare(`
+      SELECT snapshot_id, status, request_id, evaluated_at, details_json
+      FROM telemetry_alert_evaluations
+      WHERE snapshot_id = ?
+    `).get(requiredString(snapshotId, 'snapshotId'));
+    if (!row) return null;
+    return Object.freeze({
+      snapshotId: row.snapshot_id,
+      status: row.status,
+      requestId: row.request_id,
+      evaluatedAt: row.evaluated_at,
+      details: parseJson(row.details_json),
+    });
+  }
+
+  recordTelemetryAlertEvaluation({ snapshotId, status, requestId = null, evaluatedAt, details = {} } = {}) {
+    const normalizedSnapshotId = requiredString(snapshotId, 'snapshotId');
+    const normalizedStatus = requiredString(status, 'status');
+    const at = requiredIsoTime(evaluatedAt, 'evaluatedAt');
+    return this.#transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO telemetry_alert_evaluations
+          (snapshot_id, status, request_id, evaluated_at, details_json)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(
+        normalizedSnapshotId,
+        normalizedStatus,
+        requestId === null ? null : requiredString(requestId, 'requestId'),
+        at,
+        json(details, 'details'),
+      );
+      return this.getTelemetryAlertEvaluation(normalizedSnapshotId);
+    });
   }
 
   /**
@@ -1322,6 +1380,16 @@ export class SqliteStore {
       if (existing) return { enqueued: false, job: existing };
 
       const request = this.requireBudgetRequest(normalizedRequestId);
+      if (
+        request.metadata?.telemetryOnly === true
+        || request.metadata?.executionMode === 'APPROVAL_ONLY'
+      ) {
+        throw new DomainError(
+          'TELEMETRY_ONLY_REQUEST',
+          'Telemetry approval-only requests cannot be queued for execution',
+          { requestId: normalizedRequestId },
+        );
+      }
       if (!request.authorizedLineUserIds.includes(normalizedActor)) {
         throw new DomainError(
           'UNAUTHORIZED_APPROVER',

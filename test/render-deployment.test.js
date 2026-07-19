@@ -42,7 +42,8 @@ test("Render Blueprint is locked to the safe single-instance control plane", () 
     "EXECUTION_ENABLED",
     "MONITOR_ENABLED",
     "STARTUP_VALIDATION_ENABLED",
-    "CHROME_TELEMETRY_ENABLED"
+    "CHROME_TELEMETRY_ENABLED",
+    "CHROME_TELEMETRY_ALERTS_ENABLED"
   ]) {
     const value = ["CONTROL_PLANE_ONLY", "CHROME_TELEMETRY_ENABLED"].includes(flag)
       ? "true"

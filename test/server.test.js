@@ -8,7 +8,8 @@ import {
   lineWebhookHttpStatus,
   requiredEnvironmentVariables,
   resolveRuntimeMode,
-  resolveTelemetryOptions
+  resolveTelemetryOptions,
+  runNotificationCycle
 } from "../src/server.js";
 
 const adminKey = "x".repeat(43);
@@ -62,6 +63,7 @@ test("control-plane mode overrides mutation flags and does not require TikTok cr
   });
 
   assert.equal(runtime.controlPlaneOnly, true);
+  assert.equal(runtime.telemetryAlertsEnabled, false);
   assert.equal(runtime.executionEnabled, false);
   assert.equal(runtime.monitorEnabled, false);
   assert.equal(runtime.startupValidationEnabled, false);
@@ -83,8 +85,10 @@ test("control-plane mode overrides mutation flags and does not require TikTok cr
 
   const telemetryRuntime = resolveRuntimeMode({
     CONTROL_PLANE_ONLY: "true",
-    CHROME_TELEMETRY_ENABLED: "true"
+    CHROME_TELEMETRY_ENABLED: "true",
+    CHROME_TELEMETRY_ALERTS_ENABLED: "true"
   });
+  assert.equal(telemetryRuntime.telemetryAlertsEnabled, true);
   assert.deepEqual(telemetryRuntime.adapters.chromeTelemetry, {
     enabled: true,
     source: "signed-http-p256",
@@ -98,6 +102,36 @@ test("control-plane mode overrides mutation flags and does not require TikTok cr
     () => resolveTelemetryOptions({ CHROME_TELEMETRY_MAX_CLOCK_SKEW_SECONDS: "10" }),
     /between 30 and 900/
   );
+  assert.throws(
+    () => resolveRuntimeMode({
+      CONTROL_PLANE_ONLY: "true",
+      CHROME_TELEMETRY_ALERTS_ENABLED: "true"
+    }),
+    /requires CHROME_TELEMETRY_ENABLED=true/
+  );
+  assert.throws(
+    () => resolveRuntimeMode({
+      CONTROL_PLANE_ONLY: "false",
+      CHROME_TELEMETRY_ENABLED: "true",
+      CHROME_TELEMETRY_ALERTS_ENABLED: "true"
+    }),
+    /requires CONTROL_PLANE_ONLY=true/
+  );
+});
+
+test("notification cycle evaluates latest telemetry only when the opt-in flag is enabled", async () => {
+  const calls = [];
+  const service = {
+    async processLatestTelemetryDryRunAlerts(options) { calls.push(["telemetry", options]); },
+    async recoverLineWebhookEvents(options) { calls.push(["recovery", options]); },
+    async retryPendingAlerts(options) { calls.push(["alerts", options]); },
+    async retryPendingResults(options) { calls.push(["results", options]); }
+  };
+  await runNotificationCycle({ service, telemetryAlertsEnabled: false });
+  assert.deepEqual(calls.map(([name]) => name), ["recovery", "alerts", "results"]);
+  calls.length = 0;
+  await runNotificationCycle({ service, telemetryAlertsEnabled: true });
+  assert.deepEqual(calls.map(([name]) => name), ["telemetry", "recovery", "alerts", "results"]);
 });
 
 test("chrome-ui clients cannot start a runtime monitor before that adapter exists", () => {
