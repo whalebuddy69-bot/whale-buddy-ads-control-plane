@@ -14,10 +14,26 @@ test("manifest uses MV3 and only the approved minimal permissions", () => {
   assert.deepEqual(manifest.content_scripts[0].matches, [
     "https://ads.tiktok.com/i18n/gmv-max/dashboard*"
   ]);
+  assert.deepEqual(manifest.content_scripts[0].js, [
+    "lib/refresh-safety.js",
+    "lib/tiktok-parser.js",
+    "content/tiktok-live-gmv-max.js"
+  ]);
 });
 
 test("service worker keeps the Chrome campaign ID boundary explicit", async () => {
   const source = await readFile(new URL("../service-worker.js", import.meta.url), "utf8");
   assert.match(source, /campaignId:\s*null/u);
   assert.doesNotMatch(source, /chrome\.(?:cookies|debugger|webRequest|scripting)/u);
+});
+
+test("refresh fallback is visible, configurable, and manual check does not claim freshness", async () => {
+  const options = await readFile(new URL("../ui/options.html", import.meta.url), "utf8");
+  const popup = await readFile(new URL("../ui/popup.html", import.meta.url), "utf8");
+  assert.match(options, /id="page-refresh-enabled"/u);
+  assert.match(options, /value="2">ทุก 2 นาที/u);
+  assert.match(options, /เมื่อเชื่อม TikTok API แล้วให้กลับมาปิด/u);
+  assert.match(options, /อ่านค่าหน้าปัจจุบัน \(ไม่รีเฟรช\)/u);
+  assert.match(popup, /Page-refresh fallback/u);
+  assert.match(popup, /อ่านค่าหน้าปัจจุบัน/u);
 });

@@ -338,12 +338,91 @@ test("confirmation rechecks request expiry before any dry-run completion or queu
   assert.match(current.line.replies.at(-1).message.text, /หมดอายุ/);
 });
 
+test("a verified daily-budget change bypasses cooldown, starts a new round, and notifies once", async (t) => {
+  const current = harness();
+  t.after(() => current.store.close());
+  const firstAlert = await current.service.processTelemetrySnapshotForDryRunAlert({ snapshot: snapshot() });
+  let firstRequest = current.store.requireBudgetRequest(firstAlert.requestId);
+  await current.service.handleLineEvents([{
+    webhookEventId: "telemetry-round-suggest",
+    type: "postback",
+    source: { type: "user", userId: "U1" },
+    replyToken: "reply-round-suggest",
+    postback: { data: `a=suggest&id=${firstRequest.id}` }
+  }]);
+  firstRequest = current.store.requireBudgetRequest(firstRequest.id);
+  await current.service.handleLineEvents([{
+    webhookEventId: "telemetry-round-confirm",
+    type: "postback",
+    source: { type: "user", userId: "U1" },
+    replyToken: "reply-round-confirm",
+    postback: { data: `a=confirm&id=${firstRequest.id}&v=${firstRequest.version}` }
+  }]);
+  assert.equal(current.store.requireBudgetRequest(firstRequest.id).state, RequestState.CANCELLED);
+
+  const unchanged = await current.service.processTelemetrySnapshotForDryRunAlert({
+    snapshot: snapshot({ snapshotId: "ts_same-budget-after-terminal-aaaaaaaaaaaa" })
+  });
+  assert.equal(unchanged.status, "SKIP_COOLDOWN");
+
+  const changedBelow = await current.service.processTelemetrySnapshotForDryRunAlert({
+    snapshot: snapshot({
+      snapshotId: "ts_changed-budget-below-threshold-aaaaaaaa",
+      dailyBudgetMinor: 120_000,
+      totalBudgetMinor: 120_000,
+      costMinor: 60_000
+    })
+  });
+  assert.equal(changedBelow.status, "BELOW_THRESHOLD");
+  const changeMessages = () => current.line.pushes.filter(({ message }) =>
+    typeof message?.text === "string" && message.text.includes("ปรับงบแล้ว")
+  );
+  assert.equal(changeMessages().length, 1);
+  assert.match(changeMessages()[0].message.text, /ระบบนี้ไม่ได้แก้ TikTok/);
+
+  const repeatedChanged = await current.service.processTelemetrySnapshotForDryRunAlert({
+    snapshot: snapshot({
+      snapshotId: "ts_changed-budget-repeated-aaaaaaaaaaaaa",
+      dailyBudgetMinor: 120_000,
+      totalBudgetMinor: 120_000,
+      costMinor: 60_000
+    })
+  });
+  assert.equal(repeatedChanged.status, "BELOW_THRESHOLD");
+  assert.equal(changeMessages().length, 1);
+
+  const secondAlert = await current.service.processTelemetrySnapshotForDryRunAlert({
+    snapshot: snapshot({
+      snapshotId: "ts_changed-budget-at-threshold-aaaaaaaaa",
+      dailyBudgetMinor: 120_000,
+      totalBudgetMinor: 120_000,
+      costMinor: 96_000
+    })
+  });
+  assert.equal(secondAlert.status, "ALERT_DELIVERED");
+  const secondRequest = current.store.requireBudgetRequest(secondAlert.requestId);
+  assert.notEqual(secondRequest.id, firstRequest.id);
+  assert.equal(secondRequest.currentBudgetMinor, 120_000);
+  assert.equal(secondRequest.metadata.suggestedTargetMinor, 144_000);
+  assert.equal(changeMessages().length, 1);
+  assert.equal(current.tiktok.calls.length, 0);
+
+  const sentAudits = current.store.listAuditEvents({
+    requestId: firstRequest.id,
+    eventType: "LINE_BUDGET_CHANGE_SENT",
+    limit: 1000
+  });
+  assert.equal(sentAudits.length, 1);
+  assert.equal(sentAudits[0].details.observedBudgetMinor, 120_000);
+});
+
 test("latest-snapshot worker records one persistent evaluation marker", async () => {
   const input = snapshot({ costMinor: 79_999 });
   const evaluations = new Map();
   const store = {
     listLatestTelemetry() { return [input]; },
     getTelemetryAlertEvaluation(snapshotId) { return evaluations.get(snapshotId) ?? null; },
+    getLatestBudgetRequest() { return null; },
     recordTelemetryAlertEvaluation(value) {
       evaluations.set(value.snapshotId, value);
       return value;

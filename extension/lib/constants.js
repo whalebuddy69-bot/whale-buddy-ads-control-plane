@@ -28,7 +28,8 @@ export const STORAGE_KEYS = Object.freeze({
   installationId: "installationId",
   credential: "telemetryCredential",
   status: "collectorStatus",
-  lease: "collectorLease"
+  lease: "collectorLease",
+  pageRefreshSettings: "pageRefreshSettings"
 });
 
 export const ALARM_NAME = "wb-live-gmv-check";
@@ -38,7 +39,9 @@ export const MESSAGE_TYPES = Object.freeze({
   collect: "WB_COLLECT_TIKTOK_LIVE",
   enroll: "WB_ENROLL_TELEMETRY",
   checkNow: "WB_CHECK_NOW",
-  getStatus: "WB_GET_STATUS"
+  getStatus: "WB_GET_STATUS",
+  updatePageRefreshSettings: "WB_UPDATE_PAGE_REFRESH_SETTINGS",
+  refreshIfSafe: "WB_REFRESH_TIKTOK_IF_SAFE"
 });
 
 export const DASHBOARD = Object.freeze({

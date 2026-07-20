@@ -15,6 +15,12 @@ import {
   telemetryUiCampaignRef
 } from "./lib/auth.js";
 import { getDeviceKeyPair, getOrCreateDeviceKeyPair } from "./lib/idb.js";
+import {
+  PAGE_RELOAD_TIMEOUT_MILLISECONDS,
+  normalizePageRefreshSettings,
+  pageRefreshDue,
+  validatePageRefreshSettings
+} from "./lib/refresh-policy.js";
 
 class CollectorFailure extends Error {
   constructor(code, message) {
@@ -25,6 +31,7 @@ class CollectorFailure extends Error {
 }
 
 let activeCheck = null;
+const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
 async function protectExtensionStorage() {
   await chrome.storage.local.setAccessLevel({ accessLevel: "TRUSTED_CONTEXTS" });
@@ -46,9 +53,11 @@ async function readStatus() {
   const stored = await chrome.storage.local.get([
     STORAGE_KEYS.status,
     STORAGE_KEYS.credential,
-    STORAGE_KEYS.installationId
+    STORAGE_KEYS.installationId,
+    STORAGE_KEYS.pageRefreshSettings
   ]);
   const credential = stored[STORAGE_KEYS.credential] ?? null;
+  const pageRefresh = normalizePageRefreshSettings(stored[STORAGE_KEYS.pageRefreshSettings]);
   return {
     mode: credential ? "ready" : "not_enrolled",
     message: credential ? "เชื่อมต่อแล้ว รอตรวจหน้า TikTok" : "ยังไม่ได้เชื่อมต่อกับ Whale Buddy Ads",
@@ -57,8 +66,31 @@ async function readStatus() {
     clientId: credential?.clientId ?? PILOT_BINDING.clientId,
     browserProfile: credential?.browserProfile ?? PILOT_BINDING.browserProfile,
     tabGroup: credential?.tabGroup ?? PILOT_BINDING.tabGroup,
-    installationId: stored[STORAGE_KEYS.installationId] ?? null
+    installationId: stored[STORAGE_KEYS.installationId] ?? null,
+    pageRefresh
   };
+}
+
+async function readPageRefreshSettings() {
+  await protectExtensionStorage();
+  const stored = await chrome.storage.local.get(STORAGE_KEYS.pageRefreshSettings);
+  return normalizePageRefreshSettings(stored[STORAGE_KEYS.pageRefreshSettings]);
+}
+
+async function updatePageRefreshSettings(input) {
+  let settings;
+  try {
+    settings = validatePageRefreshSettings(input);
+  } catch {
+    throw new CollectorFailure("INVALID_PAGE_REFRESH_SETTINGS", "การตั้งค่ารีเฟรชหน้าไม่ถูกต้อง");
+  }
+  await protectExtensionStorage();
+  await chrome.storage.local.set({ [STORAGE_KEYS.pageRefreshSettings]: settings });
+  await updateStatus({
+    lastAutoRefreshSkipReason: null,
+    pageRefreshChangedAt: new Date().toISOString()
+  });
+  return readStatus();
 }
 
 async function updateStatus(patch) {
@@ -135,7 +167,10 @@ async function enroll(enrollmentCode) {
     !/^tc_[A-Za-z0-9_-]{16,80}$/u.test(payload.credentialId ?? "") ||
     payload.clientId !== PILOT_BINDING.clientId ||
     payload.binding?.browserProfile !== PILOT_BINDING.browserProfile ||
-    payload.binding?.tabGroup !== PILOT_BINDING.tabGroup
+    payload.binding?.tabGroup !== PILOT_BINDING.tabGroup ||
+    payload.binding?.businessCenterId !== PILOT_BINDING.businessCenterId ||
+    payload.binding?.sellerMode !== PILOT_BINDING.sellerMode ||
+    payload.binding?.pageType !== PILOT_BINDING.pageType
   ) {
     throw new CollectorFailure("ENROLLMENT_BINDING_MISMATCH", "ข้อมูลบัญชีจากเซิร์ฟเวอร์ไม่ตรง Pilot นี้");
   }
@@ -145,6 +180,9 @@ async function enroll(enrollmentCode) {
     installationId: currentInstallationId,
     browserProfile: payload.binding.browserProfile,
     tabGroup: payload.binding.tabGroup,
+    businessCenterId: payload.binding.businessCenterId,
+    sellerMode: payload.binding.sellerMode,
+    pageType: payload.binding.pageType,
     enrolledAt: new Date().toISOString()
   };
   await chrome.storage.local.set({ [STORAGE_KEYS.credential]: credential });
@@ -213,7 +251,27 @@ function validateDashboardUrl(rawUrl) {
   requireExactParameter(url, "type", PILOT_BINDING.pageType);
 }
 
-async function readTikTokObservation(credential) {
+function assertCredentialBinding(credential) {
+  const exact = [
+    [credential?.clientId, PILOT_BINDING.clientId],
+    [credential?.browserProfile, PILOT_BINDING.browserProfile],
+    [credential?.tabGroup, PILOT_BINDING.tabGroup]
+  ];
+  const optionalExact = [
+    [credential?.businessCenterId, PILOT_BINDING.businessCenterId],
+    [credential?.sellerMode, PILOT_BINDING.sellerMode],
+    [credential?.pageType, PILOT_BINDING.pageType]
+  ];
+  if (
+    exact.some(([actual, expected]) => actual !== expected)
+    || optionalExact.some(([actual, expected]) => actual != null && actual !== expected)
+  ) {
+    throw new CollectorFailure("CREDENTIAL_BINDING_MISMATCH", "ข้อมูลเชื่อมต่อไม่ตรง Pilot นี้");
+  }
+}
+
+async function resolveBoundDashboardTab(credential, { requireComplete = true } = {}) {
+  assertCredentialBinding(credential);
   const groups = await chrome.tabGroups.query({});
   const matchingGroups = groups.filter((group) => normalizeText(group.title) === credential.tabGroup);
   if (matchingGroups.length === 0) {
@@ -232,23 +290,37 @@ async function readTikTokObservation(credential) {
     throw new CollectorFailure("SUPPORTED_TAB_AMBIGUOUS", "พบหน้า LIVE GMV Max มากกว่าหนึ่งแท็บในกลุ่ม Ppan");
   }
   const tab = dashboards[0];
-  if (tab.status !== "complete" || tab.discarded === true || tab.frozen === true) {
+  if (
+    (requireComplete && tab.status !== "complete")
+    || tab.discarded === true
+    || tab.frozen === true
+    || tab.groupId !== matchingGroups[0].id
+  ) {
     throw new CollectorFailure("TAB_NOT_READY", "แท็บ TikTok ยังไม่พร้อม กรุณาเปิดแท็บไว้แล้วลองใหม่");
   }
   validateDashboardUrl(tab.url);
+  return tab;
+}
+
+function refreshBinding() {
+  return {
+    advertiserId: PILOT_BINDING.advertiserId,
+    businessCenterId: PILOT_BINDING.businessCenterId,
+    expectedTikTokAccountId: PILOT_BINDING.expectedTikTokAccountId,
+    campaignStart: `${PILOT_BINDING.liveWindow.start}:00`,
+    sellerMode: PILOT_BINDING.sellerMode,
+    pageType: PILOT_BINDING.pageType
+  };
+}
+
+async function readTikTokObservation(credential) {
+  const tab = await resolveBoundDashboardTab(credential);
 
   let response;
   try {
     response = await chrome.tabs.sendMessage(tab.id, {
       type: MESSAGE_TYPES.collect,
-      binding: {
-        advertiserId: PILOT_BINDING.advertiserId,
-        businessCenterId: PILOT_BINDING.businessCenterId,
-        expectedTikTokAccountId: PILOT_BINDING.expectedTikTokAccountId,
-        campaignStart: `${PILOT_BINDING.liveWindow.start}:00`,
-        sellerMode: PILOT_BINDING.sellerMode,
-        pageType: PILOT_BINDING.pageType
-      }
+      binding: refreshBinding()
     });
   } catch {
     throw new CollectorFailure(
@@ -286,6 +358,110 @@ async function readTikTokObservation(credential) {
     throw new CollectorFailure("COLLECTOR_RESPONSE_INVALID", "ตัวอ่านส่งข้อมูลที่ไม่ครบถ้วน");
   }
   return value;
+}
+
+function createReloadWaiter(tabId, credential) {
+  let settled = false;
+  let sawLoading = false;
+  let timer;
+  let resolvePromise;
+  let rejectPromise;
+  const cleanup = () => {
+    chrome.tabs.onUpdated.removeListener(onUpdated);
+    clearTimeout(timer);
+  };
+  const finish = (callback, value) => {
+    if (settled) return;
+    settled = true;
+    cleanup();
+    callback(value);
+  };
+  const onUpdated = (updatedTabId, changeInfo, tab) => {
+    if (updatedTabId !== tabId) return;
+    if (changeInfo.status === "loading") sawLoading = true;
+    if (!sawLoading || changeInfo.status !== "complete") return;
+    try {
+      if (tab.discarded === true || tab.frozen === true) {
+        throw new CollectorFailure("TAB_NOT_READY", "แท็บ TikTok ไม่พร้อมหลังรีเฟรช");
+      }
+      validateDashboardUrl(tab.url);
+      finish(resolvePromise, tab);
+    } catch (error) {
+      finish(rejectPromise, error);
+    }
+  };
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
+    timer = setTimeout(() => {
+      finish(
+        reject,
+        new CollectorFailure(
+          "AUTO_REFRESH_TIMEOUT",
+          "รีเฟรชหน้า TikTok ไม่เสร็จ ระบบจึงงดส่งข้อมูลรอบนี้"
+        )
+      );
+    }, PAGE_RELOAD_TIMEOUT_MILLISECONDS);
+    chrome.tabs.onUpdated.addListener(onUpdated);
+  });
+  return {
+    promise,
+    cancel() { finish(resolvePromise, null); }
+  };
+}
+
+async function refreshBoundDashboardIfSafe(credential) {
+  const tab = await resolveBoundDashboardTab(credential);
+  const waiter = createReloadWaiter(tab.id, credential);
+  await updateStatus({
+    mode: "working",
+    message: "กำลังตรวจว่าหน้า TikTok ปลอดภัยต่อการรีเฟรช…",
+    errorCode: null,
+    lastAutoRefreshAttemptAt: new Date().toISOString()
+  });
+  let response;
+  try {
+    response = await chrome.tabs.sendMessage(tab.id, {
+      type: MESSAGE_TYPES.refreshIfSafe,
+      binding: refreshBinding()
+    });
+  } catch (error) {
+    // A successful location.reload() can close the message port before Chrome
+    // delivers the response. The waiter still requires a real loading→complete
+    // transition; without it this path times out and sends no snapshot.
+    response = null;
+  }
+  if (response?.ok === true && response.safeToReload === false) {
+    waiter.cancel();
+    await waiter.promise;
+    const reasons = Array.isArray(response.reasons)
+      ? response.reasons.filter((reason) => typeof reason === "string").slice(0, 8)
+      : ["SAFETY_CHECK_FAILED"];
+    return { reloaded: false, blocked: true, reasons };
+  }
+  if (response && (response.ok !== true || response.safeToReload !== true)) {
+    waiter.cancel();
+    await waiter.promise;
+    throw new CollectorFailure(
+      "AUTO_REFRESH_SAFETY_UNAVAILABLE",
+      "ยืนยันความปลอดภัยก่อนรีเฟรชไม่ได้ ระบบจึงงดส่งข้อมูลรอบนี้"
+    );
+  }
+  const reloadedTab = await waiter.promise;
+  if (!reloadedTab) {
+    throw new CollectorFailure("AUTO_REFRESH_NOT_STARTED", "หน้า TikTok ไม่ได้เริ่มรีเฟรช");
+  }
+  await delay(750);
+  const current = await resolveBoundDashboardTab(credential);
+  if (current.id !== tab.id) {
+    throw new CollectorFailure("TAB_BINDING_CHANGED", "แท็บ TikTok เปลี่ยนระหว่างรีเฟรช");
+  }
+  const refreshedAt = new Date().toISOString();
+  await updateStatus({
+    lastAutoRefreshAt: refreshedAt,
+    lastAutoRefreshSkipReason: null
+  });
+  return { reloaded: true, refreshedAt };
 }
 
 async function buildSnapshot(observation, credential) {
@@ -361,7 +537,7 @@ async function acquireLease() {
   const now = Date.now();
   const current = (await chrome.storage.local.get(STORAGE_KEYS.lease))[STORAGE_KEYS.lease];
   if (current?.until > now) return null;
-  const lease = { holder: randomBase64Url(12), until: now + 45_000 };
+  const lease = { holder: randomBase64Url(12), until: now + 90_000 };
   await chrome.storage.local.set({ [STORAGE_KEYS.lease]: lease });
   const verified = (await chrome.storage.local.get(STORAGE_KEYS.lease))[STORAGE_KEYS.lease];
   return verified?.holder === lease.holder ? lease : null;
@@ -395,9 +571,34 @@ async function runCheck({ manual = false } = {}) {
     const lease = await acquireLease();
     if (!lease) return { skipped: true, reason: "CHECK_IN_PROGRESS" };
     try {
+      const pageRefresh = await readPageRefreshSettings();
+      const status = await readStatus();
+      if (
+        !manual
+        && pageRefreshDue({
+          settings: pageRefresh,
+          lastReloadAt: status.lastAutoRefreshAt,
+          now: new Date()
+        })
+      ) {
+        const refresh = await refreshBoundDashboardIfSafe(credential);
+        if (refresh.blocked) {
+          const reason = refresh.reasons.join(",");
+          await updateStatus({
+            mode: "waiting",
+            message: "งดรีเฟรชและงดส่งข้อมูลรอบนี้ เพราะหน้า TikTok อาจมีงานที่ยังไม่บันทึก",
+            errorCode: null,
+            lastAutoRefreshSkipReason: reason,
+            lastAttemptAt: new Date().toISOString()
+          });
+          return { skipped: true, reason: "AUTO_REFRESH_BLOCKED_UNSAFE", safetyReasons: refresh.reasons };
+        }
+      }
       await updateStatus({
         mode: "working",
-        message: "กำลังอ่านหน้า TikTok แบบ read-only…",
+        message: manual
+          ? "กำลังอ่านค่าที่แสดงบนหน้า TikTok โดยไม่รีเฟรชหน้า…"
+          : "กำลังอ่านหน้า TikTok แบบ read-only…",
         errorCode: null,
         lastAttemptAt: new Date().toISOString()
       });
@@ -496,6 +697,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === MESSAGE_TYPES.checkNow) {
     runCheck({ manual: true })
       .then((result) => sendResponse({ ok: true, result }))
+      .catch((error) => sendResponse({ ok: false, error: safeError(error) }));
+    return true;
+  }
+  if (message?.type === MESSAGE_TYPES.updatePageRefreshSettings) {
+    updatePageRefreshSettings({
+      enabled: message.enabled,
+      intervalMinutes: message.intervalMinutes
+    })
+      .then((status) => sendResponse({ ok: true, status }))
       .catch((error) => sendResponse({ ok: false, error: safeError(error) }));
     return true;
   }

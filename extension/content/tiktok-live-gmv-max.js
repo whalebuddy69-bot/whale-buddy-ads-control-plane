@@ -2,13 +2,19 @@
   "use strict";
 
   const parser = globalThis.WhaleBuddyTikTokParser;
+  const refreshSafety = globalThis.WhaleBuddyRefreshSafety;
   const COLLECT_MESSAGE = "WB_COLLECT_TIKTOK_LIVE";
+  const REFRESH_IF_SAFE_MESSAGE = "WB_REFRESH_TIKTOK_IF_SAFE";
+  const USER_QUIET_MILLISECONDS = 5 * 60_000;
   const RETRYABLE_CODES = new Set([
     "TABLE_NOT_READY",
     "TABLE_SHAPE_CHANGED",
     "CAMPAIGN_NOT_FOUND",
     "DOM_ADVERTISER_UNVERIFIED"
   ]);
+  const dirtyControls = new Set();
+  let lastTrustedInteractionAt = null;
+  let pendingSubmission = false;
 
   function collectorError(code, message, details) {
     const error = new Error(message);
@@ -88,6 +94,96 @@
 
   function visibleText(element) {
     return typeof element.innerText === "string" ? element.innerText : (element.textContent ?? "");
+  }
+
+  function isVisible(element) {
+    if (!(element instanceof Element) || !element.isConnected) return false;
+    const style = globalThis.getComputedStyle(element);
+    return style.display !== "none"
+      && style.visibility !== "hidden"
+      && style.opacity !== "0"
+      && element.getClientRects().length > 0;
+  }
+
+  function editableControl(element) {
+    if (!(element instanceof Element)) return null;
+    const candidate = element.matches(
+      "input, textarea, select, [contenteditable=''], [contenteditable='true'], [role='textbox'], [role='combobox'], [role='spinbutton']"
+    )
+      ? element
+      : element.closest(
+        "[contenteditable=''], [contenteditable='true'], [role='textbox'], [role='combobox'], [role='spinbutton']"
+      );
+    if (!candidate) return null;
+    if (candidate.tagName !== "INPUT") return candidate;
+    return new Set(["button", "hidden", "image", "reset", "submit"])
+      .has(String(candidate.getAttribute("type") ?? "text").toLowerCase())
+      ? null
+      : candidate;
+  }
+
+  function isEditable(element) {
+    return editableControl(element) !== null;
+  }
+
+  function controlIsDirty(element) {
+    const control = editableControl(element);
+    if (!control || !control.isConnected) return false;
+    if (control.matches("[contenteditable=''], [contenteditable='true']")) {
+      return dirtyControls.has(control) || parser.normalizeText(control.textContent) !== "";
+    }
+    if (control.tagName === "SELECT") {
+      return [...control.options].some((option) => option.selected !== option.defaultSelected);
+    }
+    if (control.tagName === "INPUT") {
+      const type = String(control.type ?? "text").toLowerCase();
+      if (type === "checkbox" || type === "radio") return control.checked !== control.defaultChecked;
+    }
+    return "value" in control && "defaultValue" in control
+      ? control.value !== control.defaultValue
+      : dirtyControls.has(control);
+  }
+
+  function pruneDirtyControls() {
+    for (const element of dirtyControls) {
+      if (!element.isConnected) dirtyControls.delete(element);
+    }
+  }
+
+  function refreshSafetySignals(binding) {
+    let bindingVerified = false;
+    try {
+      assertUrlIdentity(binding);
+      assertVisibleAdvertiser(binding);
+      bindingVerified = true;
+    } catch {
+      bindingVerified = false;
+    }
+    pruneDirtyControls();
+    const activeElement = document.activeElement;
+    const visibleDialog = [...document.querySelectorAll("dialog[open], [role='dialog'], [aria-modal='true']")]
+      .some(isVisible);
+    const pageBusy = [...document.querySelectorAll("[aria-busy='true']")].some(isVisible);
+    return {
+      bindingVerified,
+      documentReady: document.readyState === "complete",
+      recentUserActivity: lastTrustedInteractionAt !== null
+        && Date.now() - lastTrustedInteractionAt < USER_QUIET_MILLISECONDS,
+      dirtyControl: dirtyControls.size > 0 || [...document.querySelectorAll(
+        "input, textarea, select, [contenteditable=''], [contenteditable='true'], [role='textbox'], [role='combobox'], [role='spinbutton']"
+      )].some(controlIsDirty),
+      focusedEditable: isEditable(activeElement),
+      visibleDialog,
+      pageBusy,
+      pendingSubmission
+    };
+  }
+
+  function decideRefresh(binding) {
+    if (!refreshSafety?.evaluateRefreshSafety) {
+      return { safeToReload: false, reasons: ["SAFETY_MODULE_UNAVAILABLE"] };
+    }
+    return refreshSafety.evaluateRefreshSafety(refreshSafetySignals(binding));
   }
 
   function extractTableModel() {
@@ -196,13 +292,45 @@
     };
   }
 
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message?.type !== COLLECT_MESSAGE) return false;
+  function recordInteraction(event) {
+    if (event.isTrusted) lastTrustedInteractionAt = Date.now();
+  }
+
+  for (const eventName of ["pointerdown", "keydown", "touchstart", "focusin"]) {
+    document.addEventListener(eventName, recordInteraction, true);
+  }
+  for (const eventName of ["beforeinput", "input", "change"]) {
+    document.addEventListener(eventName, (event) => {
+      recordInteraction(event);
+      const control = editableControl(event.target);
+      if (event.isTrusted && control) dirtyControls.add(control);
+    }, true);
+  }
+  document.addEventListener("submit", (event) => {
+    recordInteraction(event);
+    if (event.isTrusted) pendingSubmission = true;
+  }, true);
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (sender?.id !== chrome.runtime.id) return false;
+    if (![COLLECT_MESSAGE, REFRESH_IF_SAFE_MESSAGE].includes(message?.type)) return false;
     let binding;
     try {
       binding = validateBinding(message.binding);
     } catch (error) {
       sendResponse(safeFailure(error));
+      return false;
+    }
+    if (message.type === REFRESH_IF_SAFE_MESSAGE) {
+      const decision = decideRefresh(binding);
+      if (!decision.safeToReload) {
+        sendResponse({ ok: true, safeToReload: false, reasons: decision.reasons });
+        return false;
+      }
+      // The safety decision and navigation happen in the same content-script
+      // task, so a user edit cannot interleave between them.
+      sendResponse({ ok: true, safeToReload: true, reloadStarted: true });
+      globalThis.location.reload();
       return false;
     }
     collectWithBoundedWait(binding)

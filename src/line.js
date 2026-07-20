@@ -231,7 +231,7 @@ export function buildResultMessage({ request, ok, detail, dryRun = false, pendin
     : dryRun
       ? "🧪 ทดสอบสำเร็จ (ยังไม่แก้งบ)"
       : ok
-        ? "✅ เพิ่มงบสำเร็จ"
+        ? "✅ ปรับงบแล้ว"
         : "❌ เพิ่มงบไม่สำเร็จ";
   const lines = [
     heading,
@@ -240,6 +240,27 @@ export function buildResultMessage({ request, ok, detail, dryRun = false, pendin
     `Audit: ${request.id.slice(0, 12)}`
   ];
   if (detail) lines.push(detail);
+  return { type: "text", text: lines.join("\n") };
+}
+
+export function buildObservedBudgetChangeMessage({
+  clientName,
+  campaignName,
+  currency,
+  previousBudget,
+  observedBudget,
+  requestId,
+  telemetryOnly = false
+}) {
+  const lines = [
+    telemetryOnly ? "✅ ตรวจพบว่าปรับงบแล้ว" : "✅ ปรับงบแล้ว",
+    `${clientName} — ${campaignName}`,
+    `${formatMoney(previousBudget, currency)} → ${formatMoney(observedBudget, currency)}`,
+    telemetryOnly
+      ? "ตรวจยืนยันจาก signed Chrome telemetry — ระบบนี้ไม่ได้แก้ TikTok"
+      : "ระบบตรวจยืนยันงบใหม่แล้ว",
+    `Audit: ${String(requestId).slice(0, 12)}`
+  ];
   return { type: "text", text: lines.join("\n") };
 }
 

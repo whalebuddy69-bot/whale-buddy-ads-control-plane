@@ -13,7 +13,8 @@ const elements = {
   budget: document.querySelector("#budget-value"),
   observedAt: document.querySelector("#observed-at"),
   checkNow: document.querySelector("#check-now"),
-  openOptions: document.querySelector("#open-options")
+  openOptions: document.querySelector("#open-options"),
+  refreshFallback: document.querySelector("#refresh-fallback")
 };
 
 const modeLabels = {
@@ -54,6 +55,10 @@ function render(status) {
   elements.profile.textContent = status?.browserProfile ?? "Whalebuddy Ads";
   elements.tabGroup.textContent = status?.tabGroup ?? "Ppan";
   elements.checkNow.disabled = !status?.enrolled || mode === "working";
+  const pageRefresh = status?.pageRefresh ?? { enabled: true, intervalMinutes: 2 };
+  elements.refreshFallback.textContent = pageRefresh.enabled
+    ? `Page-refresh fallback: เปิด · ทุก ${pageRefresh.intervalMinutes} นาที`
+    : "Page-refresh fallback: ปิด · อ่านเฉพาะค่าที่หน้าแสดง";
 
   const snapshot = status?.lastSnapshot;
   elements.snapshotCard.hidden = !snapshot;
@@ -76,7 +81,7 @@ elements.checkNow.addEventListener("click", async () => {
   elements.checkNow.disabled = true;
   elements.checkNow.textContent = "กำลังตรวจ…";
   await chrome.runtime.sendMessage({ type: MESSAGE_TYPES.checkNow }).catch(() => null);
-  elements.checkNow.textContent = "ตรวจตอนนี้";
+  elements.checkNow.textContent = "อ่านค่าหน้าปัจจุบัน";
   await refresh();
 });
 

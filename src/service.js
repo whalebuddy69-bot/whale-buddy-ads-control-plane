@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
-import { DomainError, RequestState, createBudgetRequest } from "./domain.js";
+import { DomainError, RequestState, createBudgetRequest, isTerminalState } from "./domain.js";
 import {
   buildBudgetAlertMessage,
+  buildObservedBudgetChangeMessage,
   buildBudgetConfirmationMessage,
   buildResultMessage,
   parseBudgetText,
@@ -655,10 +656,101 @@ export class BudgetGuardService {
       : null;
   }
 
-  #cooldownUntil(adAccountId, campaignId) {
+  #terminalReferenceBudgetMinor(request) {
+    return request.state === RequestState.SUCCEEDED && request.result?.actualBudgetMinor != null
+      ? request.result.actualBudgetMinor
+      : request.currentBudgetMinor;
+  }
+
+  #latestTerminalRequest(adAccountId, campaignId) {
+    const latest = this.store.getLatestBudgetRequest({
+      adAccountId: String(adAccountId),
+      campaignId: String(campaignId)
+    });
+    return latest && isTerminalState(latest.state) ? latest : null;
+  }
+
+  #cooldownUntil(adAccountId, campaignId, { observedBudgetMinor = null } = {}) {
     const latest = this.store.getLatestBudgetRequest({ adAccountId: String(adAccountId), campaignId: String(campaignId) });
     if (!latest || [RequestState.PENDING_INPUT, RequestState.PENDING_APPROVAL, RequestState.EXECUTING].includes(latest.state)) return null;
+    if (
+      observedBudgetMinor !== null
+      && Number.isSafeInteger(observedBudgetMinor)
+      && observedBudgetMinor !== this.#terminalReferenceBudgetMinor(latest)
+    ) {
+      return null;
+    }
     return new Date(Date.parse(latest.updatedAt) + this.config.cooldownMinutes * 60_000);
+  }
+
+  async #notifyObservedBudgetChange({ request, snapshot, client }) {
+    const referenceBudgetMinor = this.#terminalReferenceBudgetMinor(request);
+    if (snapshot.dailyBudgetMinor === referenceBudgetMinor) return { delivered: 0, total: 0 };
+    const sent = new Set(
+      this.store.listAuditEvents({
+        requestId: request.id,
+        eventType: "LINE_BUDGET_CHANGE_SENT",
+        limit: 1000
+      })
+        .filter((event) => event.details.observedBudgetMinor === snapshot.dailyBudgetMinor)
+        .map((event) => event.details.approverIndex)
+        .filter(Number.isSafeInteger)
+    );
+    let total = 0;
+    for (let index = 0; index < request.authorizedLineUserIds.length; index += 1) {
+      const userId = request.authorizedLineUserIds[index];
+      if (!this.#isCurrentApprover(client, userId)) continue;
+      total += 1;
+      if (sent.has(index)) continue;
+      const retryKey = stableRetryKey(
+        "observed-budget-change",
+        request.id,
+        String(snapshot.dailyBudgetMinor),
+        String(index)
+      );
+      try {
+        await this.line.push(userId, buildObservedBudgetChangeMessage({
+          clientName: request.metadata.clientName,
+          campaignName: snapshot.campaignName,
+          currency: snapshot.currency,
+          previousBudget: fromMinor(referenceBudgetMinor, snapshot.currency),
+          observedBudget: fromMinor(snapshot.dailyBudgetMinor, snapshot.currency),
+          requestId: request.id,
+          telemetryOnly: telemetryOnlyRequest(request)
+        }), retryKey);
+        sent.add(index);
+        this.store.appendAuditEvent({
+          requestId: request.id,
+          eventType: "LINE_BUDGET_CHANGE_SENT",
+          actorType: "SYSTEM",
+          occurredAt: this.now(),
+          details: {
+            snapshotId: snapshot.snapshotId,
+            observedBudgetMinor: snapshot.dailyBudgetMinor,
+            referenceBudgetMinor,
+            approverIndex: index,
+            retryKey,
+            telemetryOnly: telemetryOnlyRequest(request)
+          }
+        });
+      } catch (error) {
+        this.store.appendAuditEvent({
+          requestId: request.id,
+          eventType: "LINE_BUDGET_CHANGE_FAILED",
+          actorType: "SYSTEM",
+          occurredAt: this.now(),
+          details: {
+            snapshotId: snapshot.snapshotId,
+            observedBudgetMinor: snapshot.dailyBudgetMinor,
+            referenceBudgetMinor,
+            approverIndex: index,
+            retryKey,
+            error: String(error?.message ?? error).slice(0, 500)
+          }
+        });
+      }
+    }
+    return { delivered: sent.size, total };
   }
 
   async processTelemetrySnapshotForDryRunAlert({ snapshot, latest = true } = {}) {
@@ -762,6 +854,13 @@ export class BudgetGuardService {
     ) {
       return skip("SKIP_OVER_POLICY_CAP");
     }
+    const latestTerminal = this.#latestTerminalRequest(client.advertiserId, snapshot.campaignRef);
+    if (
+      latestTerminal
+      && snapshot.dailyBudgetMinor !== this.#terminalReferenceBudgetMinor(latestTerminal)
+    ) {
+      await this.#notifyObservedBudgetChange({ request: latestTerminal, snapshot, client });
+    }
     if (snapshot.dailyBudgetMinor >= capMinor) return skip("SKIP_NO_SAFE_INCREASE");
     if (!thresholdReached(snapshot.costMinor, snapshot.dailyBudgetMinor, client.warningThreshold)) {
       return skip("BELOW_THRESHOLD", {
@@ -772,7 +871,9 @@ export class BudgetGuardService {
 
     const active = this.#activeRequestFor(client.advertiserId, snapshot.campaignRef);
     if (active) return skip("SKIP_ACTIVE_REQUEST", { requestId: active.id });
-    const cooldownUntil = this.#cooldownUntil(client.advertiserId, snapshot.campaignRef);
+    const cooldownUntil = this.#cooldownUntil(client.advertiserId, snapshot.campaignRef, {
+      observedBudgetMinor: snapshot.dailyBudgetMinor
+    });
     if (cooldownUntil && cooldownUntil.getTime() > now.getTime()) {
       return skip("SKIP_COOLDOWN", { cooldownUntil: cooldownUntil.toISOString() });
     }
@@ -940,7 +1041,17 @@ export class BudgetGuardService {
       }
       return { clientId: client.id, campaignId: campaign.id, status: "SKIP_ACTIVE_REQUEST" };
     }
-    const cooldownUntil = this.#cooldownUntil(client.advertiserId, campaign.id);
+    const info = resolvedInfo ?? await this.tiktok.getCampaignInfo({
+      advertiserId: client.advertiserId,
+      campaignId: campaign.id
+    });
+    this.#assertCampaignIdentity(info, client, campaign, { requireEnabled: false });
+    if (info.operationStatus !== "ENABLE") {
+      return { clientId: client.id, campaignId: campaign.id, status: "SKIP_DISABLED" };
+    }
+    const cooldownUntil = this.#cooldownUntil(client.advertiserId, campaign.id, {
+      observedBudgetMinor: toMinor(info.budget, campaign.currency)
+    });
     if (cooldownUntil && cooldownUntil.getTime() > this.now().getTime()) {
       return {
         clientId: client.id,
@@ -949,20 +1060,13 @@ export class BudgetGuardService {
         cooldownUntil: cooldownUntil.toISOString()
       };
     }
-    const [info, spendResult] = await Promise.all([
-      resolvedInfo ?? this.tiktok.getCampaignInfo({ advertiserId: client.advertiserId, campaignId: campaign.id }),
-      this.tiktok.getTodayCampaignSpend({
-        advertiserId: client.advertiserId,
-        storeId: client.storeId,
-        campaignId: campaign.id,
-        timezone: client.timezone,
-        now: this.now()
-      })
-    ]);
-    this.#assertCampaignIdentity(info, client, campaign, { requireEnabled: false });
-    if (info.operationStatus !== "ENABLE") {
-      return { clientId: client.id, campaignId: campaign.id, status: "SKIP_DISABLED" };
-    }
+    const spendResult = await this.tiktok.getTodayCampaignSpend({
+      advertiserId: client.advertiserId,
+      storeId: client.storeId,
+      campaignId: campaign.id,
+      timezone: client.timezone,
+      now: this.now()
+    });
     if (spendResult.currency && spendResult.currency !== campaign.currency) {
       throw new DomainError("REPORT_CURRENCY_MISMATCH", "TikTok report currency does not match the configured campaign currency");
     }
@@ -1047,21 +1151,21 @@ export class BudgetGuardService {
     }
     if (!mapping) throw new DomainError("MAPPING_NOT_FOUND", "Advertiser/campaign is not present in the approved config");
     if (this.#activeRequestFor(advertiserId, campaignId)) throw new DomainError("ACTIVE_REQUEST_EXISTS", "An active request already exists for this campaign");
-    const cooldownUntil = this.#cooldownUntil(advertiserId, campaignId);
+    const info = resolvedInfo ?? await this.tiktok.getCampaignInfo({ advertiserId, campaignId });
+    this.#assertCampaignIdentity(info, mapping.client, mapping.campaign);
+    const cooldownUntil = this.#cooldownUntil(advertiserId, campaignId, {
+      observedBudgetMinor: toMinor(info.budget, mapping.campaign.currency)
+    });
     if (cooldownUntil && cooldownUntil.getTime() > this.now().getTime()) {
       throw new DomainError("COOLDOWN_ACTIVE", `Campaign is in cooldown until ${cooldownUntil.toISOString()}`);
     }
-    const [info, spendResult] = await Promise.all([
-      resolvedInfo ?? this.tiktok.getCampaignInfo({ advertiserId, campaignId }),
-      this.tiktok.getTodayCampaignSpend({
-        advertiserId,
-        storeId: mapping.client.storeId,
-        campaignId,
-        timezone: mapping.client.timezone,
-        now: this.now()
-      })
-    ]);
-    this.#assertCampaignIdentity(info, mapping.client, mapping.campaign);
+    const spendResult = await this.tiktok.getTodayCampaignSpend({
+      advertiserId,
+      storeId: mapping.client.storeId,
+      campaignId,
+      timezone: mapping.client.timezone,
+      now: this.now()
+    });
     return this.createAndSendRequest({
       ...mapping,
       currentBudget: info.budget,

@@ -7,11 +7,22 @@ const result = document.querySelector("#form-result");
 const badge = document.querySelector("#connection-badge");
 const currentStatus = document.querySelector("#current-status");
 const manualCheck = document.querySelector("#manual-check");
+const refreshForm = document.querySelector("#page-refresh-form");
+const refreshEnabled = document.querySelector("#page-refresh-enabled");
+const refreshInterval = document.querySelector("#page-refresh-interval");
+const refreshBadge = document.querySelector("#refresh-badge");
+const refreshResult = document.querySelector("#refresh-result");
 
 function showResult(kind, text) {
   result.hidden = false;
   result.className = `form-result ${kind}`;
   result.textContent = text;
+}
+
+function showRefreshResult(kind, text) {
+  refreshResult.hidden = false;
+  refreshResult.className = `form-result ${kind}`;
+  refreshResult.textContent = text;
 }
 
 function renderStatus(status) {
@@ -20,6 +31,14 @@ function renderStatus(status) {
   currentStatus.textContent = status?.message ?? "อ่านสถานะไม่ได้";
   manualCheck.disabled = !status?.enrolled || status?.mode === "working";
   if (status?.enrolled) connectButton.textContent = "เชื่อมต่อใหม่";
+  const pageRefresh = status?.pageRefresh ?? { enabled: true, intervalMinutes: 2 };
+  refreshEnabled.checked = pageRefresh.enabled === true;
+  refreshInterval.value = String(pageRefresh.intervalMinutes ?? 2);
+  refreshInterval.disabled = !refreshEnabled.checked;
+  refreshBadge.className = `status-pill ${pageRefresh.enabled ? "healthy" : "waiting"}`;
+  refreshBadge.textContent = pageRefresh.enabled
+    ? `เปิด · ${pageRefresh.intervalMinutes} นาที`
+    : "ปิดอยู่";
 }
 
 async function refreshStatus() {
@@ -66,8 +85,41 @@ manualCheck.addEventListener("click", async () => {
   const response = await chrome.runtime.sendMessage({ type: MESSAGE_TYPES.checkNow }).catch(() => null);
   if (response?.ok) showResult("success", "อ่านและส่งข้อมูลล่าสุดสำเร็จ");
   else showResult("error", response?.error?.message ?? "ตรวจหน้า TikTok ไม่สำเร็จ");
-  manualCheck.textContent = "ตรวจหน้า TikTok ตอนนี้";
+  manualCheck.textContent = "อ่านค่าหน้าปัจจุบัน (ไม่รีเฟรช)";
   await refreshStatus();
+});
+
+refreshEnabled.addEventListener("change", () => {
+  refreshInterval.disabled = !refreshEnabled.checked;
+});
+
+refreshForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const saveButton = document.querySelector("#save-refresh-settings");
+  saveButton.disabled = true;
+  refreshResult.hidden = true;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: MESSAGE_TYPES.updatePageRefreshSettings,
+      enabled: refreshEnabled.checked,
+      intervalMinutes: Number(refreshInterval.value)
+    });
+    if (response?.ok) {
+      showRefreshResult(
+        "success",
+        refreshEnabled.checked
+          ? "เปิด fallback แล้ว ระบบจะรีเฟรชเมื่อหน้าไม่มีงานที่ยังไม่บันทึก"
+          : "ปิด fallback แล้ว ส่วนขยายจะไม่รีเฟรชหน้า TikTok อัตโนมัติ"
+      );
+    } else {
+      showRefreshResult("error", response?.error?.message ?? "บันทึกการตั้งค่าไม่สำเร็จ");
+    }
+  } catch {
+    showRefreshResult("error", "ติดต่อส่วนทำงานเบื้องหลังไม่ได้");
+  } finally {
+    saveButton.disabled = false;
+    await refreshStatus();
+  }
 });
 
 void refreshStatus();

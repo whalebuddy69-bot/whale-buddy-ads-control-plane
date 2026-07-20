@@ -19,7 +19,7 @@
 
       <section class="safety-panel">
         <strong>ปลอดภัยในระยะ Pilot</strong>
-        <p>ส่วนขยายนี้อ่านตัวเลขที่มองเห็นบนหน้า TikTok เท่านั้น ไม่คลิกปุ่ม ไม่อ่านรหัสผ่าน และไม่มีสิทธิ์แก้งบ</p>
+        <p>ส่วนขยายนี้อ่านตัวเลขที่มองเห็นบนหน้า TikTok เท่านั้น ไม่คลิกปุ่ม ไม่อ่านรหัสผ่าน และไม่มีสิทธิ์แก้งบ Pilot นี้เปิด page-refresh fallback ทุก 2 นาที และคุณปิดได้ทุกเมื่อ</p>
       </section>
 
       <section class="setup-card">
@@ -78,13 +78,45 @@
           <li>เปิดหน้า LIVE GMV Max ของบัญชี punpan_020</li>
           <li>นำแท็บไว้ในกลุ่มชื่อ <strong>Ppan</strong> เพียงกลุ่มเดียว</li>
           <li>รีโหลดแท็บหนึ่งครั้งหลังติดตั้งส่วนขยาย</li>
-          <li>กดไอคอนส่วนขยาย แล้วเลือก “ตรวจตอนนี้”</li>
+          <li>กดไอคอนส่วนขยาย แล้วเลือก “อ่านค่าหน้าปัจจุบัน” เพื่อตรวจโดยไม่รีเฟรช</li>
         </ol>
+      </section>
+
+      <section class="setup-card">
+        <div class="card-heading">
+          <div>
+            <p class="step-label">Fallback ระหว่างรอ TikTok API</p>
+            <h2>รีเฟรชหน้าข้อมูลอย่างปลอดภัย</h2>
+          </div>
+          <span id="refresh-badge" class="status-pill">กำลังอ่านสถานะ</span>
+        </div>
+        <form id="page-refresh-form" novalidate>
+          <label class="toggle-row" for="page-refresh-enabled">
+            <input id="page-refresh-enabled" type="checkbox">
+            <span>
+              เปิด page-refresh fallback
+              <small>ระบบจะรีเฟรชเฉพาะหน้า/บัญชี/กลุ่มแท็บที่ผูกไว้เท่านั้น</small>
+            </span>
+          </label>
+          <div class="refresh-controls">
+            <label for="page-refresh-interval">ระยะห่างระหว่างการรีเฟรช</label>
+            <select id="page-refresh-interval">
+              <option value="2">ทุก 2 นาที (Pilot)</option>
+              <option value="5">ทุก 5 นาที</option>
+              <option value="10">ทุก 10 นาที</option>
+              <option value="15">ทุก 15 นาที</option>
+              <option value="30">ทุก 30 นาที</option>
+            </select>
+            <button id="save-refresh-settings" class="secondary-button" type="submit">บันทึก</button>
+          </div>
+        </form>
+        <p class="hint">หากพบการพิมพ์, ฟอร์มที่เปลี่ยน, ช่องแก้ไขกำลังใช้งาน, dialog หรือการ submit ระบบจะงดทั้งการรีเฟรชและการส่ง snapshot รอบนั้น เมื่อเชื่อม TikTok API แล้วให้กลับมาปิด fallback นี้</p>
+        <div id="refresh-result" class="form-result" aria-live="polite" hidden></div>
       </section>
 
       <footer class="options-footer">
         <span id="current-status">กำลังอ่านสถานะ…</span>
-        <button id="manual-check" class="secondary-button" type="button">ตรวจหน้า TikTok ตอนนี้</button>
+        <button id="manual-check" class="secondary-button" type="button">อ่านค่าหน้าปัจจุบัน (ไม่รีเฟรช)</button>
       </footer>
     </main>
     <script type="module" src="options.js"></script>

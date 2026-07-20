@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Whale Buddy LIVE GMV Telemetry",
-  "version": "0.1.0",
-  "description": "อ่านสถานะ LIVE GMV Max แบบ read-only และส่งข้อมูลไป Whale Buddy Ads",
+  "version": "0.2.0",
+  "description": "อ่านสถานะ LIVE GMV Max และมี page-refresh fallback แบบหยุดเมื่อพบงานที่ยังไม่บันทึก",
   "minimum_chrome_version": "120",
   "incognito": "not_allowed",
   "background": {
@@ -24,6 +24,7 @@
         "https://ads.tiktok.com/i18n/gmv-max/dashboard*"
       ],
       "js": [
+        "lib/refresh-safety.js",
         "lib/tiktok-parser.js",
         "content/tiktok-live-gmv-max.js"
       ],

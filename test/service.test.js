@@ -55,8 +55,12 @@ class FakeLine {
 
 class FakeTikTok {
   budget = 10000;
+  spend = 8000;
   updates = [];
+  infoReads = 0;
+  spendReads = 0;
   async getCampaignInfo() {
+    this.infoReads += 1;
     return {
       advertiserId: "adv",
       campaignId: "cmp",
@@ -67,7 +71,10 @@ class FakeTikTok {
       shoppingAdsType: "LIVE"
     };
   }
-  async getTodayCampaignSpend() { return { spend: 8000 }; }
+  async getTodayCampaignSpend() {
+    this.spendReads += 1;
+    return { spend: this.spend };
+  }
   async updateCampaignBudget(input) {
     this.updates.push(input);
     this.budget = input.budget;
@@ -89,6 +96,25 @@ function makeService({ executionEnabled = true, tiktok: tiktokOverride } = {}) {
     now: () => new Date(fixedNow)
   });
   return { service, store, line, tiktok };
+}
+
+async function createDryRunTerminal(service, eventSuffix) {
+  const currentConfig = makeConfig();
+  const request = await service.createAndSendRequest({
+    client: currentConfig.clients[0],
+    campaign: currentConfig.clients[0].campaigns[0],
+    currentBudget: 10000,
+    spend: 8000,
+    proposedBudget: 15000
+  });
+  await service.handleLineEvents([{
+    webhookEventId: `evt-budget-aware-${eventSuffix}`,
+    type: "postback",
+    source: { userId: "U1" },
+    replyToken: `reply-budget-aware-${eventSuffix}`,
+    postback: { data: `a=suggest&id=${request.id}` }
+  }]);
+  return service.executeApprovedRequest(request.id, "U1");
 }
 
 test("monitor sends one alert and suppresses a second active request", async (t) => {
@@ -152,6 +178,9 @@ test("LINE approval is two-step and execution re-verifies then updates", async (
   assert.equal(updated.state, RequestState.SUCCEEDED);
   assert.equal(tiktok.updates.length, 1);
   assert.equal(tiktok.updates[0].budget, 15000);
+  assert.equal(line.pushes.length, 2);
+  assert.match(line.pushes.at(-1).message.text, /ปรับงบแล้ว/);
+  await service.retryPendingResults();
   assert.equal(line.pushes.length, 2);
 });
 
@@ -541,6 +570,54 @@ test("a terminal request enforces campaign cooldown before another alert", async
 
   const outcome = await service.pollOnce();
   assert.equal(outcome[0].status, "SKIP_COOLDOWN");
+});
+
+test("API monitor reads current budget before cooldown and skips spend unless the budget changed", async (t) => {
+  const { service, store, tiktok } = makeService({ executionEnabled: false });
+  t.after(() => store.close());
+  const terminal = await createDryRunTerminal(service, "monitor");
+  assert.equal(terminal.state, RequestState.CANCELLED);
+  assert.equal(tiktok.infoReads, 0);
+  assert.equal(tiktok.spendReads, 0);
+
+  const unchanged = await service.pollOnce();
+  assert.equal(unchanged[0].status, "SKIP_COOLDOWN");
+  assert.equal(tiktok.infoReads, 1);
+  assert.equal(tiktok.spendReads, 0);
+
+  tiktok.budget = 12000;
+  tiktok.spend = 9600;
+  const changed = await service.pollOnce();
+  assert.equal(changed[0].status, "ALERT_DELIVERED");
+  assert.equal(tiktok.infoReads, 2);
+  assert.equal(tiktok.spendReads, 1);
+  assert.equal(store.requireBudgetRequest(changed[0].requestId).currentBudgetMinor, 1_200_000);
+});
+
+test("manual API request keeps unchanged-budget cooldown but bypasses it after a verified change", async (t) => {
+  const { service, store, tiktok } = makeService({ executionEnabled: false });
+  t.after(() => store.close());
+  const terminal = await createDryRunTerminal(service, "manual");
+  assert.equal(terminal.state, RequestState.CANCELLED);
+
+  await assert.rejects(
+    () => service.createManualRequest({ advertiserId: "adv", campaignId: "cmp", proposedBudget: 15000 }),
+    (error) => error?.code === "COOLDOWN_ACTIVE"
+  );
+  assert.equal(tiktok.infoReads, 1);
+  assert.equal(tiktok.spendReads, 0);
+
+  tiktok.budget = 12000;
+  tiktok.spend = 9600;
+  const changed = await service.createManualRequest({
+    advertiserId: "adv",
+    campaignId: "cmp",
+    proposedBudget: 15000
+  });
+  assert.equal(changed.currentBudgetMinor, 1_200_000);
+  assert.equal(changed.metadata.source, "ADMIN");
+  assert.equal(tiktok.infoReads, 2);
+  assert.equal(tiktok.spendReads, 1);
 });
 
 test("timeout after TikTok applied the absolute budget reconciles to success", async (t) => {

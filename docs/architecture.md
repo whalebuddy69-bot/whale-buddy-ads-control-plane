@@ -94,6 +94,7 @@ Pilot ตรวจหน้า Ads แบบ read-only ผ่าน tab group `P
 - request หมดอายุ 15 นาที
 - campaign หนึ่งมี active request ได้ครั้งเดียว
 - mapping คงที่จำกัด target ด้วยทั้ง `maxDailyBudget` และ `maxIncreasePercent`; dynamic policy ต้องผ่าน hard cap และ policy revision ปัจจุบัน
+- cooldown ของ telemetry จะถูกข้ามเมื่อ snapshot ที่เซ็นถูกต้องยืนยันว่า Daily budget เปลี่ยนจากฐานของคำขอ terminal ล่าสุด เพื่อเริ่มรอบ 80% ใหม่ทันที; LINE แจ้งว่า “ปรับงบแล้ว” แบบ dedupe และระบุชัดว่าตัวอ่านไม่ได้เป็นผู้แก้ TikTok
 
 Pilot `punpan_020` override ค่า default ดังนี้:
 

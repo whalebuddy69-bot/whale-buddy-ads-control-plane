@@ -191,6 +191,8 @@ Endpoints:
 ตั้ง `CHROME_TELEMETRY_ALERTS_ENABLED=true` ได้เฉพาะเมื่อเปิด signed Chrome telemetry และใช้
 `CONTROL_PLANE_ONLY=true` เท่านั้น โหมดนี้ส่ง LINE approval แบบ **DRY-RUN** จาก Cost ≥ 80%
 และจบคำขอโดยไม่เข้าคิว TikTok หรือเปลี่ยนงบจริง ค่าใน Render Blueprint ยังคงเป็น `false`.
+เมื่อ snapshot ยืนยันว่า Daily budget เปลี่ยนจากฐานเดิม ระบบจะเริ่มรอบ 80% ใหม่โดยไม่รอ cooldown
+และส่ง LINE “ปรับงบแล้ว” หนึ่งครั้งต่อยอดที่ตรวจพบ โดยไม่กล่าวอ้างว่าระบบ dry-run เป็นผู้แก้ TikTok.
 
 - `GET /health`
 - `POST /webhooks/line`
