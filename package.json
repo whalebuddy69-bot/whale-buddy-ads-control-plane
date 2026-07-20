@@ -11,6 +11,6 @@
     "start": "node --disable-warning=ExperimentalWarning src/server.js",
     "dev": "node --watch --disable-warning=ExperimentalWarning src/server.js",
     "test": "node --disable-warning=ExperimentalWarning --test",
-    "check": "node --check src/server.js && node --check src/service.js && node --check src/tiktok.js && node --check src/line.js && node --check src/telemetry.js && node --check src/store.js && node --check extension/service-worker.js && node --check extension/content/tiktok-live-gmv-max.js && node --check extension/ui/options.js && node --check extension/ui/popup.js"
+    "check": "node --check src/server.js && node --check src/service.js && node --check src/tiktok.js && node --check src/line.js && node --check src/line-controls.js && node --check src/telemetry.js && node --check src/store.js && node --check extension/service-worker.js && node --check extension/content/tiktok-live-gmv-max.js && node --check extension/ui/options.js && node --check extension/ui/popup.js"
   }
 }

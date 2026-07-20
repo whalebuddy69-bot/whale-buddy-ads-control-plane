@@ -2,6 +2,10 @@
   "use strict";
 
   const EXPECTED_COLUMN_COUNT = 22;
+  // ROI values are represented exactly as thousandths. For example, the
+  // visible value `3.69` becomes 3_690 and `1.234` becomes 1_234.
+  const ROI_SCALE = 1_000;
+  const NO_DATA_PLACEHOLDERS = Object.freeze(["-", "--", "—"]);
   const REQUIRED_HEADERS = Object.freeze({
     campaignName: "Campaign name",
     campaignStatus: "Status",
@@ -10,6 +14,13 @@
     costMinor: "Cost",
     totalBudgetMinor: "Total budget",
     netCostMinor: "Net Cost"
+  });
+  const OPTIONAL_HEADERS = Object.freeze({
+    grossRevenueMinor: "Gross revenue",
+    grossRoiMilli: "Gross ROI",
+    netRevenueMinor: "Net revenue",
+    netRoiMilli: "Net ROI",
+    gmvMinor: "GMV"
   });
 
   class ParserError extends Error {
@@ -44,6 +55,31 @@
       fail("MONEY_PARSE_ERROR", `${field} มีค่ามากเกินขอบเขต`, { field });
     }
     return minor;
+  }
+
+  function isNoDataPlaceholder(value) {
+    return NO_DATA_PLACEHOLDERS.includes(normalizeText(value));
+  }
+
+  function parseNullableThbMinor(value, field) {
+    if (isNoDataPlaceholder(value)) return null;
+    return parseThbMinor(value, field);
+  }
+
+  function parseRoiMilli(value, field) {
+    const text = normalizeText(value);
+    if (isNoDataPlaceholder(text)) return null;
+    const match = text.match(/^((?:0|[1-9]\d*)|(?:[1-9]\d{0,2}(?:,\d{3})+))(?:\.(\d{1,3}))?$/u);
+    if (!match) {
+      fail("ROI_PARSE_ERROR", `${field} ไม่ใช่ค่า ROI ที่รองรับ`, { field });
+    }
+    const whole = Number(match[1].replaceAll(",", ""));
+    const fraction = Number((match[2] ?? "").padEnd(3, "0") || "0");
+    const milli = whole * ROI_SCALE + fraction;
+    if (!Number.isSafeInteger(milli) || milli < 0) {
+      fail("ROI_PARSE_ERROR", `${field} มีค่ามากเกินขอบเขต`, { field });
+    }
+    return milli;
   }
 
   function parseDailyBudgetMinor(value) {
@@ -104,7 +140,23 @@
     if (indexes.costMinor === indexes.netCostMinor) {
       fail("COST_NET_COST_AMBIGUOUS", "Cost และ Net Cost ชี้ไปคอลัมน์เดียวกัน");
     }
+    for (const [semantic, visibleHeader] of Object.entries(OPTIONAL_HEADERS)) {
+      indexes[semantic] = map.has(visibleHeader) ? map.get(visibleHeader) : null;
+    }
     return indexes;
+  }
+
+  function parseOptionalMetric(row, index, parser) {
+    if (!Number.isInteger(index)) return null;
+    try {
+      return parser(row[index]);
+    } catch (error) {
+      // Revenue/ROI/GMV enrich the core budget observation. TikTok sometimes
+      // changes or withholds these cells, so one malformed optional metric must
+      // not suppress otherwise valid budget and cost telemetry.
+      if (error instanceof ParserError) return null;
+      throw error;
+    }
   }
 
   function parseTableModel({
@@ -169,16 +221,46 @@
       // Cost and Net Cost are intentionally selected by two different exact
       // headers. Never replace either lookup with a fuzzy `includes("Cost")`.
       costMinor: parseThbMinor(row[indexes.costMinor], "costMinor"),
-      netCostMinor: parseThbMinor(row[indexes.netCostMinor], "netCostMinor")
+      netCostMinor: parseThbMinor(row[indexes.netCostMinor], "netCostMinor"),
+      grossRevenueMinor: parseOptionalMetric(
+        row,
+        indexes.grossRevenueMinor,
+        (value) => parseNullableThbMinor(value, "grossRevenueMinor")
+      ),
+      grossRoiMilli: parseOptionalMetric(
+        row,
+        indexes.grossRoiMilli,
+        (value) => parseRoiMilli(value, "grossRoiMilli")
+      ),
+      netRevenueMinor: parseOptionalMetric(
+        row,
+        indexes.netRevenueMinor,
+        (value) => parseNullableThbMinor(value, "netRevenueMinor")
+      ),
+      netRoiMilli: parseOptionalMetric(
+        row,
+        indexes.netRoiMilli,
+        (value) => parseRoiMilli(value, "netRoiMilli")
+      ),
+      gmvMinor: parseOptionalMetric(
+        row,
+        indexes.gmvMinor,
+        (value) => parseNullableThbMinor(value, "gmvMinor")
+      )
     });
   }
 
   root.WhaleBuddyTikTokParser = Object.freeze({
     EXPECTED_COLUMN_COUNT,
+    ROI_SCALE,
+    NO_DATA_PLACEHOLDERS,
     REQUIRED_HEADERS,
+    OPTIONAL_HEADERS,
     ParserError,
     normalizeText,
     parseThbMinor,
+    parseNullableThbMinor,
+    parseRoiMilli,
     parseDailyBudgetMinor,
     dateInBangkok,
     buildHeaderMap,

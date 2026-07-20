@@ -4,7 +4,9 @@ import test from "node:test";
 
 import { validateConfig } from "../src/config.js";
 import {
+  TELEMETRY_ROI_SCALE,
   TELEMETRY_UI_SCHEMA_FINGERPRINT_V1,
+  TELEMETRY_UI_SCHEMA_FINGERPRINT_V2,
   TelemetryError,
   telemetrySigningMessage,
   telemetryUiCampaignRef,
@@ -94,6 +96,19 @@ function snapshot(overrides = {}) {
   return { ...value, ...overrides };
 }
 
+function snapshotV2(overrides = {}) {
+  return snapshot({
+    schemaVersion: 2,
+    uiSchemaFingerprint: TELEMETRY_UI_SCHEMA_FINGERPRINT_V2,
+    grossRevenueMinor: 120_000,
+    grossRoiMilli: 3_690,
+    netRevenueMinor: 110_000,
+    netRoiMilli: 3_660,
+    gmvMinor: 120_000,
+    ...overrides
+  });
+}
+
 function assertTelemetryCode(code) {
   return (error) => error instanceof TelemetryError && error.code === code;
 }
@@ -116,6 +131,60 @@ test("telemetry snapshot is exact, account-bound, integer-safe, and read-only da
   assert.equal("approved" in value, false);
   assert(Object.isFrozen(value));
   assert(Object.isFrozen(value.source));
+});
+
+test("telemetry v2 validates exact revenue, ROI, and GMV observations", () => {
+  const value = validateTelemetrySnapshot(snapshotV2(), {
+    config: config(),
+    credential: credential(),
+    now
+  });
+  assert.equal(TELEMETRY_ROI_SCALE, 1_000);
+  assert.equal(value.schemaVersion, 2);
+  assert.equal(value.uiSchemaFingerprint, TELEMETRY_UI_SCHEMA_FINGERPRINT_V2);
+  assert.equal(value.grossRevenueMinor, 120_000);
+  assert.equal(value.grossRoiMilli, 3_690);
+  assert.equal(value.netRevenueMinor, 110_000);
+  assert.equal(value.netRoiMilli, 3_660);
+  assert.equal(value.gmvMinor, 120_000);
+  assert(Object.isFrozen(value));
+});
+
+test("telemetry v2 preserves known no-data metrics as null", () => {
+  const value = validateTelemetrySnapshot(snapshotV2({
+    grossRevenueMinor: null,
+    grossRoiMilli: null,
+    netRevenueMinor: null,
+    netRoiMilli: null,
+    gmvMinor: null
+  }), {
+    config: config(),
+    credential: credential(),
+    now
+  });
+  for (const field of [
+    "grossRevenueMinor",
+    "grossRoiMilli",
+    "netRevenueMinor",
+    "netRoiMilli",
+    "gmvMinor"
+  ]) {
+    assert.equal(value[field], null);
+  }
+});
+
+test("telemetry v1 remains supported and cannot smuggle v2 fields", () => {
+  const value = validateTelemetrySnapshot(snapshot(), {
+    config: config(), credential: credential(), now
+  });
+  assert.equal(value.schemaVersion, 1);
+  assert.equal("grossRevenueMinor" in value, false);
+  assert.throws(
+    () => validateTelemetrySnapshot(snapshot({ grossRevenueMinor: null }), {
+      config: config(), credential: credential(), now
+    }),
+    assertTelemetryCode("INVALID_TELEMETRY_SNAPSHOT")
+  );
 });
 
 test("telemetry fails closed on parser drift and every routing identity", () => {
@@ -172,6 +241,33 @@ test("telemetry validates all four UI money observations and observation time", 
       config: config(), credential: credential(), now, maxFutureSkewSeconds: 60
     }),
     assertTelemetryCode("TELEMETRY_TIMESTAMP_OUT_OF_RANGE")
+  );
+});
+
+test("telemetry v2 rejects malformed or missing reporting metrics", () => {
+  for (const [field, value] of [
+    ["grossRevenueMinor", -1],
+    ["grossRevenueMinor", undefined],
+    ["grossRoiMilli", 3.69],
+    ["grossRoiMilli", -1],
+    ["netRevenueMinor", Number.NaN],
+    ["netRoiMilli", "3.66"],
+    ["gmvMinor", 1200.5]
+  ]) {
+    assert.throws(
+      () => validateTelemetrySnapshot(snapshotV2({ [field]: value }), {
+        config: config(), credential: credential(), now
+      }),
+      assertTelemetryCode("INVALID_TELEMETRY_SNAPSHOT")
+    );
+  }
+  assert.throws(
+    () => validateTelemetrySnapshot(snapshotV2({
+      uiSchemaFingerprint: TELEMETRY_UI_SCHEMA_FINGERPRINT_V1
+    }), {
+      config: config(), credential: credential(), now
+    }),
+    assertTelemetryCode("TELEMETRY_UI_SCHEMA_MISMATCH")
   );
 });
 

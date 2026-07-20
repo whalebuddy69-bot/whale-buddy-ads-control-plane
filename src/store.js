@@ -232,12 +232,17 @@ export class SqliteStore {
         campaign_type TEXT NOT NULL CHECK(campaign_type = 'LIVE_GMV_MAX'),
         campaign_status TEXT NOT NULL CHECK(campaign_status = 'ACTIVE'),
         currency TEXT NOT NULL CHECK(currency = 'THB'),
-        schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+        schema_version INTEGER NOT NULL CHECK(schema_version IN (1, 2)),
         ui_schema_fingerprint TEXT NOT NULL,
         daily_budget_minor INTEGER NOT NULL CHECK(daily_budget_minor > 0),
         total_budget_minor INTEGER NOT NULL CHECK(total_budget_minor > 0),
         cost_minor INTEGER NOT NULL CHECK(cost_minor >= 0),
         net_cost_minor INTEGER NOT NULL CHECK(net_cost_minor >= 0),
+        gross_revenue_minor INTEGER CHECK(gross_revenue_minor IS NULL OR gross_revenue_minor >= 0),
+        gross_roi_milli INTEGER CHECK(gross_roi_milli IS NULL OR gross_roi_milli >= 0),
+        net_revenue_minor INTEGER CHECK(net_revenue_minor IS NULL OR net_revenue_minor >= 0),
+        net_roi_milli INTEGER CHECK(net_roi_milli IS NULL OR net_roi_milli >= 0),
+        gmv_minor INTEGER CHECK(gmv_minor IS NULL OR gmv_minor >= 0),
         policy_cap_minor INTEGER NOT NULL CHECK(policy_cap_minor > 0),
         over_policy_cap INTEGER NOT NULL CHECK(over_policy_cap IN (0, 1)),
         observed_at TEXT NOT NULL,
@@ -275,6 +280,66 @@ export class SqliteStore {
         FOREIGN KEY(request_id) REFERENCES budget_requests(id)
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS campaign_shortcuts (
+        client_id TEXT NOT NULL,
+        shortcut_name TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        campaign_name_template TEXT NOT NULL,
+        daily_budget_minor INTEGER NOT NULL CHECK(daily_budget_minor > 0),
+        target_roi_milli INTEGER NOT NULL CHECK(target_roi_milli > 0),
+        top_up_threshold_bps INTEGER NOT NULL
+          CHECK(top_up_threshold_bps > 0 AND top_up_threshold_bps < 10000),
+        created_at TEXT NOT NULL,
+        created_by_line_user_id TEXT NOT NULL,
+        PRIMARY KEY(client_id, shortcut_name, revision)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS report_subscriptions (
+        client_id TEXT NOT NULL,
+        line_user_id TEXT NOT NULL,
+        interval_minutes INTEGER NOT NULL
+          CHECK(interval_minutes BETWEEN 60 AND 1440),
+        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+        next_due_at TEXT NOT NULL,
+        last_occurrence_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(client_id, line_user_id)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS campaign_control_requests (
+        id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN (
+          'PENDING_CONFIRMATION', 'CONFIRMED_DRY_RUN', 'CONFIRMED',
+          'CANCELLED', 'EXPIRED'
+        )),
+        version INTEGER NOT NULL CHECK(version > 0),
+        requested_by_line_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        data_json TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS coupon_schedules (
+        id TEXT PRIMARY KEY,
+        control_request_id TEXT UNIQUE,
+        client_id TEXT NOT NULL,
+        line_user_id TEXT NOT NULL,
+        event_at TEXT NOT NULL,
+        notify_at TEXT NOT NULL,
+        budget_minor INTEGER NOT NULL CHECK(budget_minor > 0),
+        status TEXT NOT NULL CHECK(status IN (
+          'PENDING', 'PROCESSING', 'SENT', 'FAILED', 'CANCELLED'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_error TEXT,
+        FOREIGN KEY(control_request_id) REFERENCES campaign_control_requests(id)
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS audit_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         request_id TEXT,
@@ -294,6 +359,16 @@ export class SqliteStore {
     this.#ensureColumn('webhook_events', 'lease_token', 'TEXT');
     this.#ensureColumn('webhook_events', 'lease_expires_at', 'TEXT');
     this.#ensureColumn('webhook_events', 'last_attempt_at', 'TEXT');
+    // The first LINE-controls build created coupon_schedules without its
+    // control-request link. Adding a nullable referenced column is safe for
+    // those intermediate databases, while fresh databases receive the same
+    // constraint in CREATE TABLE above.
+    this.#ensureColumn(
+      'coupon_schedules',
+      'control_request_id',
+      'TEXT REFERENCES campaign_control_requests(id)',
+    );
+    this.#migrateTelemetrySchemaV2();
     this.#backfillBudgetUpdatedAt();
     this.#assertNoActiveRequestDuplicates();
 
@@ -333,6 +408,17 @@ export class SqliteStore {
         ON telemetry_nonces(received_at);
       CREATE INDEX IF NOT EXISTS telemetry_alert_evaluations_time_idx
         ON telemetry_alert_evaluations(evaluated_at);
+      CREATE INDEX IF NOT EXISTS campaign_shortcuts_latest_idx
+        ON campaign_shortcuts(client_id, shortcut_name, revision DESC);
+      CREATE INDEX IF NOT EXISTS report_subscriptions_due_idx
+        ON report_subscriptions(enabled, next_due_at);
+      CREATE INDEX IF NOT EXISTS campaign_control_requests_client_idx
+        ON campaign_control_requests(client_id, state, expires_at);
+      CREATE INDEX IF NOT EXISTS coupon_schedules_due_idx
+        ON coupon_schedules(status, notify_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS coupon_schedules_control_request_idx
+        ON coupon_schedules(control_request_id)
+        WHERE control_request_id IS NOT NULL;
       CREATE INDEX IF NOT EXISTS audit_events_request_idx
         ON audit_events(request_id, sequence);
     `);
@@ -343,6 +429,80 @@ export class SqliteStore {
     if (!columns.some((candidate) => candidate.name === column)) {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`);
     }
+  }
+
+  #migrateTelemetrySchemaV2() {
+    const table = this.db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'telemetry_snapshots'
+    `).get();
+    if (!table?.sql || /schema_version\s+IN\s*\(1,\s*2\)/i.test(table.sql)) return;
+    this.db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      this.db.exec(`
+        BEGIN IMMEDIATE;
+        CREATE TABLE telemetry_snapshots_v2 (
+          snapshot_id TEXT PRIMARY KEY,
+          credential_id TEXT NOT NULL,
+          client_id TEXT NOT NULL,
+          advertiser_id TEXT NOT NULL,
+          business_center_id TEXT NOT NULL,
+          seller_mode TEXT NOT NULL,
+          page_type TEXT NOT NULL,
+          tiktok_account_id TEXT NOT NULL,
+          campaign_id TEXT,
+          campaign_ref TEXT NOT NULL,
+          campaign_name TEXT NOT NULL,
+          campaign_type TEXT NOT NULL CHECK(campaign_type = 'LIVE_GMV_MAX'),
+          campaign_status TEXT NOT NULL CHECK(campaign_status = 'ACTIVE'),
+          currency TEXT NOT NULL CHECK(currency = 'THB'),
+          schema_version INTEGER NOT NULL CHECK(schema_version IN (1, 2)),
+          ui_schema_fingerprint TEXT NOT NULL,
+          daily_budget_minor INTEGER NOT NULL CHECK(daily_budget_minor > 0),
+          total_budget_minor INTEGER NOT NULL CHECK(total_budget_minor > 0),
+          cost_minor INTEGER NOT NULL CHECK(cost_minor >= 0),
+          net_cost_minor INTEGER NOT NULL CHECK(net_cost_minor >= 0),
+          gross_revenue_minor INTEGER CHECK(gross_revenue_minor IS NULL OR gross_revenue_minor >= 0),
+          gross_roi_milli INTEGER CHECK(gross_roi_milli IS NULL OR gross_roi_milli >= 0),
+          net_revenue_minor INTEGER CHECK(net_revenue_minor IS NULL OR net_revenue_minor >= 0),
+          net_roi_milli INTEGER CHECK(net_roi_milli IS NULL OR net_roi_milli >= 0),
+          gmv_minor INTEGER CHECK(gmv_minor IS NULL OR gmv_minor >= 0),
+          policy_cap_minor INTEGER NOT NULL CHECK(policy_cap_minor > 0),
+          over_policy_cap INTEGER NOT NULL CHECK(over_policy_cap IN (0, 1)),
+          observed_at TEXT NOT NULL,
+          received_at TEXT NOT NULL,
+          source_browser_profile TEXT NOT NULL,
+          source_tab_group TEXT NOT NULL,
+          payload_hash TEXT NOT NULL
+            CHECK(length(payload_hash) = 64 AND payload_hash NOT GLOB '*[^0-9a-f]*'),
+          FOREIGN KEY(credential_id) REFERENCES telemetry_credentials(credential_id)
+        ) STRICT;
+        INSERT INTO telemetry_snapshots_v2 (
+          snapshot_id, credential_id, client_id, advertiser_id, business_center_id,
+          seller_mode, page_type, tiktok_account_id, campaign_id, campaign_ref,
+          campaign_name, campaign_type, campaign_status, currency, schema_version,
+          ui_schema_fingerprint, daily_budget_minor, total_budget_minor, cost_minor,
+          net_cost_minor, policy_cap_minor, over_policy_cap, observed_at, received_at,
+          source_browser_profile, source_tab_group, payload_hash
+        )
+        SELECT snapshot_id, credential_id, client_id, advertiser_id, business_center_id,
+          seller_mode, page_type, tiktok_account_id, campaign_id, campaign_ref,
+          campaign_name, campaign_type, campaign_status, currency, schema_version,
+          ui_schema_fingerprint, daily_budget_minor, total_budget_minor, cost_minor,
+          net_cost_minor, policy_cap_minor, over_policy_cap, observed_at, received_at,
+          source_browser_profile, source_tab_group, payload_hash
+        FROM telemetry_snapshots;
+        DROP TABLE telemetry_snapshots;
+        ALTER TABLE telemetry_snapshots_v2 RENAME TO telemetry_snapshots;
+        COMMIT;
+      `);
+    } catch (error) {
+      try { this.db.exec('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      this.db.exec('PRAGMA foreign_keys = ON');
+    }
+    const violation = this.db.prepare('PRAGMA foreign_key_check').get();
+    if (violation) throw new Error('Telemetry schema v2 migration failed foreign-key validation');
   }
 
   #backfillBudgetUpdatedAt() {
@@ -863,6 +1023,77 @@ export class SqliteStore {
   }
 
   /**
+   * Revokes one database-paired LINE approver and removes the durable work
+   * that was still waiting on that user's authority. Configured approvers are
+   * deliberately handled by the HTTP boundary because they cannot be revoked
+   * by changing database state.
+   */
+  revokeLineApprover({ clientId, lineUserId, revokedAt } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedLineUserId = requiredString(lineUserId, 'lineUserId');
+    const at = requiredIsoTime(revokedAt, 'revokedAt');
+
+    return this.#transaction(() => {
+      const existing = this.#getLineApprover(normalizedClientId, normalizedLineUserId);
+      if (!existing) {
+        throw new DomainError(
+          'LINE_APPROVER_NOT_FOUND',
+          'LINE approver is not paired for this client',
+          { clientId: normalizedClientId },
+        );
+      }
+
+      const approver = this.db.prepare(`
+        UPDATE line_approvers
+        SET active = 0, updated_at = ?
+        WHERE client_id = ? AND line_user_id = ? AND active = 1
+      `).run(at, normalizedClientId, normalizedLineUserId);
+      const reports = this.db.prepare(`
+        UPDATE report_subscriptions
+        SET enabled = 0, updated_at = ?
+        WHERE client_id = ? AND line_user_id = ? AND enabled = 1
+      `).run(at, normalizedClientId, normalizedLineUserId);
+      const coupons = this.db.prepare(`
+        UPDATE coupon_schedules
+        SET status = 'CANCELLED', updated_at = ?
+        WHERE client_id = ? AND line_user_id = ? AND status = 'PENDING'
+      `).run(at, normalizedClientId, normalizedLineUserId);
+      const controls = this.db.prepare(`
+        UPDATE campaign_control_requests
+        SET state = 'CANCELLED', version = version + 1, updated_at = ?
+        WHERE client_id = ?
+          AND requested_by_line_user_id = ?
+          AND state = 'PENDING_CONFIRMATION'
+      `).run(at, normalizedClientId, normalizedLineUserId);
+
+      const counts = Object.freeze({
+        approversRevoked: Number(approver.changes),
+        reportSubscriptionsDisabled: Number(reports.changes),
+        couponSchedulesCancelled: Number(coupons.changes),
+        campaignControlRequestsCancelled: Number(controls.changes),
+      });
+      this.#insertAudit({
+        eventType: 'LINE_APPROVER_REVOKED',
+        actorType: 'ADMIN',
+        occurredAt: at,
+        details: {
+          clientId: normalizedClientId,
+          lineUserId: normalizedLineUserId,
+          ...counts,
+        },
+      });
+
+      return Object.freeze({
+        clientId: normalizedClientId,
+        lineUserId: normalizedLineUserId,
+        revokedAt: at,
+        counts,
+        approver: this.#getLineApprover(normalizedClientId, normalizedLineUserId),
+      });
+    });
+  }
+
+  /**
    * Creates a short-lived, single-use bootstrap code for one Chrome telemetry
    * client. Only the SHA-256 hash crosses the storage boundary. Creating a new
    * challenge invalidates any older unused challenge for the same client.
@@ -1079,6 +1310,11 @@ export class SqliteStore {
       totalBudgetMinor: row.total_budget_minor,
       costMinor: row.cost_minor,
       netCostMinor: row.net_cost_minor,
+      grossRevenueMinor: row.gross_revenue_minor,
+      grossRoiMilli: row.gross_roi_milli,
+      netRevenueMinor: row.net_revenue_minor,
+      netRoiMilli: row.net_roi_milli,
+      gmvMinor: row.gmv_minor,
       observedAt: row.observed_at,
       receivedAt: row.received_at,
       source: Object.freeze({
@@ -1099,6 +1335,8 @@ export class SqliteStore {
              campaign_ref, campaign_name, campaign_type, campaign_status,
              currency, schema_version, ui_schema_fingerprint,
              daily_budget_minor, total_budget_minor, cost_minor, net_cost_minor,
+             gross_revenue_minor, gross_roi_milli, net_revenue_minor,
+             net_roi_milli, gmv_minor,
              policy_cap_minor, over_policy_cap, observed_at, received_at,
              source_browser_profile, source_tab_group
       FROM telemetry_snapshots
@@ -1143,6 +1381,8 @@ export class SqliteStore {
              s.campaign_ref, s.campaign_name, s.campaign_type, s.campaign_status,
              s.currency, s.schema_version, s.ui_schema_fingerprint,
              s.daily_budget_minor, s.total_budget_minor, s.cost_minor, s.net_cost_minor,
+             s.gross_revenue_minor, s.gross_roi_milli, s.net_revenue_minor,
+             s.net_roi_milli, s.gmv_minor,
              s.policy_cap_minor, s.over_policy_cap, s.observed_at, s.received_at,
              s.source_browser_profile, s.source_tab_group
       FROM telemetry_latest l
@@ -1263,10 +1503,11 @@ export class SqliteStore {
            seller_mode, page_type, tiktok_account_id, campaign_id, campaign_ref,
            campaign_name, campaign_type, campaign_status, currency,
            schema_version, ui_schema_fingerprint, daily_budget_minor,
-           total_budget_minor, cost_minor, net_cost_minor, policy_cap_minor,
-           over_policy_cap, observed_at, received_at, source_browser_profile,
-           source_tab_group, payload_hash)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           total_budget_minor, cost_minor, net_cost_minor, gross_revenue_minor,
+           gross_roi_milli, net_revenue_minor, net_roi_milli, gmv_minor,
+           policy_cap_minor, over_policy_cap, observed_at, received_at,
+           source_browser_profile, source_tab_group, payload_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         snapshot.snapshotId,
         normalizedCredentialId,
@@ -1288,6 +1529,11 @@ export class SqliteStore {
         safeMinor(snapshot.totalBudgetMinor, 'snapshot.totalBudgetMinor', { positive: true }),
         safeMinor(snapshot.costMinor, 'snapshot.costMinor'),
         safeMinor(snapshot.netCostMinor, 'snapshot.netCostMinor'),
+        snapshot.grossRevenueMinor == null ? null : safeMinor(snapshot.grossRevenueMinor, 'snapshot.grossRevenueMinor'),
+        snapshot.grossRoiMilli == null ? null : safeMinor(snapshot.grossRoiMilli, 'snapshot.grossRoiMilli'),
+        snapshot.netRevenueMinor == null ? null : safeMinor(snapshot.netRevenueMinor, 'snapshot.netRevenueMinor'),
+        snapshot.netRoiMilli == null ? null : safeMinor(snapshot.netRoiMilli, 'snapshot.netRoiMilli'),
+        snapshot.gmvMinor == null ? null : safeMinor(snapshot.gmvMinor, 'snapshot.gmvMinor'),
         safeMinor(snapshot.policy?.maxDailyBudgetMinor, 'snapshot.policy.maxDailyBudgetMinor', { positive: true }),
         snapshot.policy?.overDailyBudgetCap === true ? 1 : 0,
         requiredIsoTime(snapshot.observedAt, 'snapshot.observedAt'),
@@ -1327,6 +1573,11 @@ export class SqliteStore {
           totalBudgetMinor: snapshot.totalBudgetMinor,
           costMinor: snapshot.costMinor,
           netCostMinor: snapshot.netCostMinor,
+          grossRevenueMinor: snapshot.grossRevenueMinor ?? null,
+          grossRoiMilli: snapshot.grossRoiMilli ?? null,
+          netRevenueMinor: snapshot.netRevenueMinor ?? null,
+          netRoiMilli: snapshot.netRoiMilli ?? null,
+          gmvMinor: snapshot.gmvMinor ?? null,
           observedAt: snapshot.observedAt,
           latest: isLatest,
         },
@@ -1736,7 +1987,13 @@ export class SqliteStore {
         priorLeaseExpiresAt: current.leaseExpiresAt,
       },
     });
-    return { claimed: true, reason: null, event };
+    return {
+      claimed: true,
+      reason: null,
+      event,
+      priorStatus: current.status,
+      priorErrorCode: current.errorCode,
+    };
   }
 
   /**
@@ -1924,6 +2181,760 @@ export class SqliteStore {
         },
       });
       return this.getWebhookEvent(normalizedProvider, normalizedEventId);
+    });
+  }
+
+  #mapCampaignShortcut(row) {
+    return Object.freeze({
+      clientId: row.client_id,
+      shortcutName: row.shortcut_name,
+      revision: row.revision,
+      campaignNameTemplate: row.campaign_name_template,
+      dailyBudgetMinor: row.daily_budget_minor,
+      targetRoiMilli: row.target_roi_milli,
+      topUpThresholdBps: row.top_up_threshold_bps,
+      createdAt: row.created_at,
+      createdByLineUserId: row.created_by_line_user_id,
+    });
+  }
+
+  saveCampaignShortcut({
+    clientId,
+    shortcutName,
+    campaignNameTemplate,
+    dailyBudgetMinor,
+    targetRoiMilli,
+    topUpThresholdBps,
+    lineUserId,
+    createdAt,
+  } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedName = requiredString(shortcutName, 'shortcutName');
+    const normalizedTemplate = requiredString(campaignNameTemplate, 'campaignNameTemplate');
+    const normalizedUserId = requiredString(lineUserId, 'lineUserId');
+    const at = requiredIsoTime(createdAt, 'createdAt');
+    const budget = safeMinor(dailyBudgetMinor, 'dailyBudgetMinor', { positive: true });
+    const roi = safeMinor(targetRoiMilli, 'targetRoiMilli', { positive: true });
+    const threshold = safeMinor(topUpThresholdBps, 'topUpThresholdBps', { positive: true });
+    if (threshold >= 10_000) {
+      throw new DomainError('INVALID_REQUEST', 'topUpThresholdBps must be below 10000');
+    }
+    return this.#transaction(() => {
+      const current = this.db.prepare(`
+        SELECT COALESCE(MAX(revision), 0) AS revision
+        FROM campaign_shortcuts
+        WHERE client_id = ? AND shortcut_name = ?
+      `).get(normalizedClientId, normalizedName);
+      const revision = Number(current.revision) + 1;
+      this.db.prepare(`
+        INSERT INTO campaign_shortcuts
+          (client_id, shortcut_name, revision, campaign_name_template,
+           daily_budget_minor, target_roi_milli, top_up_threshold_bps,
+           created_at, created_by_line_user_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        normalizedClientId,
+        normalizedName,
+        revision,
+        normalizedTemplate,
+        budget,
+        roi,
+        threshold,
+        at,
+        normalizedUserId,
+      );
+      this.#insertAudit({
+        eventType: 'CAMPAIGN_SHORTCUT_SAVED',
+        actorType: 'LINE_USER',
+        actorId: normalizedUserId,
+        occurredAt: at,
+        details: {
+          clientId: normalizedClientId,
+          shortcutName: normalizedName,
+          revision,
+          dailyBudgetMinor: budget,
+          targetRoiMilli: roi,
+          topUpThresholdBps: threshold,
+        },
+      });
+      return this.getCampaignShortcut({ clientId: normalizedClientId, shortcutName: normalizedName });
+    });
+  }
+
+  getCampaignShortcut({ clientId, shortcutName } = {}) {
+    const row = this.db.prepare(`
+      SELECT client_id, shortcut_name, revision, campaign_name_template,
+             daily_budget_minor, target_roi_milli, top_up_threshold_bps,
+             created_at, created_by_line_user_id
+      FROM campaign_shortcuts
+      WHERE client_id = ? AND shortcut_name = ?
+      ORDER BY revision DESC
+      LIMIT 1
+    `).get(requiredString(clientId, 'clientId'), requiredString(shortcutName, 'shortcutName'));
+    return row ? this.#mapCampaignShortcut(row) : null;
+  }
+
+  listCampaignShortcuts({ clientId } = {}) {
+    return this.db.prepare(`
+      SELECT c.client_id, c.shortcut_name, c.revision, c.campaign_name_template,
+             c.daily_budget_minor, c.target_roi_milli, c.top_up_threshold_bps,
+             c.created_at, c.created_by_line_user_id
+      FROM campaign_shortcuts c
+      WHERE c.client_id = ?
+        AND c.revision = (
+          SELECT MAX(latest.revision)
+          FROM campaign_shortcuts latest
+          WHERE latest.client_id = c.client_id
+            AND latest.shortcut_name = c.shortcut_name
+        )
+      ORDER BY c.shortcut_name ASC
+    `).all(requiredString(clientId, 'clientId')).map((row) => this.#mapCampaignShortcut(row));
+  }
+
+  #mapReportSubscription(row) {
+    return Object.freeze({
+      clientId: row.client_id,
+      lineUserId: row.line_user_id,
+      intervalMinutes: row.interval_minutes,
+      enabled: row.enabled === 1,
+      nextDueAt: row.next_due_at,
+      lastOccurrenceAt: row.last_occurrence_at,
+      updatedAt: row.updated_at,
+    });
+  }
+
+  setReportSubscription({ clientId, lineUserId, intervalMinutes, enabled = true, now } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedUserId = requiredString(lineUserId, 'lineUserId');
+    if (!Number.isSafeInteger(intervalMinutes) || intervalMinutes < 60 || intervalMinutes > 1440) {
+      throw new DomainError('INVALID_REQUEST', 'intervalMinutes must be between 60 and 1440');
+    }
+    const at = requiredIsoTime(now, 'now');
+    const nextDueAt = new Date(Date.parse(at) + intervalMinutes * 60_000).toISOString();
+    this.#transaction(() => {
+      this.db.prepare(`
+        INSERT INTO report_subscriptions
+          (client_id, line_user_id, interval_minutes, enabled, next_due_at,
+           last_occurrence_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, NULL, ?)
+        ON CONFLICT(client_id, line_user_id) DO UPDATE SET
+          interval_minutes = excluded.interval_minutes,
+          enabled = excluded.enabled,
+          next_due_at = excluded.next_due_at,
+          updated_at = excluded.updated_at
+      `).run(
+        normalizedClientId,
+        normalizedUserId,
+        intervalMinutes,
+        enabled ? 1 : 0,
+        nextDueAt,
+        at,
+      );
+      this.#insertAudit({
+        eventType: enabled ? 'REPORT_SUBSCRIPTION_ENABLED' : 'REPORT_SUBSCRIPTION_DISABLED',
+        actorType: 'LINE_USER',
+        actorId: normalizedUserId,
+        occurredAt: at,
+        details: { clientId: normalizedClientId, intervalMinutes, nextDueAt },
+      });
+    });
+    return this.getReportSubscription({ clientId: normalizedClientId, lineUserId: normalizedUserId });
+  }
+
+  getReportSubscription({ clientId, lineUserId } = {}) {
+    const row = this.db.prepare(`
+      SELECT client_id, line_user_id, interval_minutes, enabled, next_due_at,
+             last_occurrence_at, updated_at
+      FROM report_subscriptions
+      WHERE client_id = ? AND line_user_id = ?
+    `).get(requiredString(clientId, 'clientId'), requiredString(lineUserId, 'lineUserId'));
+    return row ? this.#mapReportSubscription(row) : null;
+  }
+
+  disableReportSubscription({ clientId, lineUserId, now } = {}) {
+    const existing = this.getReportSubscription({ clientId, lineUserId });
+    if (!existing) return null;
+    return this.setReportSubscription({
+      clientId,
+      lineUserId,
+      intervalMinutes: existing.intervalMinutes,
+      enabled: false,
+      now,
+    });
+  }
+
+  claimDueReportSubscriptions({ now, limit = 100 } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new DomainError('INVALID_REQUEST', 'limit must be between 1 and 1000');
+    }
+    const at = requiredIsoTime(now, 'now');
+    return this.db.prepare(`
+      SELECT client_id, line_user_id, interval_minutes, enabled, next_due_at,
+             last_occurrence_at, updated_at
+      FROM report_subscriptions
+      WHERE enabled = 1 AND next_due_at <= ?
+      ORDER BY next_due_at ASC, client_id ASC, line_user_id ASC
+      LIMIT ?
+    `).all(at, limit).map((row) => Object.freeze({
+      ...this.#mapReportSubscription(row),
+      occurrenceAt: row.next_due_at,
+    }));
+  }
+
+  completeReportOccurrence({ clientId, lineUserId, occurrenceAt, now } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedUserId = requiredString(lineUserId, 'lineUserId');
+    const occurrence = requiredIsoTime(occurrenceAt, 'occurrenceAt');
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const current = this.getReportSubscription({
+        clientId: normalizedClientId,
+        lineUserId: normalizedUserId,
+      });
+      if (!current || !current.enabled || current.nextDueAt !== occurrence) return current;
+      let nextDueMilliseconds = Date.parse(occurrence) + current.intervalMinutes * 60_000;
+      while (nextDueMilliseconds <= Date.parse(at)) {
+        nextDueMilliseconds += current.intervalMinutes * 60_000;
+      }
+      const nextDueAt = new Date(nextDueMilliseconds).toISOString();
+      const result = this.db.prepare(`
+        UPDATE report_subscriptions
+        SET next_due_at = ?, last_occurrence_at = ?, updated_at = ?
+        WHERE client_id = ? AND line_user_id = ? AND next_due_at = ? AND enabled = 1
+      `).run(
+        nextDueAt,
+        occurrence,
+        at,
+        normalizedClientId,
+        normalizedUserId,
+        occurrence,
+      );
+      if (result.changes !== 1) {
+        throw new DomainError('CONCURRENT_MODIFICATION', 'Report occurrence changed concurrently');
+      }
+      return this.getReportSubscription({
+        clientId: normalizedClientId,
+        lineUserId: normalizedUserId,
+      });
+    });
+  }
+
+  #mapControlRequest(row) {
+    return Object.freeze({
+      id: row.id,
+      clientId: row.client_id,
+      action: row.action,
+      state: row.state,
+      version: row.version,
+      requestedByLineUserId: row.requested_by_line_user_id,
+      createdAt: row.created_at,
+      expiresAt: row.expires_at,
+      updatedAt: row.updated_at,
+      data: Object.freeze(parseJson(row.data_json)),
+    });
+  }
+
+  createCampaignControlRequest({
+    id,
+    clientId,
+    action,
+    requestedByLineUserId,
+    createdAt,
+    expiresAt,
+    data,
+  } = {}) {
+    const normalizedId = requiredString(id, 'id');
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedAction = requiredString(action, 'action');
+    const normalizedUserId = requiredString(requestedByLineUserId, 'requestedByLineUserId');
+    const created = requiredIsoTime(createdAt, 'createdAt');
+    const expires = requiredIsoTime(expiresAt, 'expiresAt');
+    if (Date.parse(expires) <= Date.parse(created)) {
+      throw new DomainError('INVALID_REQUEST', 'expiresAt must be later than createdAt');
+    }
+    this.#transaction(() => {
+      this.db.prepare(`
+        INSERT INTO campaign_control_requests
+          (id, client_id, action, state, version, requested_by_line_user_id,
+           created_at, expires_at, updated_at, data_json)
+        VALUES (?, ?, ?, 'PENDING_CONFIRMATION', 1, ?, ?, ?, ?, ?)
+      `).run(
+        normalizedId,
+        normalizedClientId,
+        normalizedAction,
+        normalizedUserId,
+        created,
+        expires,
+        created,
+        json(data, 'data'),
+      );
+      this.#insertAudit({
+        eventType: 'CAMPAIGN_CONTROL_REQUEST_CREATED',
+        actorType: 'LINE_USER',
+        actorId: normalizedUserId,
+        occurredAt: created,
+        details: { controlRequestId: normalizedId, clientId: normalizedClientId, action: normalizedAction },
+      });
+    });
+    return this.getCampaignControlRequest(normalizedId);
+  }
+
+  getCampaignControlRequest(id) {
+    const row = this.db.prepare(`
+      SELECT id, client_id, action, state, version, requested_by_line_user_id,
+             created_at, expires_at, updated_at, data_json
+      FROM campaign_control_requests WHERE id = ?
+    `).get(requiredString(id, 'id'));
+    return row ? this.#mapControlRequest(row) : null;
+  }
+
+  #couponResolutionMatchesReplay(controlRequestId, version, outcome) {
+    const rows = this.db.prepare(`
+      SELECT details_json
+      FROM audit_events
+      WHERE event_type = 'CAMPAIGN_CONTROL_REQUEST_EXPIRED'
+      ORDER BY sequence DESC
+    `).all();
+    for (const row of rows) {
+      const details = parseJson(row.details_json);
+      if (details?.controlRequestId !== controlRequestId) continue;
+      return details.fromVersion === version && details.outcome === outcome;
+    }
+    return false;
+  }
+
+  transitionCampaignControlRequest({ id, version, lineUserId, outcome, now } = {}) {
+    const normalizedId = requiredString(id, 'id');
+    const normalizedUserId = requiredString(lineUserId, 'lineUserId');
+    if (!Number.isSafeInteger(version) || version < 1) {
+      throw new DomainError('INVALID_REQUEST', 'version must be a positive integer');
+    }
+    const at = requiredIsoTime(now, 'now');
+    const targetState = outcome === 'confirm'
+      ? 'CONFIRMED_DRY_RUN'
+      : outcome === 'confirm_live'
+        ? 'CONFIRMED'
+        : outcome === 'reject'
+          ? 'CANCELLED'
+          : null;
+    if (!targetState) throw new DomainError('INVALID_REQUEST', 'outcome is invalid');
+    return this.#transaction(() => {
+      const current = this.getCampaignControlRequest(normalizedId);
+      if (!current) throw new DomainError('REQUEST_NOT_FOUND', 'Campaign control request was not found');
+      if (current.state !== 'PENDING_CONFIRMATION') {
+        throw new DomainError('INVALID_STATE', `Campaign control request is ${current.state}`);
+      }
+      if (current.version !== version) throw new DomainError('CONCURRENT_MODIFICATION', 'Request version changed');
+      const expired = Date.parse(at) >= Date.parse(current.expiresAt);
+      const nextState = expired ? 'EXPIRED' : targetState;
+      const result = this.db.prepare(`
+        UPDATE campaign_control_requests
+        SET state = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND state = 'PENDING_CONFIRMATION' AND version = ?
+      `).run(nextState, at, normalizedId, version);
+      if (result.changes !== 1) throw new DomainError('CONCURRENT_MODIFICATION', 'Request changed concurrently');
+      this.#insertAudit({
+        eventType: expired ? 'CAMPAIGN_CONTROL_REQUEST_EXPIRED' : `CAMPAIGN_CONTROL_REQUEST_${nextState}`,
+        actorType: 'LINE_USER',
+        actorId: normalizedUserId,
+        occurredAt: at,
+        details: { controlRequestId: normalizedId, clientId: current.clientId, action: current.action },
+      });
+      return this.getCampaignControlRequest(normalizedId);
+    });
+  }
+
+  #mapCouponSchedule(row) {
+    return Object.freeze({
+      id: row.id,
+      controlRequestId: row.control_request_id,
+      clientId: row.client_id,
+      lineUserId: row.line_user_id,
+      eventAt: row.event_at,
+      notifyAt: row.notify_at,
+      budgetMinor: row.budget_minor,
+      status: row.status,
+      attemptCount: row.attempt_count,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      lastError: row.last_error,
+    });
+  }
+
+  #insertCouponSchedule({ controlRequestId, clientId, lineUserId, eventAt, notifyAt, budgetMinor, now }) {
+    const normalizedControlRequestId = controlRequestId === null
+      ? null
+      : requiredString(controlRequestId, 'controlRequestId');
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedUserId = requiredString(lineUserId, 'lineUserId');
+    const event = requiredIsoTime(eventAt, 'eventAt');
+    const notify = requiredIsoTime(notifyAt, 'notifyAt');
+    const at = requiredIsoTime(now, 'now');
+    const budget = safeMinor(budgetMinor, 'budgetMinor', { positive: true });
+
+    if (normalizedControlRequestId !== null) {
+      const controlRequest = this.getCampaignControlRequest(normalizedControlRequestId);
+      if (!controlRequest) {
+        throw new DomainError(
+          'REQUEST_NOT_FOUND',
+          'Coupon control request was not found',
+          { controlRequestId: normalizedControlRequestId },
+        );
+      }
+      if (controlRequest.action !== 'SCHEDULE_COUPON_BOOST') {
+        throw new DomainError(
+          'INVALID_REQUEST',
+          'Campaign control request is not a coupon boost schedule',
+          { controlRequestId: normalizedControlRequestId, action: controlRequest.action },
+        );
+      }
+      const desired = controlRequest.data?.desired;
+      const matchesControl = controlRequest.clientId === normalizedClientId
+        && controlRequest.requestedByLineUserId === normalizedUserId
+        && requiredIsoTime(desired?.eventAt, 'controlRequest.data.desired.eventAt') === event
+        && requiredIsoTime(desired?.notifyAt, 'controlRequest.data.desired.notifyAt') === notify
+        && desired?.dailyBudgetMinor === budget;
+      if (!matchesControl) {
+        throw new DomainError(
+          'COUPON_SCHEDULE_CONFLICT',
+          'Coupon schedule does not match its control request',
+          { controlRequestId: normalizedControlRequestId },
+        );
+      }
+      const existing = this.getCouponScheduleByControlRequestId(normalizedControlRequestId);
+      if (existing) {
+        const identical = existing.clientId === normalizedClientId
+          && existing.lineUserId === normalizedUserId
+          && existing.eventAt === event
+          && existing.notifyAt === notify
+          && existing.budgetMinor === budget;
+        if (!identical) {
+          throw new DomainError(
+            'COUPON_SCHEDULE_CONFLICT',
+            'Coupon control request is already linked to a different schedule',
+            { controlRequestId: normalizedControlRequestId, scheduleId: existing.id },
+          );
+        }
+        return existing;
+      }
+    }
+
+    if (Date.parse(notify) >= Date.parse(event) || Date.parse(notify) <= Date.parse(at)) {
+      throw new DomainError('INVALID_REQUEST', 'Coupon notifyAt must be in the future and before eventAt');
+    }
+
+    // A linked schedule derives its primary key from the immutable control id.
+    // Together with the unique FK this gives retries one stable one-to-one map.
+    const id = normalizedControlRequestId === null
+      ? `cs_${randomUUID()}`
+      : `cs_${normalizedControlRequestId}`;
+    this.db.prepare(`
+      INSERT INTO coupon_schedules
+        (id, control_request_id, client_id, line_user_id, event_at, notify_at,
+         budget_minor, status, attempt_count, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)
+    `).run(
+      id,
+      normalizedControlRequestId,
+      normalizedClientId,
+      normalizedUserId,
+      event,
+      notify,
+      budget,
+      at,
+      at,
+    );
+    this.#insertAudit({
+      eventType: 'COUPON_SCHEDULE_CREATED',
+      actorType: 'LINE_USER',
+      actorId: normalizedUserId,
+      occurredAt: at,
+      details: {
+        scheduleId: id,
+        controlRequestId: normalizedControlRequestId,
+        clientId: normalizedClientId,
+        eventAt: event,
+        notifyAt: notify,
+        budgetMinor: budget,
+      },
+    });
+    return this.getCouponSchedule(id);
+  }
+
+  createCouponSchedule({
+    controlRequestId = null,
+    clientId,
+    lineUserId,
+    eventAt,
+    notifyAt,
+    budgetMinor,
+    now,
+  } = {}) {
+    return this.#transaction(() => this.#insertCouponSchedule({
+      controlRequestId,
+      clientId,
+      lineUserId,
+      eventAt,
+      notifyAt,
+      budgetMinor,
+      now,
+    }));
+  }
+
+  getCouponSchedule(id) {
+    const row = this.db.prepare(`
+      SELECT id, control_request_id, client_id, line_user_id, event_at, notify_at,
+             budget_minor, status, attempt_count, created_at, updated_at, last_error
+      FROM coupon_schedules WHERE id = ?
+    `).get(requiredString(id, 'id'));
+    return row ? this.#mapCouponSchedule(row) : null;
+  }
+
+  getCouponScheduleByControlRequestId(controlRequestId) {
+    const row = this.db.prepare(`
+      SELECT id, control_request_id, client_id, line_user_id, event_at, notify_at,
+             budget_minor, status, attempt_count, created_at, updated_at, last_error
+      FROM coupon_schedules WHERE control_request_id = ?
+    `).get(requiredString(controlRequestId, 'controlRequestId'));
+    return row ? this.#mapCouponSchedule(row) : null;
+  }
+
+  /**
+   * Resolves a coupon confirmation and creates its durable reminder as one
+   * transaction. A retry carrying the original version/outcome returns the
+   * already-resolved request and its one linked schedule without another write.
+   */
+  transitionCouponBoostControlRequest({ id, version, lineUserId, outcome, now } = {}) {
+    const normalizedId = requiredString(id, 'id');
+    if (!Number.isSafeInteger(version) || version < 1) {
+      throw new DomainError('INVALID_REQUEST', 'version must be a positive integer');
+    }
+    const at = requiredIsoTime(now, 'now');
+    const targetState = outcome === 'confirm'
+      ? 'CONFIRMED_DRY_RUN'
+      : outcome === 'confirm_live'
+        ? 'CONFIRMED'
+        : outcome === 'reject'
+          ? 'CANCELLED'
+          : outcome === 'expire'
+            ? 'EXPIRED'
+            : null;
+    if (!targetState) throw new DomainError('INVALID_REQUEST', 'outcome is invalid');
+    const normalizedUserId = outcome === 'expire'
+      ? null
+      : requiredString(lineUserId, 'lineUserId');
+
+    return this.#transaction(() => {
+      let current = this.getCampaignControlRequest(normalizedId);
+      if (!current) throw new DomainError('REQUEST_NOT_FOUND', 'Campaign control request was not found');
+      if (current.action !== 'SCHEDULE_COUPON_BOOST') {
+        throw new DomainError(
+          'INVALID_REQUEST',
+          'Campaign control request is not a coupon boost schedule',
+          { controlRequestId: normalizedId, action: current.action },
+        );
+      }
+
+      // Idempotent postback/webhook replay. EXPIRED is also terminal when a
+      // confirm/reject first arrived after its deadline.
+      const replayedTerminalState = current.version === version + 1
+        && (current.state === 'EXPIRED'
+          ? this.#couponResolutionMatchesReplay(normalizedId, version, outcome)
+          : current.state === targetState);
+      if (replayedTerminalState) {
+        let schedule = this.getCouponScheduleByControlRequestId(normalizedId);
+        if (
+          schedule === null
+          && (current.state === 'CONFIRMED_DRY_RUN' || current.state === 'CONFIRMED')
+        ) {
+          const desired = current.data?.desired;
+          schedule = this.#insertCouponSchedule({
+            controlRequestId: current.id,
+            clientId: current.clientId,
+            lineUserId: current.requestedByLineUserId,
+            eventAt: desired?.eventAt,
+            notifyAt: desired?.notifyAt,
+            budgetMinor: desired?.dailyBudgetMinor,
+            now: current.updatedAt,
+          });
+        }
+        return Object.freeze({ request: current, schedule });
+      }
+
+      if (current.state !== 'PENDING_CONFIRMATION') {
+        throw new DomainError('INVALID_STATE', `Campaign control request is ${current.state}`);
+      }
+      if (current.version !== version) {
+        throw new DomainError('CONCURRENT_MODIFICATION', 'Request version changed');
+      }
+      if (outcome === 'expire' && Date.parse(at) < Date.parse(current.expiresAt)) {
+        throw new DomainError('INVALID_STATE', 'Campaign control request has not expired');
+      }
+
+      const expired = Date.parse(at) >= Date.parse(current.expiresAt);
+      const nextState = expired ? 'EXPIRED' : targetState;
+      const result = this.db.prepare(`
+        UPDATE campaign_control_requests
+        SET state = ?, version = version + 1, updated_at = ?
+        WHERE id = ? AND state = 'PENDING_CONFIRMATION' AND version = ?
+      `).run(nextState, at, normalizedId, version);
+      if (result.changes !== 1) {
+        throw new DomainError('CONCURRENT_MODIFICATION', 'Request changed concurrently');
+      }
+      this.#insertAudit({
+        eventType: expired || outcome === 'expire'
+          ? 'CAMPAIGN_CONTROL_REQUEST_EXPIRED'
+          : `CAMPAIGN_CONTROL_REQUEST_${nextState}`,
+        actorType: outcome === 'expire' ? 'SYSTEM' : 'LINE_USER',
+        actorId: outcome === 'expire' ? null : normalizedUserId,
+        occurredAt: at,
+        details: {
+          controlRequestId: normalizedId,
+          clientId: current.clientId,
+          action: current.action,
+          outcome,
+          fromVersion: version,
+        },
+      });
+
+      current = this.getCampaignControlRequest(normalizedId);
+      let schedule = null;
+      if (current.state === 'CONFIRMED_DRY_RUN' || current.state === 'CONFIRMED') {
+        const desired = current.data?.desired;
+        schedule = this.#insertCouponSchedule({
+          controlRequestId: current.id,
+          clientId: current.clientId,
+          lineUserId: current.requestedByLineUserId,
+          eventAt: desired?.eventAt,
+          notifyAt: desired?.notifyAt,
+          budgetMinor: desired?.dailyBudgetMinor,
+          now: at,
+        });
+      }
+      return Object.freeze({ request: current, schedule });
+    });
+  }
+
+  cancelPendingCouponSchedules({ clientId, lineUserId, now } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedUserId = requiredString(lineUserId, 'lineUserId');
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const pending = this.db.prepare(`
+        SELECT id, control_request_id
+        FROM coupon_schedules
+        WHERE client_id = ? AND line_user_id = ? AND status = 'PENDING'
+        ORDER BY id ASC
+      `).all(normalizedClientId, normalizedUserId);
+      const result = this.db.prepare(`
+        UPDATE coupon_schedules
+        SET status = 'CANCELLED', updated_at = ?
+        WHERE client_id = ? AND line_user_id = ? AND status = 'PENDING'
+      `).run(at, normalizedClientId, normalizedUserId);
+      if (Number(result.changes) !== pending.length) {
+        throw new DomainError('CONCURRENT_MODIFICATION', 'Coupon schedules changed concurrently');
+      }
+      for (const schedule of pending) {
+        this.#insertAudit({
+          eventType: 'COUPON_SCHEDULE_CANCELLED',
+          actorType: 'LINE_USER',
+          actorId: normalizedUserId,
+          occurredAt: at,
+          details: {
+            scheduleId: schedule.id,
+            controlRequestId: schedule.control_request_id,
+            clientId: normalizedClientId,
+          },
+        });
+      }
+      return pending.length;
+    });
+  }
+
+  claimDueCouponSchedules({ now, limit = 20 } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    const staleProcessingBefore = new Date(Date.parse(at) - 120_000).toISOString();
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new DomainError('INVALID_REQUEST', 'limit must be between 1 and 100');
+    }
+    return this.#transaction(() => {
+      const rows = this.db.prepare(`
+        SELECT id, control_request_id, client_id, line_user_id, event_at,
+               notify_at, budget_minor, status, attempt_count, created_at,
+               updated_at, last_error
+        FROM coupon_schedules
+        WHERE notify_at <= ?
+          AND (
+            status = 'PENDING'
+            OR (status = 'PROCESSING' AND updated_at <= ?)
+          )
+        ORDER BY notify_at ASC, id ASC
+        LIMIT ?
+      `).all(at, staleProcessingBefore, limit);
+      const claimed = [];
+      for (const row of rows) {
+        const result = this.db.prepare(`
+          UPDATE coupon_schedules
+          SET status = 'PROCESSING', attempt_count = attempt_count + 1, updated_at = ?
+          WHERE id = ?
+            AND (
+              status = 'PENDING'
+              OR (status = 'PROCESSING' AND updated_at <= ?)
+            )
+        `).run(at, row.id, staleProcessingBefore);
+        if (result.changes === 1) {
+          const schedule = this.getCouponSchedule(row.id);
+          this.#insertAudit({
+            eventType: 'COUPON_SCHEDULE_CLAIMED',
+            actorType: 'SYSTEM',
+            occurredAt: at,
+            details: {
+              scheduleId: schedule.id,
+              controlRequestId: schedule.controlRequestId,
+              clientId: schedule.clientId,
+              attemptCount: schedule.attemptCount,
+              reclaimed: row.status === 'PROCESSING',
+            },
+          });
+          claimed.push(schedule);
+        }
+      }
+      return claimed;
+    });
+  }
+
+  finishCouponSchedule({ id, ok, now, error = null } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const current = this.getCouponSchedule(id);
+      if (!current || current.status !== 'PROCESSING') return current;
+      const retry = !ok && current.attemptCount < 3;
+      const status = ok ? 'SENT' : retry ? 'PENDING' : 'FAILED';
+      const notifyAt = retry ? new Date(Date.parse(at) + 60_000).toISOString() : current.notifyAt;
+      const normalizedError = error == null ? null : String(error).slice(0, 500);
+      const result = this.db.prepare(`
+        UPDATE coupon_schedules
+        SET status = ?, notify_at = ?, updated_at = ?, last_error = ?
+        WHERE id = ? AND status = 'PROCESSING'
+      `).run(status, notifyAt, at, normalizedError, current.id);
+      if (result.changes !== 1) {
+        throw new DomainError('CONCURRENT_MODIFICATION', 'Coupon schedule changed concurrently');
+      }
+      this.#insertAudit({
+        eventType: 'COUPON_SCHEDULE_FINISHED',
+        actorType: 'SYSTEM',
+        occurredAt: at,
+        details: {
+          scheduleId: current.id,
+          controlRequestId: current.controlRequestId,
+          clientId: current.clientId,
+          status,
+          retry,
+          attemptCount: current.attemptCount,
+          error: normalizedError,
+        },
+      });
+      return this.getCouponSchedule(current.id);
     });
   }
 

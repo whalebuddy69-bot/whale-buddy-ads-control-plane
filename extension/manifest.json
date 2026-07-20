@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Whale Buddy LIVE GMV Telemetry",
-  "version": "0.2.0",
-  "description": "อ่านสถานะ LIVE GMV Max และมี page-refresh fallback แบบหยุดเมื่อพบงานที่ยังไม่บันทึก",
+  "version": "0.3.0",
+  "description": "อ่านงบ ยอดขาย และ ROI ของ LIVE GMV Max พร้อม page-refresh fallback ที่หยุดเมื่อพบงานยังไม่บันทึก",
   "minimum_chrome_version": "120",
   "incognito": "not_allowed",
   "background": {

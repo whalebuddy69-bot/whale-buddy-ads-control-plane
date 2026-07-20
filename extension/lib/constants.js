@@ -19,10 +19,11 @@ export const PILOT_BINDING = Object.freeze({
   liveWindow: Object.freeze({ start: "06:00", end: "23:00" })
 });
 
-// This must match TELEMETRY_UI_SCHEMA_FINGERPRINT_V1 in src/telemetry.js.
-// It fingerprints the approved semantic mapping, not the literal DOM headers.
+// These must match telemetry v2 in src/telemetry.js. The fingerprint covers
+// the approved semantic mapping, not the literal DOM headers.
+export const TELEMETRY_SCHEMA_VERSION = 2;
 export const UI_SCHEMA_FINGERPRINT =
-  "f7832eee44e50e87673de0b8b9a840f603461816940e1a99eec2fd4c0f203ccc";
+  "e1163e229b1c451871300ad6c06309d776b44c4269b6f2c939d4b2aac9e5c5fc";
 
 export const STORAGE_KEYS = Object.freeze({
   installationId: "installationId",

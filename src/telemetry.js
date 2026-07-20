@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 
 const MAX_TEXT_LENGTH = 200;
 const MAX_MONEY_MINOR = 100_000_000_000;
+const MAX_ROI_MILLI = 100_000_000_000;
 const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{43}$/;
 const BASE64URL_NONCE = /^[A-Za-z0-9_-]{22,86}$/;
 const CREDENTIAL_ID = /^tc_[A-Za-z0-9_-]{16,80}$/;
@@ -25,6 +26,56 @@ export const TELEMETRY_UI_SCHEMA_FINGERPRINT_V1 = crypto
   .createHash("sha256")
   .update(JSON.stringify(TELEMETRY_UI_SCHEMA_V1), "utf8")
   .digest("hex");
+
+// ROI values in telemetry v2 are exact integers scaled by 1,000. For example,
+// a visible Gross ROI of 3.69 is transmitted as grossRoiMilli: 3_690.
+export const TELEMETRY_ROI_SCALE = 1_000;
+
+export const TELEMETRY_UI_SCHEMA_V2 = Object.freeze({
+  ...TELEMETRY_UI_SCHEMA_V1,
+  grossRevenueMinor: "Gross revenue",
+  grossRoiMilli: "Gross ROI",
+  netRevenueMinor: "Net revenue",
+  netRoiMilli: "Net ROI",
+  gmvMinor: "GMV"
+});
+
+export const TELEMETRY_UI_SCHEMA_FINGERPRINT_V2 = crypto
+  .createHash("sha256")
+  .update(JSON.stringify(TELEMETRY_UI_SCHEMA_V2), "utf8")
+  .digest("hex");
+
+const TELEMETRY_SNAPSHOT_V1_KEYS = Object.freeze([
+  "schemaVersion",
+  "uiSchemaFingerprint",
+  "snapshotId",
+  "clientId",
+  "advertiserId",
+  "businessCenterId",
+  "sellerMode",
+  "pageType",
+  "tiktokAccountId",
+  "campaignId",
+  "campaignRef",
+  "campaignName",
+  "campaignType",
+  "campaignStatus",
+  "currency",
+  "dailyBudgetMinor",
+  "totalBudgetMinor",
+  "costMinor",
+  "netCostMinor",
+  "observedAt",
+  "source"
+]);
+
+const TELEMETRY_SNAPSHOT_V2_METRIC_KEYS = Object.freeze([
+  "grossRevenueMinor",
+  "grossRoiMilli",
+  "netRevenueMinor",
+  "netRoiMilli",
+  "gmvMinor"
+]);
 
 export class TelemetryError extends Error {
   constructor(code, message, { status = 400, details } = {}) {
@@ -64,6 +115,22 @@ function moneyMinor(value, field, { positive = false } = {}) {
     fail(
       "INVALID_TELEMETRY_SNAPSHOT",
       `${field} must be a ${positive ? "positive" : "non-negative"} safe integer in minor currency units`,
+      { details: { field } }
+    );
+  }
+  return value;
+}
+
+function nullableMoneyMinor(value, field) {
+  return value === null ? null : moneyMinor(value, field);
+}
+
+function nullableRoiMilli(value, field) {
+  if (value === null) return null;
+  if (!Number.isSafeInteger(value) || value < 0 || value > MAX_ROI_MILLI) {
+    fail(
+      "INVALID_TELEMETRY_SNAPSHOT",
+      `${field} must be a non-negative safe integer scaled by ${TELEMETRY_ROI_SCALE}`,
       { details: { field } }
     );
   }
@@ -120,33 +187,23 @@ export function validateTelemetrySnapshot(input, {
   now = new Date(),
   maxFutureSkewSeconds = 60
 } = {}) {
-  exactObject(input, "snapshot", [
-    "schemaVersion",
-    "uiSchemaFingerprint",
-    "snapshotId",
-    "clientId",
-    "advertiserId",
-    "businessCenterId",
-    "sellerMode",
-    "pageType",
-    "tiktokAccountId",
-    "campaignId",
-    "campaignRef",
-    "campaignName",
-    "campaignType",
-    "campaignStatus",
-    "currency",
-    "dailyBudgetMinor",
-    "totalBudgetMinor",
-    "costMinor",
-    "netCostMinor",
-    "observedAt",
-    "source"
-  ]);
-  if (input.schemaVersion !== 1) {
-    fail("UNSUPPORTED_TELEMETRY_SCHEMA", "schemaVersion must be 1");
+  const allSnapshotKeys = [
+    ...TELEMETRY_SNAPSHOT_V1_KEYS,
+    ...TELEMETRY_SNAPSHOT_V2_METRIC_KEYS
+  ];
+  exactObject(input, "snapshot", allSnapshotKeys);
+  if (input.schemaVersion !== 1 && input.schemaVersion !== 2) {
+    fail("UNSUPPORTED_TELEMETRY_SCHEMA", "schemaVersion must be 1 or 2");
   }
-  if (input.uiSchemaFingerprint !== TELEMETRY_UI_SCHEMA_FINGERPRINT_V1) {
+  exactObject(
+    input,
+    "snapshot",
+    input.schemaVersion === 1 ? TELEMETRY_SNAPSHOT_V1_KEYS : allSnapshotKeys
+  );
+  const expectedUiSchemaFingerprint = input.schemaVersion === 1
+    ? TELEMETRY_UI_SCHEMA_FINGERPRINT_V1
+    : TELEMETRY_UI_SCHEMA_FINGERPRINT_V2;
+  if (input.uiSchemaFingerprint !== expectedUiSchemaFingerprint) {
     fail(
       "TELEMETRY_UI_SCHEMA_MISMATCH",
       "TikTok UI header mapping does not match the approved telemetry schema"
@@ -285,13 +342,22 @@ export function validateTelemetrySnapshot(input, {
   const totalBudgetMinor = moneyMinor(input.totalBudgetMinor, "totalBudgetMinor", { positive: true });
   const costMinor = moneyMinor(input.costMinor, "costMinor");
   const netCostMinor = moneyMinor(input.netCostMinor, "netCostMinor");
+  const v2Metrics = input.schemaVersion === 2
+    ? {
+        grossRevenueMinor: nullableMoneyMinor(input.grossRevenueMinor, "grossRevenueMinor"),
+        grossRoiMilli: nullableRoiMilli(input.grossRoiMilli, "grossRoiMilli"),
+        netRevenueMinor: nullableMoneyMinor(input.netRevenueMinor, "netRevenueMinor"),
+        netRoiMilli: nullableRoiMilli(input.netRoiMilli, "netRoiMilli"),
+        gmvMinor: nullableMoneyMinor(input.gmvMinor, "gmvMinor")
+      }
+    : null;
   const policyCapMinor = client.budgetPolicy == null
     ? Math.round(configuredCampaign.maxDailyBudget * 100)
     : Math.round(client.budgetPolicy.maxDailyBudget * 100);
 
-  return Object.freeze({
-    schemaVersion: 1,
-    uiSchemaFingerprint: TELEMETRY_UI_SCHEMA_FINGERPRINT_V1,
+  const normalized = {
+    schemaVersion: input.schemaVersion,
+    uiSchemaFingerprint: expectedUiSchemaFingerprint,
     snapshotId,
     clientId,
     advertiserId,
@@ -309,13 +375,15 @@ export function validateTelemetrySnapshot(input, {
     totalBudgetMinor,
     costMinor,
     netCostMinor,
+    ...(v2Metrics ?? {}),
     observedAt,
     source: Object.freeze({ browserProfile, tabGroup }),
     policy: Object.freeze({
       maxDailyBudgetMinor: policyCapMinor,
       overDailyBudgetCap: dailyBudgetMinor > policyCapMinor
     })
-  });
+  };
+  return Object.freeze(normalized);
 }
 
 export function telemetryUiCampaignRef({ advertiserId, campaignName } = {}) {

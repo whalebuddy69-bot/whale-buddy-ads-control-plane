@@ -10,6 +10,7 @@ import { DomainError } from "../src/domain.js";
 import { SqliteStore } from "../src/store.js";
 import {
   TELEMETRY_UI_SCHEMA_FINGERPRINT_V1,
+  TELEMETRY_UI_SCHEMA_FINGERPRINT_V2,
   telemetryUiCampaignRef
 } from "../src/telemetry.js";
 
@@ -235,5 +236,233 @@ test("verified telemetry persists latest state, audit history, and replay nonces
     );
   } finally {
     reopened.close();
+  }
+});
+
+test("telemetry schema v2 persists reporting metrics without changing v1 history", () => {
+  const store = new SqliteStore();
+  const credential = enroll(store);
+  try {
+    const value = snapshot(
+      "ts_44444444-4444-4444-4444-444444444444",
+      "2026-07-20T11:59:30.000Z",
+      {
+        schemaVersion: 2,
+        uiSchemaFingerprint: TELEMETRY_UI_SCHEMA_FINGERPRINT_V2,
+        grossRevenueMinor: 120_000,
+        grossRoiMilli: 3690,
+        netRevenueMinor: 110_000,
+        netRoiMilli: 3660,
+        gmvMinor: 120_000
+      }
+    );
+    store.recordTelemetrySnapshot({
+      snapshot: value,
+      credentialId: credential.credentialId,
+      nonce: "EEEEEEEEEEEEEEEEEEEEEE",
+      payloadHash: hash("v2-payload"),
+      receivedAt: "2026-07-20T12:00:00.000Z",
+      pruneNoncesBefore: "2026-07-20T11:49:00.000Z"
+    });
+    const stored = store.getLatestTelemetry({ clientId: "punpan_020" });
+    assert.equal(stored.schemaVersion, 2);
+    assert.equal(stored.grossRevenueMinor, 120_000);
+    assert.equal(stored.grossRoiMilli, 3690);
+    assert.equal(stored.netRevenueMinor, 110_000);
+    assert.equal(stored.netRoiMilli, 3660);
+    assert.equal(stored.gmvMinor, 120_000);
+  } finally {
+    store.close();
+  }
+});
+
+test("existing telemetry v1 table migrates in place to accept v2 metrics", () => {
+  const directory = mkdtempSync(join(tmpdir(), "gmv-max-telemetry-v1-migration-"));
+  const filename = join(directory, "telemetry.sqlite");
+  const snapshotId = "ts_55555555-5555-5555-5555-555555555555";
+  const campaignName = "2026-07-20 06:00:00";
+  const campaignRef = telemetryUiCampaignRef({
+    advertiserId: "7646832328389263378",
+    campaignName
+  });
+  const legacy = new DatabaseSync(filename);
+  try {
+    legacy.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE telemetry_credentials (
+        credential_id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        installation_id TEXT NOT NULL,
+        public_key_jwk TEXT NOT NULL,
+        browser_profile TEXT NOT NULL,
+        tab_group TEXT NOT NULL,
+        business_center_id TEXT NOT NULL,
+        seller_mode TEXT NOT NULL,
+        page_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        revoked_at TEXT,
+        enrollment_id TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE telemetry_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        credential_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        advertiser_id TEXT NOT NULL,
+        business_center_id TEXT NOT NULL,
+        seller_mode TEXT NOT NULL,
+        page_type TEXT NOT NULL,
+        tiktok_account_id TEXT NOT NULL,
+        campaign_id TEXT,
+        campaign_ref TEXT NOT NULL,
+        campaign_name TEXT NOT NULL,
+        campaign_type TEXT NOT NULL CHECK(campaign_type = 'LIVE_GMV_MAX'),
+        campaign_status TEXT NOT NULL CHECK(campaign_status = 'ACTIVE'),
+        currency TEXT NOT NULL CHECK(currency = 'THB'),
+        schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+        ui_schema_fingerprint TEXT NOT NULL,
+        daily_budget_minor INTEGER NOT NULL CHECK(daily_budget_minor > 0),
+        total_budget_minor INTEGER NOT NULL CHECK(total_budget_minor > 0),
+        cost_minor INTEGER NOT NULL CHECK(cost_minor >= 0),
+        net_cost_minor INTEGER NOT NULL CHECK(net_cost_minor >= 0),
+        policy_cap_minor INTEGER NOT NULL CHECK(policy_cap_minor > 0),
+        over_policy_cap INTEGER NOT NULL CHECK(over_policy_cap IN (0, 1)),
+        observed_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        source_browser_profile TEXT NOT NULL,
+        source_tab_group TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        FOREIGN KEY(credential_id) REFERENCES telemetry_credentials(credential_id)
+      ) STRICT;
+      CREATE TABLE telemetry_latest (
+        client_id TEXT PRIMARY KEY,
+        snapshot_id TEXT NOT NULL UNIQUE,
+        observed_at TEXT NOT NULL,
+        received_at TEXT NOT NULL,
+        FOREIGN KEY(snapshot_id) REFERENCES telemetry_snapshots(snapshot_id)
+      ) STRICT;
+      CREATE TABLE telemetry_alert_evaluations (
+        snapshot_id TEXT PRIMARY KEY,
+        status TEXT NOT NULL,
+        request_id TEXT,
+        evaluated_at TEXT NOT NULL,
+        details_json TEXT NOT NULL,
+        FOREIGN KEY(snapshot_id) REFERENCES telemetry_snapshots(snapshot_id)
+      ) STRICT;
+    `);
+    legacy.prepare(`
+      INSERT INTO telemetry_credentials (
+        credential_id, client_id, installation_id, public_key_jwk,
+        browser_profile, tab_group, business_center_id, seller_mode, page_type,
+        created_at, revoked_at, enrollment_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+    `).run(
+      "tc_55555555-5555-5555-5555-555555555555",
+      "punpan_020",
+      "install_legacy_123",
+      "{}",
+      "Whalebuddy Ads",
+      "Ppan",
+      "7627179356976201745",
+      "withoutShop",
+      "live",
+      "2026-07-20T11:50:00.000Z",
+      "te_legacy_123"
+    );
+    legacy.prepare(`
+      INSERT INTO telemetry_snapshots (
+        snapshot_id, credential_id, client_id, advertiser_id, business_center_id,
+        seller_mode, page_type, tiktok_account_id, campaign_id, campaign_ref,
+        campaign_name, campaign_type, campaign_status, currency, schema_version,
+        ui_schema_fingerprint, daily_budget_minor, total_budget_minor, cost_minor,
+        net_cost_minor, policy_cap_minor, over_policy_cap, observed_at, received_at,
+        source_browser_profile, source_tab_group, payload_hash
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, 'LIVE_GMV_MAX', 'ACTIVE',
+                'THB', 1, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+    `).run(
+      snapshotId,
+      "tc_55555555-5555-5555-5555-555555555555",
+      "punpan_020",
+      "7646832328389263378",
+      "7627179356976201745",
+      "withoutShop",
+      "live",
+      "7285935731820920833",
+      campaignRef,
+      campaignName,
+      TELEMETRY_UI_SCHEMA_FINGERPRINT_V1,
+      300_000,
+      300_000,
+      240_000,
+      230_000,
+      600_000,
+      "2026-07-20T11:59:30.000Z",
+      "2026-07-20T12:00:00.000Z",
+      "Whalebuddy Ads",
+      "Ppan",
+      hash("legacy-v1-payload")
+    );
+    legacy.prepare(`
+      INSERT INTO telemetry_latest (client_id, snapshot_id, observed_at, received_at)
+      VALUES (?, ?, ?, ?)
+    `).run(
+      "punpan_020",
+      snapshotId,
+      "2026-07-20T11:59:30.000Z",
+      "2026-07-20T12:00:00.000Z"
+    );
+    legacy.prepare(`
+      INSERT INTO telemetry_alert_evaluations (
+        snapshot_id, status, request_id, evaluated_at, details_json
+      ) VALUES (?, 'BELOW_THRESHOLD', NULL, ?, ?)
+    `).run(
+      snapshotId,
+      "2026-07-20T12:00:01.000Z",
+      JSON.stringify({ utilization: 0.8 })
+    );
+  } finally {
+    legacy.close();
+  }
+
+  const migrated = new SqliteStore(filename);
+  try {
+    const sql = migrated.db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'telemetry_snapshots'
+    `).get().sql;
+    assert.match(sql, /schema_version IN \(1, 2\)/);
+    const columns = migrated.db.prepare("PRAGMA table_info(telemetry_snapshots)").all()
+      .map((column) => column.name);
+    for (const field of [
+      "gross_revenue_minor",
+      "gross_roi_milli",
+      "net_revenue_minor",
+      "net_roi_milli",
+      "gmv_minor"
+    ]) assert(columns.includes(field));
+    const latest = migrated.getLatestTelemetry({ clientId: "punpan_020" });
+    assert.equal(latest.snapshotId, snapshotId);
+    assert.equal(latest.schemaVersion, 1);
+    assert.equal(latest.grossRevenueMinor, null);
+    assert.equal(latest.grossRoiMilli, null);
+    assert.equal(latest.netRevenueMinor, null);
+    assert.equal(latest.netRoiMilli, null);
+    assert.equal(latest.gmvMinor, null);
+    const evaluation = migrated.getTelemetryAlertEvaluation(snapshotId);
+    assert.equal(evaluation.status, "BELOW_THRESHOLD");
+    assert.equal(evaluation.details.utilization, 0.8);
+    assert.equal(
+      migrated.db.prepare("SELECT COUNT(*) AS count FROM telemetry_snapshots").get().count,
+      1
+    );
+    assert.equal(
+      migrated.db.prepare("SELECT COUNT(*) AS count FROM telemetry_latest").get().count,
+      1
+    );
+    assert.equal(
+      migrated.db.prepare("SELECT COUNT(*) AS count FROM telemetry_alert_evaluations").get().count,
+      1
+    );
+    assert.equal(migrated.db.prepare("PRAGMA foreign_key_check").all().length, 0);
+  } finally {
+    migrated.close();
   }
 });

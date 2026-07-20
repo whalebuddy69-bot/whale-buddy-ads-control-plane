@@ -212,6 +212,11 @@ export function createHttpServer({
           telemetryAlertsEnabled: runtimeStatus.telemetryAlertsEnabled,
           executionEnabled: runtimeStatus.executionEnabled,
           monitorEnabled: runtimeStatus.monitorEnabled,
+          lineControls: {
+            enabled: config.clients.some((client) => client.lineControl?.enabled === true),
+            configuredClients: config.clients.filter((client) => client.lineControl?.enabled === true).length,
+            writeMode: "dry-run"
+          },
           adapters
         });
       }
@@ -364,6 +369,41 @@ export function createHttpServer({
         });
       }
 
+      if (request.method === "POST" && url.pathname === "/admin/line-approvers/revoke") {
+        const rawBody = await readBody(request);
+        const input = JSON.parse(rawBody.toString("utf8"));
+        const clientId = typeof input.clientId === "string" ? input.clientId.trim() : "";
+        const lineUserId = typeof input.lineUserId === "string" ? input.lineUserId.trim() : "";
+        if (!clientId || !lineUserId) {
+          return jsonResponse(response, 400, {
+            ok: false,
+            error: "INVALID_REQUEST",
+            message: "clientId and lineUserId must be non-empty strings"
+          });
+        }
+        const client = config.clients.find((candidate) => candidate.id === clientId);
+        if (!client) {
+          return jsonResponse(response, 404, { ok: false, error: "CLIENT_NOT_FOUND" });
+        }
+        if ((client.lineApproverUserIds ?? []).includes(lineUserId)) {
+          return jsonResponse(response, 409, {
+            ok: false,
+            error: "CONFIGURED_LINE_APPROVER",
+            message: "This LINE approver is configured in the client policy and cannot be revoked in the database"
+          });
+        }
+        let revocation;
+        try {
+          revocation = store.revokeLineApprover({ clientId, lineUserId, revokedAt: clock() });
+        } catch (error) {
+          if (error?.code === "LINE_APPROVER_NOT_FOUND") {
+            return jsonResponse(response, 404, { ok: false, error: error.code, message: error.message });
+          }
+          throw error;
+        }
+        return jsonResponse(response, 200, { ok: true, revocation });
+      }
+
       if (request.method === "POST" && url.pathname === "/admin/telemetry/enrollments") {
         if (!runtimeStatus.adapters.chromeTelemetry.enabled) {
           return jsonResponse(response, 503, { ok: false, error: "TELEMETRY_DISABLED" });
@@ -491,6 +531,9 @@ export function createHttpServer({
 export async function runNotificationCycle({ service, telemetryAlertsEnabled = false } = {}) {
   if (telemetryAlertsEnabled) {
     await service.processLatestTelemetryDryRunAlerts({ limit: 100 });
+  }
+  if (typeof service.processScheduledLineControls === "function") {
+    await service.processScheduledLineControls({ reportLimit: 100, couponLimit: 20 });
   }
   await service.recoverLineWebhookEvents({ maxEvents: 20 });
   await service.retryPendingAlerts({ limit: 100 });

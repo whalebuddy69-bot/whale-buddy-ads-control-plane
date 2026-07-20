@@ -43,7 +43,7 @@
         "businessCenterId": "TIKTOK_BUSINESS_CENTER_ID",
         "sellerMode": "withoutShop",
         "pageType": "live",
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "maxSnapshotAgeSeconds": 900
       },
       "timezone": "Asia/Bangkok",

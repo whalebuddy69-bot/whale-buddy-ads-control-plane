@@ -123,8 +123,8 @@ function normalizeTelemetry(value, label) {
     throw new Error(`${label}.source must be chrome-ui`);
   }
   const schemaVersion = value.schemaVersion ?? 1;
-  if (schemaVersion !== 1) {
-    throw new Error(`${label}.schemaVersion must be 1`);
+  if (![1, 2].includes(schemaVersion)) {
+    throw new Error(`${label}.schemaVersion must be 1 or 2`);
   }
   const maxSnapshotAgeSeconds = value.maxSnapshotAgeSeconds ?? 900;
   if (
@@ -154,6 +154,80 @@ function normalizeTelemetry(value, label) {
   };
 }
 
+function normalizeLineControl(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object`);
+  }
+  if (!Array.isArray(value.aliases) || value.aliases.length === 0) {
+    throw new Error(`${label}.aliases must contain at least one alias`);
+  }
+  const aliases = [...new Set(value.aliases.map((item) =>
+    requiredString(item, `${label}.aliases`)
+  ))];
+  if (aliases.some((item) => item.length > 80 || /\s/u.test(item))) {
+    throw new Error(`${label}.aliases must be single tokens no longer than 80 characters`);
+  }
+  const minDailyBudget = positiveNumber(
+    value.minDailyBudget ?? 100,
+    `${label}.minDailyBudget`
+  );
+  const minTargetRoi = positiveNumber(
+    value.minTargetRoi ?? 0.1,
+    `${label}.minTargetRoi`,
+    { max: 1000 }
+  );
+  const maxTargetRoi = positiveNumber(
+    value.maxTargetRoi ?? 100,
+    `${label}.maxTargetRoi`,
+    { max: 1000 }
+  );
+  if (maxTargetRoi <= minTargetRoi) {
+    throw new Error(`${label}.maxTargetRoi must be greater than minTargetRoi`);
+  }
+  const minTopUpThresholdPercent = finiteNumber(
+    value.minTopUpThresholdPercent ?? 10,
+    `${label}.minTopUpThresholdPercent`,
+    { min: 1, max: 98 }
+  );
+  const maxTopUpThresholdPercent = finiteNumber(
+    value.maxTopUpThresholdPercent ?? 95,
+    `${label}.maxTopUpThresholdPercent`,
+    { min: 2, max: 99 }
+  );
+  if (maxTopUpThresholdPercent <= minTopUpThresholdPercent) {
+    throw new Error(`${label}.maxTopUpThresholdPercent must be greater than minTopUpThresholdPercent`);
+  }
+  return {
+    enabled: booleanValue(value.enabled ?? true, `${label}.enabled`),
+    aliases,
+    minDailyBudget,
+    minTargetRoi,
+    maxTargetRoi,
+    minTopUpThresholdPercent,
+    maxTopUpThresholdPercent,
+    minReportIntervalHours: finiteNumber(
+      value.minReportIntervalHours ?? 1,
+      `${label}.minReportIntervalHours`,
+      { min: 1, max: 24 }
+    ),
+    maxReportIntervalHours: finiteNumber(
+      value.maxReportIntervalHours ?? 24,
+      `${label}.maxReportIntervalHours`,
+      { min: 1, max: 24 }
+    ),
+    minCouponLeadMinutes: finiteNumber(
+      value.minCouponLeadMinutes ?? 5,
+      `${label}.minCouponLeadMinutes`,
+      { min: 5, max: 180 }
+    ),
+    maxCouponLeadMinutes: finiteNumber(
+      value.maxCouponLeadMinutes ?? 180,
+      `${label}.maxCouponLeadMinutes`,
+      { min: 5, max: 180 }
+    )
+  };
+}
+
 export function validateConfig(input) {
   if (!input || typeof input !== "object" || !Array.isArray(input.clients)) {
     throw new Error("config.clients must be an array");
@@ -176,6 +250,7 @@ export function validateConfig(input) {
   const clientIds = new Set();
   const campaignKeys = new Set();
   const dynamicAdvertiserIds = new Set();
+  const lineControlAliases = new Map();
 
   for (const rawClient of input.clients) {
     const id = requiredString(rawClient.id, "client.id");
@@ -275,6 +350,9 @@ export function validateConfig(input) {
     const budgetPolicy = rawClient.budgetPolicy == null
       ? undefined
       : normalizeBudgetPolicy(rawClient.budgetPolicy, `${id}.budgetPolicy`);
+    const lineControl = rawClient.lineControl == null
+      ? undefined
+      : normalizeLineControl(rawClient.lineControl, `${id}.lineControl`);
 
     if (campaignSelector && !liveWindow) throw new Error(`${id}.liveWindow is required for a dynamic campaign selector`);
     if (campaignSelector && !budgetIncrease) throw new Error(`${id}.budgetIncrease is required for a dynamic campaign selector`);
@@ -298,6 +376,40 @@ export function validateConfig(input) {
     if (liveWindow) client.liveWindow = liveWindow;
     if (budgetIncrease) client.budgetIncrease = budgetIncrease;
     if (budgetPolicy) client.budgetPolicy = budgetPolicy;
+    if (lineControl) {
+      if (!budgetPolicy) throw new Error(`${id}.budgetPolicy is required when lineControl is configured`);
+      if (lineControl.minDailyBudget > budgetPolicy.maxDailyBudget) {
+        throw new Error(`${id}.lineControl.minDailyBudget cannot exceed budgetPolicy.maxDailyBudget`);
+      }
+      if (lineControl.maxReportIntervalHours < lineControl.minReportIntervalHours) {
+        throw new Error(`${id}.lineControl.maxReportIntervalHours must be at least minReportIntervalHours`);
+      }
+      if (lineControl.maxCouponLeadMinutes < lineControl.minCouponLeadMinutes) {
+        throw new Error(`${id}.lineControl.maxCouponLeadMinutes must be at least minCouponLeadMinutes`);
+      }
+      if (lineControl.enabled) {
+        if (telemetry?.source !== "chrome-ui") {
+          throw new Error(`${id}.telemetry.source must be chrome-ui when lineControl.enabled is true`);
+        }
+        if (!campaignSelector) {
+          throw new Error(`${id}.campaignSelector is required when lineControl.enabled is true`);
+        }
+        if (!liveWindow) {
+          throw new Error(`${id}.liveWindow is required when lineControl.enabled is true`);
+        }
+        const names = [id, rawClient.name, ...lineControl.aliases]
+          .map((value) => requiredString(value, `${id}.lineControl.aliases`));
+        for (const alias of names) {
+          const key = alias.toLocaleLowerCase("th-TH");
+          const owner = lineControlAliases.get(key);
+          if (owner && owner !== id) {
+            throw new Error(`duplicate lineControl alias: ${alias}`);
+          }
+          lineControlAliases.set(key, id);
+        }
+      }
+      client.lineControl = lineControl;
+    }
     config.clients.push(client);
   }
 

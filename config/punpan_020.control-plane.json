@@ -22,7 +22,7 @@
         "businessCenterId": "7627179356976201745",
         "sellerMode": "withoutShop",
         "pageType": "live",
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "maxSnapshotAgeSeconds": 900
       },
       "timezone": "Asia/Bangkok",
@@ -45,6 +45,19 @@
         "maxDailyBudget": 6000,
         "effectiveFrom": "2026-07-19",
         "revision": 1
+      },
+      "lineControl": {
+        "enabled": true,
+        "aliases": ["Ppan"],
+        "minDailyBudget": 100,
+        "minTargetRoi": 0.1,
+        "maxTargetRoi": 100,
+        "minTopUpThresholdPercent": 10,
+        "maxTopUpThresholdPercent": 95,
+        "minReportIntervalHours": 1,
+        "maxReportIntervalHours": 24,
+        "minCouponLeadMinutes": 5,
+        "maxCouponLeadMinutes": 180
       }
     }
   ]

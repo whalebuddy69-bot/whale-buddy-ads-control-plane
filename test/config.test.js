@@ -104,6 +104,108 @@ test("dynamic selector config normalizes the LIVE window and budget policy", () 
   assert.equal(Object.hasOwn(client, "campaigns"), false);
 });
 
+test("LINE control policy is bounded and aliases are unambiguous", () => {
+  const lineControl = {
+    enabled: true,
+    aliases: ["Ppan"],
+    minDailyBudget: 100,
+    minTargetRoi: 0.1,
+    maxTargetRoi: 100,
+    minTopUpThresholdPercent: 10,
+    maxTopUpThresholdPercent: 95,
+    minReportIntervalHours: 1,
+    maxReportIntervalHours: 24,
+    minCouponLeadMinutes: 5,
+    maxCouponLeadMinutes: 180
+  };
+  const chromeBinding = {
+    shopBinding: { mode: "observe-and-pin" },
+    telemetry: {
+      source: "chrome-ui",
+      browserProfile: "Whalebuddy Ads",
+      tabGroup: "Ppan",
+      businessCenterId: "7627179356976201745"
+    }
+  };
+  const client = validateConfig(dynamicInput({ lineControl, ...chromeBinding })).clients[0];
+  assert.deepEqual(client.lineControl.aliases, ["Ppan"]);
+  assert.equal(client.lineControl.minDailyBudget, 100);
+
+  assert.throws(() => validateConfig(dynamicInput({
+    lineControl: { ...lineControl, minDailyBudget: 7000 },
+    ...chromeBinding
+  })), /cannot exceed budgetPolicy/);
+  assert.throws(() => validateConfig(dynamicInput({
+    lineControl: { ...lineControl, aliases: ["two words"] },
+    ...chromeBinding
+  })), /single tokens/);
+
+  const second = validDynamicClient({
+    id: "dynamic-client-2",
+    name: "Dynamic Client 2",
+    advertiserId: "dynamic-adv-2",
+    storeId: "dynamic-shop-2",
+    storeAuthorizedBcId: "dynamic-bc-2",
+    lineControl: { ...lineControl, aliases: ["ppan"] },
+    shopBinding: { mode: "observe-and-pin" },
+    telemetry: {
+      ...chromeBinding.telemetry,
+      tabGroup: "Ppan 2"
+    }
+  });
+  assert.throws(() => validateConfig({
+    clients: [validDynamicClient({ lineControl, ...chromeBinding }), second]
+  }), /duplicate lineControl alias/);
+});
+
+test("enabled LINE controls require Chrome telemetry and a dynamic LIVE selector", () => {
+  const lineControl = {
+    enabled: true,
+    aliases: ["Static"],
+    minDailyBudget: 100
+  };
+  const staticClient = validInput().clients[0];
+  staticClient.budgetPolicy = {
+    maxDailyBudget: 50000,
+    effectiveFrom: "2026-07-19",
+    revision: 1
+  };
+  staticClient.lineControl = lineControl;
+
+  assert.throws(
+    () => validateConfig({ clients: [staticClient] }),
+    /telemetry\.source must be chrome-ui when lineControl\.enabled is true/
+  );
+
+  staticClient.shopBinding = { mode: "observe-and-pin" };
+  staticClient.telemetry = {
+    source: "chrome-ui",
+    browserProfile: "Whalebuddy Ads",
+    tabGroup: "Static",
+    businessCenterId: "7627179356976201745"
+  };
+  assert.throws(
+    () => validateConfig({ clients: [staticClient] }),
+    /campaignSelector is required when lineControl\.enabled is true/
+  );
+});
+
+test("disabled LINE controls remain valid for static non-telemetry clients", () => {
+  const staticClient = validInput().clients[0];
+  staticClient.budgetPolicy = {
+    maxDailyBudget: 50000,
+    effectiveFrom: "2026-07-19",
+    revision: 1
+  };
+  staticClient.lineControl = {
+    enabled: false,
+    aliases: ["Static"],
+    minDailyBudget: 100
+  };
+
+  assert.equal(validateConfig({ clients: [staticClient] }).clients[0].lineControl.enabled, false);
+});
+
 test("static campaigns and a dynamic selector are mutually exclusive", () => {
   const input = dynamicInput({
     campaigns: [{ id: "cmp", name: "LIVE", currency: "THB", maxDailyBudget: 6000 }]
@@ -248,8 +350,12 @@ test("chrome telemetry schema is versioned and bounds snapshot freshness", () =>
     tabGroup: "Ppan",
     businessCenterId: "7627179356976201745"
   };
+  assert.equal(validateConfig(dynamicInput({
+    shopBinding: { mode: "observe-and-pin" },
+    telemetry: { ...base, schemaVersion: 2 }
+  })).clients[0].telemetry.schemaVersion, 2);
   for (const [field, value, expected] of [
-    ["schemaVersion", 2, /schemaVersion must be 1/],
+    ["schemaVersion", 3, /schemaVersion must be 1 or 2/],
     ["maxSnapshotAgeSeconds", 59, /between 60 and 3600/],
     ["maxSnapshotAgeSeconds", 3601, /between 60 and 3600/],
     ["maxSnapshotAgeSeconds", 90.5, /between 60 and 3600/]

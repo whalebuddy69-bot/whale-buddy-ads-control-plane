@@ -6,6 +6,7 @@ import {
   MESSAGE_TYPES,
   PILOT_BINDING,
   STORAGE_KEYS,
+  TELEMETRY_SCHEMA_VERSION,
   UI_SCHEMA_FINGERPRINT
 } from "./lib/constants.js";
 import {
@@ -336,6 +337,8 @@ async function readTikTokObservation(credential) {
   }
   const value = response.observation;
   const moneyFields = ["dailyBudgetMinor", "totalBudgetMinor", "costMinor", "netCostMinor"];
+  const nullableMoneyFields = ["grossRevenueMinor", "netRevenueMinor", "gmvMinor"];
+  const nullableRoiFields = ["grossRoiMilli", "netRoiMilli"];
   const observedMilliseconds = Date.parse(value?.observedAt);
   const expectedCampaignName = `${dateInBangkok()} ${PILOT_BINDING.liveWindow.start}:00`;
   const maximumMoneyMinor = 100_000_000_000;
@@ -349,6 +352,20 @@ async function readTikTokObservation(credential) {
       Number.isSafeInteger(value[field]) &&
       value[field] >= 0 &&
       value[field] <= maximumMoneyMinor
+    ) ||
+    !nullableMoneyFields.every((field) =>
+      value[field] === null || (
+        Number.isSafeInteger(value[field]) &&
+        value[field] >= 0 &&
+        value[field] <= maximumMoneyMinor
+      )
+    ) ||
+    !nullableRoiFields.every((field) =>
+      value[field] === null || (
+        Number.isSafeInteger(value[field]) &&
+        value[field] >= 0 &&
+        value[field] <= maximumMoneyMinor
+      )
     ) ||
     value.dailyBudgetMinor <= 0 ||
     value.totalBudgetMinor <= 0 ||
@@ -466,7 +483,7 @@ async function refreshBoundDashboardIfSafe(credential) {
 
 async function buildSnapshot(observation, credential) {
   return {
-    schemaVersion: 1,
+    schemaVersion: TELEMETRY_SCHEMA_VERSION,
     uiSchemaFingerprint: UI_SCHEMA_FINGERPRINT,
     snapshotId: `ts_${crypto.randomUUID()}`,
     clientId: credential.clientId,
@@ -491,6 +508,11 @@ async function buildSnapshot(observation, credential) {
     totalBudgetMinor: observation.totalBudgetMinor,
     costMinor: observation.costMinor,
     netCostMinor: observation.netCostMinor,
+    grossRevenueMinor: observation.grossRevenueMinor,
+    grossRoiMilli: observation.grossRoiMilli,
+    netRevenueMinor: observation.netRevenueMinor,
+    netRoiMilli: observation.netRoiMilli,
+    gmvMinor: observation.gmvMinor,
     observedAt: new Date(observation.observedAt).toISOString(),
     source: {
       browserProfile: credential.browserProfile,

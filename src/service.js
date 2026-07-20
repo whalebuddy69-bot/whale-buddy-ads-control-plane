@@ -12,7 +12,19 @@ import {
 } from "./line.js";
 import { fromMinor, toMinor } from "./money.js";
 import {
+  buildControlConfirmationMessage,
+  buildControlMenuMessage,
+  buildCouponReminderMessage,
+  buildPerformanceReportMessage,
+  buildShortcutListMessage,
+  controlHelpText,
+  newControlRequestId,
+  parseControlCommand,
+  parseControlPostbackData
+} from "./line-controls.js";
+import {
   TELEMETRY_UI_SCHEMA_FINGERPRINT_V1,
+  TELEMETRY_UI_SCHEMA_FINGERPRINT_V2,
   telemetryUiCampaignRef
 } from "./telemetry.js";
 
@@ -52,6 +64,12 @@ function pairingCodeHash(clientId, code) {
   return crypto.createHash("sha256").update(`${clientId}\u0000${code}`).digest("hex");
 }
 
+function controlRequestIdForEvent(eventId) {
+  if (!eventId) return newControlRequestId();
+  const digest = crypto.createHash("sha256").update(String(eventId)).digest("hex").slice(0, 40);
+  return `ca_${digest}`;
+}
+
 function allowsManualTarget(request) {
   if (request?.metadata?.allowManualTarget !== undefined) {
     return request.metadata.allowManualTarget !== false;
@@ -64,6 +82,14 @@ function allowsManualTarget(request) {
 function normalizedLineCommand(event) {
   const userId = event.source?.userId;
   if (!userId) return null;
+  if (event.type === "postback" && parseControlPostbackData(event.postback?.data)) {
+    return {
+      kind: "control_postback",
+      userId,
+      data: event.postback.data,
+      sourceType: event.source?.type ?? null
+    };
+  }
   if (event.type === "postback" && parsePostbackData(event.postback?.data)) {
     return { kind: "postback", userId, data: event.postback.data };
   }
@@ -80,6 +106,15 @@ function normalizedLineCommand(event) {
     }
     if (parseBudgetText(event.message.text)) {
       return { kind: "budget_text", userId, text: event.message.text };
+    }
+    const control = parseControlCommand(event.message.text);
+    if (control) {
+      return {
+        kind: "control_command",
+        userId,
+        command: control,
+        sourceType: event.source?.type ?? null
+      };
     }
   }
   return null;
@@ -114,6 +149,33 @@ function zonedDateTimeParts(date, timeZone) {
 function localDateFor(date, timeZone) {
   const parts = zonedDateTimeParts(date, timeZone);
   return `${parts.year}-${parts.month}-${parts.day}`;
+}
+
+function renderCampaignNameTemplate(template, date, client) {
+  const localDate = localDateFor(date, client.timezone);
+  return String(template)
+    .replaceAll("{date}", localDate)
+    .replaceAll("{start}", client.liveWindow?.start ?? "00:00")
+    .slice(0, 120);
+}
+
+function localBangkokDateTime(localDate, localTime, timezone) {
+  if (timezone !== "Asia/Bangkok") {
+    throw new DomainError(
+      "UNSUPPORTED_TIMEZONE",
+      "Coupon scheduling currently supports Asia/Bangkok only"
+    );
+  }
+  const parsed = new Date(`${localDate}T${localTime}:00+07:00`);
+  if (Number.isNaN(parsed.getTime())) {
+    throw new DomainError("INVALID_SCHEDULE", "Coupon date or time is invalid");
+  }
+  const roundTrip = zonedDateTimeParts(parsed, timezone);
+  if (`${roundTrip.year}-${roundTrip.month}-${roundTrip.day}` !== localDate
+      || `${roundTrip.hour}:${roundTrip.minute}` !== localTime) {
+    throw new DomainError("INVALID_SCHEDULE", "Coupon date or time is invalid");
+  }
+  return parsed;
 }
 
 function timeMinutes(value) {
@@ -254,6 +316,211 @@ export class BudgetGuardService {
 
   #isCurrentApprover(client, userId) {
     return this.#approversForClient(client).includes(userId);
+  }
+
+  #lineControlClient(alias, userId) {
+    const key = String(alias ?? "").toLocaleLowerCase("th-TH");
+    const matches = this.config.clients.filter((client) => {
+      if (client.lineControl?.enabled !== true) return false;
+      const names = [client.id, client.name, ...(client.lineControl.aliases ?? [])];
+      return names.some((name) => String(name).toLocaleLowerCase("th-TH") === key);
+    });
+    if (matches.length !== 1) {
+      throw new DomainError(
+        matches.length === 0 ? "CLIENT_NOT_FOUND" : "CLIENT_ALIAS_AMBIGUOUS",
+        matches.length === 0
+          ? "ไม่พบลูกค้าจากชื่อที่ระบุ กรุณาใช้ชื่อจากเมนู"
+          : "ชื่อลูกค้านี้ตรงมากกว่าหนึ่งบัญชี กรุณาใช้ Client ID"
+      );
+    }
+    const [client] = matches;
+    if (!this.#isCurrentApprover(client, userId)) {
+      throw new DomainError("LINE_NOT_AUTHORIZED", "LINE นี้ไม่มีสิทธิ์ควบคุมบัญชีลูกค้านี้");
+    }
+    return client;
+  }
+
+  #latestControlSnapshot(client) {
+    const snapshot = this.store.getLatestTelemetry({ clientId: client.id });
+    if (!snapshot) return { snapshot: null, stale: true };
+    const age = this.now().getTime() - Date.parse(snapshot.observedAt);
+    const activeCredential = typeof this.store.isTelemetrySnapshotCredentialActive !== "function"
+      || this.store.isTelemetrySnapshotCredentialActive(snapshot.snapshotId) !== false;
+    return {
+      snapshot,
+      stale: !activeCredential
+        || !Number.isFinite(age)
+        || age < -60_000
+        || age > client.telemetry.maxSnapshotAgeSeconds * 1000
+    };
+  }
+
+  #validateControlBudget(client, amount) {
+    const minimum = client.lineControl.minDailyBudget;
+    const maximum = client.budgetPolicy.maxDailyBudget;
+    if (!Number.isFinite(amount) || amount < minimum || amount > maximum) {
+      throw new DomainError(
+        "BUDGET_OUT_OF_POLICY",
+        `งบต้องอยู่ระหว่าง ${minimum} และ ${maximum} THB`
+      );
+    }
+    return toMinor(amount, client.campaignSelector.currency);
+  }
+
+  #validateControlRoi(client, value) {
+    if (
+      !Number.isFinite(value)
+      || value < client.lineControl.minTargetRoi
+      || value > client.lineControl.maxTargetRoi
+    ) {
+      throw new DomainError(
+        "ROI_OUT_OF_POLICY",
+        `Target ROI ต้องอยู่ระหว่าง ${client.lineControl.minTargetRoi} และ ${client.lineControl.maxTargetRoi}`
+      );
+    }
+    return Math.round(value * 1000);
+  }
+
+  #validateTopUpThreshold(client, percent) {
+    if (
+      !Number.isFinite(percent)
+      || percent < client.lineControl.minTopUpThresholdPercent
+      || percent > client.lineControl.maxTopUpThresholdPercent
+    ) {
+      throw new DomainError(
+        "THRESHOLD_OUT_OF_POLICY",
+        `เปอร์เซ็นต์เติมงบต้องอยู่ระหว่าง ${client.lineControl.minTopUpThresholdPercent}% และ ${client.lineControl.maxTopUpThresholdPercent}%`
+      );
+    }
+    return Math.round(percent * 100);
+  }
+
+  #validateCampaignNameTemplate(client, template) {
+    const normalized = String(template ?? "").normalize("NFKC").trim();
+    if (
+      client.telemetry?.source === "chrome-ui"
+      && normalized !== "{date} {start}:00"
+    ) {
+      throw new DomainError(
+        "CAMPAIGN_NAME_TEMPLATE_UNSUPPORTED",
+        "ช่วงที่ใช้ Chrome reader ชื่อแคมเปญต้องเป็น {date} {start}:00 ก่อน หลังเชื่อม API จึงจะเปิดใช้ชื่ออิสระได้"
+      );
+    }
+    return normalized;
+  }
+
+  #createControlRequest({ client, userId, action, desired, before = null, source = "LINE", requestId = null }) {
+    const now = this.now();
+    const id = requestId ?? newControlRequestId();
+    const existing = this.store.getCampaignControlRequest(id);
+    if (existing) {
+      if (existing.clientId !== client.id || existing.action !== action) {
+        throw new DomainError("CONTROL_REQUEST_CONFLICT", "Webhook identifier was reused for another command");
+      }
+      return existing;
+    }
+    return this.store.createCampaignControlRequest({
+      id,
+      clientId: client.id,
+      action,
+      requestedByLineUserId: userId,
+      createdAt: now,
+      expiresAt: new Date(now.getTime() + this.config.requestTtlMinutes * 60_000),
+      data: {
+        clientName: client.name,
+        advertiserId: client.advertiserId,
+        tiktokAccountId: client.campaignSelector.expectedTikTokAccountId,
+        currency: client.campaignSelector.currency,
+        source,
+        // Keep every new campaign-control action fail-closed until its official
+        // TikTok executor and read-back reconciliation are implemented.
+        dryRun: true,
+        before,
+        desired
+      }
+    });
+  }
+
+  #beforeFromSnapshot(snapshot, stale = false) {
+    if (!snapshot) return null;
+    return {
+      campaignName: snapshot.campaignName,
+      campaignRef: snapshot.campaignRef,
+      campaignStatus: snapshot.campaignStatus,
+      dailyBudgetMinor: snapshot.dailyBudgetMinor,
+      observedAt: snapshot.observedAt,
+      stale
+    };
+  }
+
+  #requestForControlCommand(client, userId, command, requestId = null) {
+    const { snapshot, stale } = this.#latestControlSnapshot(client);
+    const before = this.#beforeFromSnapshot(snapshot, stale);
+    if (command.action === "CREATE_FROM_SHORTCUT") {
+      const shortcut = this.store.getCampaignShortcut({
+        clientId: client.id,
+        shortcutName: command.shortcutName
+      });
+      if (!shortcut) throw new DomainError("SHORTCUT_NOT_FOUND", "ไม่พบ Shortcut ที่ระบุ");
+      const campaignNameTemplate = this.#validateCampaignNameTemplate(
+        client,
+        shortcut.campaignNameTemplate
+      );
+      const desired = {
+        shortcutName: shortcut.shortcutName,
+        shortcutRevision: shortcut.revision,
+        campaignName: renderCampaignNameTemplate(campaignNameTemplate, this.now(), client),
+        campaignNameTemplate,
+        dailyBudgetMinor: shortcut.dailyBudgetMinor,
+        targetRoiMilli: shortcut.targetRoiMilli,
+        topUpThresholdBps: shortcut.topUpThresholdBps,
+        scheduleStart: client.liveWindow.start,
+        scheduleEnd: client.liveWindow.end
+      };
+      return this.#createControlRequest({
+        client,
+        userId,
+        action: "CREATE_FROM_SHORTCUT",
+        desired,
+        before,
+        source: "LINE_SHORTCUT",
+        requestId
+      });
+    }
+    if (command.action === "UPDATE_BUDGET") {
+      if (!snapshot) throw new DomainError("TELEMETRY_UNAVAILABLE", "ยังไม่มีข้อมูลแคมเปญจาก Chrome reader");
+      return this.#createControlRequest({
+        client,
+        userId,
+        action: command.action,
+        before,
+        desired: { dailyBudgetMinor: this.#validateControlBudget(client, command.amount) },
+        requestId
+      });
+    }
+    if (command.action === "UPDATE_ROI") {
+      if (!snapshot) throw new DomainError("TELEMETRY_UNAVAILABLE", "ยังไม่มีข้อมูลแคมเปญจาก Chrome reader");
+      return this.#createControlRequest({
+        client,
+        userId,
+        action: command.action,
+        before,
+        desired: { targetRoiMilli: this.#validateControlRoi(client, command.targetRoi) },
+        requestId
+      });
+    }
+    if (new Set(["PAUSE", "RESUME"]).has(command.action)) {
+      if (!snapshot) throw new DomainError("TELEMETRY_UNAVAILABLE", "ยังไม่มีข้อมูลแคมเปญจาก Chrome reader");
+      return this.#createControlRequest({
+        client,
+        userId,
+        action: command.action,
+        before,
+        desired: { campaignStatus: command.action === "PAUSE" ? "DISABLE" : "ENABLE" },
+        requestId
+      });
+    }
+    throw new DomainError("CONTROL_ACTION_UNSUPPORTED", "คำสั่งนี้ยังไม่รองรับ");
   }
 
   createLinePairing({ clientId, ttlMinutes = 10 } = {}) {
@@ -765,10 +1032,12 @@ export class BudgetGuardService {
     if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
       return skip("SKIP_INVALID_SNAPSHOT");
     }
-    if (
-      snapshot.schemaVersion !== 1
-      || snapshot.uiSchemaFingerprint !== TELEMETRY_UI_SCHEMA_FINGERPRINT_V1
-    ) {
+    const expectedTelemetryFingerprint = snapshot.schemaVersion === 1
+      ? TELEMETRY_UI_SCHEMA_FINGERPRINT_V1
+      : snapshot.schemaVersion === 2
+        ? TELEMETRY_UI_SCHEMA_FINGERPRINT_V2
+        : null;
+    if (!expectedTelemetryFingerprint || snapshot.uiSchemaFingerprint !== expectedTelemetryFingerprint) {
       return skip("SKIP_TELEMETRY_SCHEMA_MISMATCH");
     }
     if (
@@ -1190,6 +1459,27 @@ export class BudgetGuardService {
     }
   }
 
+  async #replyControlDurably(replyToken, message) {
+    if (!replyToken) return;
+    try {
+      await this.line.reply(replyToken, message);
+    } catch (error) {
+      this.store.appendAuditEvent({
+        eventType: "LINE_CONTROL_REPLY_FAILED",
+        actorType: "SYSTEM",
+        occurredAt: this.now(),
+        details: { error: String(error?.message ?? error).slice(0, 500) }
+      });
+      // A failed reply must leave the webhook recoverable. The durable webhook
+      // worker will rebuild the response and push it with an idempotency key.
+      throw new DomainError(
+        "LINE_CONTROL_REPLY_FAILED",
+        "LINE control response could not be delivered",
+        { cause: String(error?.message ?? error).slice(0, 500) }
+      );
+    }
+  }
+
   async #handlePairingCommand({ clientId, codeHash, userId, sourceType, replyToken }) {
     if (sourceType !== "user") {
       await this.#replySafely(replyToken, { type: "text", text: "กรุณาจับคู่ผู้อนุมัติในแชตส่วนตัวกับ LINE OA เท่านั้น" });
@@ -1222,6 +1512,257 @@ export class BudgetGuardService {
         text: "จับคู่ไม่สำเร็จ รหัสอาจไม่ถูกต้อง หมดอายุ หรือถูกแทนที่แล้ว กรุณาขอรหัสใหม่"
       });
       return { paired: false, reason: error?.code ?? "PAIRING_FAILED" };
+    }
+  }
+
+  async #handleControlCommand(event, userId, parsedCommand = null, eventId = null) {
+    const command = parsedCommand ?? parseControlCommand(event.message?.text);
+    if (!command) return false;
+    if (event.source?.type && event.source.type !== "user") {
+      await this.#replyControlDurably(event.replyToken, {
+        type: "text",
+        text: "กรุณาใช้คำสั่งควบคุมโฆษณาในแชตส่วนตัวกับ LINE OA เท่านั้น"
+      });
+      return true;
+    }
+    try {
+      const client = this.#lineControlClient(command.clientAlias, userId);
+      if (command.kind === "menu") {
+        await this.#replyControlDurably(event.replyToken, buildControlMenuMessage(client));
+        return true;
+      }
+      if (command.kind === "help") {
+        await this.#replyControlDurably(event.replyToken, { type: "text", text: controlHelpText(client) });
+        return true;
+      }
+      if (command.kind === "status") {
+        const { snapshot, stale } = this.#latestControlSnapshot(client);
+        await this.#replyControlDurably(event.replyToken, buildPerformanceReportMessage({
+          client,
+          snapshot,
+          stale,
+          now: this.now()
+        }));
+        return true;
+      }
+      if (command.kind === "report_subscribe") {
+        if (
+          command.intervalHours < client.lineControl.minReportIntervalHours
+          || command.intervalHours > client.lineControl.maxReportIntervalHours
+        ) {
+          throw new DomainError(
+            "REPORT_INTERVAL_OUT_OF_POLICY",
+            `ตั้งรายงานได้ทุก ${client.lineControl.minReportIntervalHours}–${client.lineControl.maxReportIntervalHours} ชั่วโมง`
+          );
+        }
+        const subscription = this.store.setReportSubscription({
+          clientId: client.id,
+          lineUserId: userId,
+          intervalMinutes: command.intervalHours * 60,
+          enabled: true,
+          now: this.now()
+        });
+        const { snapshot, stale } = this.#latestControlSnapshot(client);
+        await this.#replyControlDurably(event.replyToken, [
+          {
+            type: "text",
+            text: `✅ ตั้งรายงาน ${client.name} ทุก ${command.intervalHours} ชั่วโมงแล้ว\nรอบถัดไป: ${new Date(subscription.nextDueAt).toLocaleString("th-TH", { timeZone: client.timezone, hour: "2-digit", minute: "2-digit" })}`
+          },
+          buildPerformanceReportMessage({ client, snapshot, stale, now: this.now() })
+        ]);
+        return true;
+      }
+      if (command.kind === "report_unsubscribe") {
+        const disabled = this.store.disableReportSubscription({
+          clientId: client.id,
+          lineUserId: userId,
+          now: this.now()
+        });
+        await this.#replyControlDurably(event.replyToken, {
+          type: "text",
+          text: disabled
+            ? `หยุดรายงานตามเวลาของ ${client.name} แล้ว`
+            : `${client.name} ยังไม่ได้เปิดรายงานตามเวลา`
+        });
+        return true;
+      }
+      if (command.kind === "shortcut_list") {
+        await this.#replyControlDurably(event.replyToken, buildShortcutListMessage({
+          client,
+          shortcuts: this.store.listCampaignShortcuts({ clientId: client.id })
+        }));
+        return true;
+      }
+      if (command.kind === "shortcut_upsert") {
+        const saved = this.store.saveCampaignShortcut({
+          clientId: client.id,
+          shortcutName: command.shortcutName,
+          campaignNameTemplate: this.#validateCampaignNameTemplate(
+            client,
+            command.campaignNameTemplate
+          ),
+          dailyBudgetMinor: this.#validateControlBudget(client, command.dailyBudget),
+          targetRoiMilli: this.#validateControlRoi(client, command.targetRoi),
+          topUpThresholdBps: this.#validateTopUpThreshold(client, command.topUpThresholdPercent),
+          lineUserId: userId,
+          createdAt: this.now()
+        });
+        await this.#replyControlDurably(event.replyToken, [
+          { type: "text", text: `✅ บันทึก Shortcut ${saved.shortcutName} revision ${saved.revision} แล้ว` },
+          buildShortcutListMessage({ client, shortcuts: [saved] })
+        ]);
+        return true;
+      }
+      if (command.kind === "action") {
+        const request = this.#requestForControlCommand(
+          client,
+          userId,
+          command,
+          controlRequestIdForEvent(eventId)
+        );
+        await this.#replyControlDurably(event.replyToken, buildControlConfirmationMessage(request));
+        return true;
+      }
+      if (command.kind === "coupon_schedule") {
+        if (
+          command.leadMinutes < client.lineControl.minCouponLeadMinutes
+          || command.leadMinutes > client.lineControl.maxCouponLeadMinutes
+        ) {
+          throw new DomainError(
+            "COUPON_LEAD_OUT_OF_POLICY",
+            `ตั้งเตือนล่วงหน้าได้ ${client.lineControl.minCouponLeadMinutes}–${client.lineControl.maxCouponLeadMinutes} นาที`
+          );
+        }
+        const eventAt = localBangkokDateTime(
+          command.localDate,
+          command.localTime,
+          client.timezone
+        );
+        const notifyAt = new Date(eventAt.getTime() - command.leadMinutes * 60_000);
+        if (notifyAt.getTime() <= this.now().getTime()) {
+          throw new DomainError("COUPON_SCHEDULE_IN_PAST", "เวลาแจ้งเตือนคูปองต้องอยู่ในอนาคต");
+        }
+        const { snapshot, stale } = this.#latestControlSnapshot(client);
+        const request = this.#createControlRequest({
+          client,
+          userId,
+          action: "SCHEDULE_COUPON_BOOST",
+          source: "LINE_COUPON_SCHEDULE",
+          before: this.#beforeFromSnapshot(snapshot, stale),
+          desired: {
+            eventAt: eventAt.toISOString(),
+            notifyAt: notifyAt.toISOString(),
+            leadMinutes: command.leadMinutes,
+            dailyBudgetMinor: this.#validateControlBudget(client, command.amount)
+          },
+          requestId: controlRequestIdForEvent(eventId)
+        });
+        await this.#replyControlDurably(event.replyToken, buildControlConfirmationMessage(request));
+        return true;
+      }
+      if (command.kind === "coupon_cancel") {
+        const count = this.store.cancelPendingCouponSchedules({
+          clientId: client.id,
+          lineUserId: userId,
+          now: this.now()
+        });
+        await this.#replyControlDurably(event.replyToken, {
+          type: "text",
+          text: count > 0
+            ? `ยกเลิกการแจ้งเตือนคูปองของ ${client.name} ${count} รายการแล้ว`
+            : `ไม่พบการแจ้งเตือนคูปองที่รอยกเลิกของ ${client.name}`
+        });
+        return true;
+      }
+      return false;
+    } catch (error) {
+      if (error?.code === "LINE_CONTROL_REPLY_FAILED") throw error;
+      const safe = safeError(error);
+      await this.#replyControlDurably(event.replyToken, {
+        type: "text",
+        text: `คำสั่งยังทำไม่ได้: ${safe.message}`
+      });
+      return true;
+    }
+  }
+
+  async #handleControlPostback(event, userId) {
+    const parsed = parseControlPostbackData(event.postback?.data);
+    if (!parsed) return false;
+    if (event.source?.type && event.source.type !== "user") {
+      await this.#replyControlDurably(event.replyToken, {
+        type: "text",
+        text: "กรุณายืนยันคำสั่งในแชตส่วนตัวกับ LINE OA เท่านั้น"
+      });
+      return true;
+    }
+    const request = this.store.getCampaignControlRequest(parsed.requestId);
+    if (!request) {
+      await this.#replyControlDurably(event.replyToken, { type: "text", text: "ไม่พบคำสั่งนี้ หรือคำสั่งถูกลบไปแล้ว" });
+      return true;
+    }
+    const client = this.#clientById(request.clientId);
+    if (!client || !this.#isCurrentApprover(client, userId)) {
+      await this.#replyControlDurably(event.replyToken, { type: "text", text: "คุณไม่มีสิทธิ์ยืนยันคำสั่งของบัญชีนี้" });
+      return true;
+    }
+    try {
+      const outcome = parsed.action === "confirm" ? "confirm" : "reject";
+      const couponResolution = request.action === "SCHEDULE_COUPON_BOOST"
+        ? this.store.transitionCouponBoostControlRequest({
+            id: request.id,
+            version: parsed.version,
+            lineUserId: userId,
+            outcome,
+            now: this.now()
+          })
+        : null;
+      const updated = couponResolution?.request ?? this.store.transitionCampaignControlRequest({
+        id: request.id,
+        version: parsed.version,
+        lineUserId: userId,
+        outcome,
+        now: this.now()
+      });
+      if (updated.state === "EXPIRED") {
+        await this.#replyControlDurably(event.replyToken, { type: "text", text: "คำสั่งนี้หมดอายุแล้ว ไม่มีการเปลี่ยนแปลง TikTok" });
+        return true;
+      }
+      if (updated.state === "CANCELLED") {
+        await this.#replyControlDurably(event.replyToken, { type: "text", text: "ยกเลิกคำสั่งแล้ว" });
+        return true;
+      }
+      if (updated.action === "SCHEDULE_COUPON_BOOST") {
+        const schedule = couponResolution?.schedule;
+        if (!schedule) {
+          throw new DomainError(
+            "COUPON_SCHEDULE_MISSING",
+            "Coupon confirmation did not create a durable schedule"
+          );
+        }
+        await this.#replyControlDurably(event.replyToken, {
+          type: "text",
+          text: [
+            "✅ บันทึก Coupon Boost แล้ว",
+            `ระบบจะเตือนเวลา ${new Date(schedule.notifyAt).toLocaleString("th-TH", { timeZone: client.timezone, day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}`,
+            "ระหว่างรอ API ระบบจะส่งคำขอทดสอบและไม่เปลี่ยนงบ TikTok จริง"
+          ].join("\n")
+        });
+        return true;
+      }
+      await this.#replyControlDurably(event.replyToken, {
+        type: "text",
+        text: "🧪 ยืนยันการทดสอบแล้ว — ระบบบันทึก Audit แต่ยังไม่มีการเปลี่ยนแปลงบน TikTok"
+      });
+      return true;
+    } catch (error) {
+      if (error?.code === "LINE_CONTROL_REPLY_FAILED") throw error;
+      const safe = safeError(error);
+      await this.#replyControlDurably(event.replyToken, {
+        type: "text",
+        text: `คำสั่งนี้ใช้ไม่ได้แล้ว: ${safe.message}`
+      });
+      return true;
     }
   }
 
@@ -1325,7 +1866,7 @@ export class BudgetGuardService {
     return this.#replySafely(event.replyToken, { type: "text", text: `คำสั่งนี้ใช้ไม่ได้ในสถานะปัจจุบัน (${request.state})` }, request.id);
   }
 
-  async #handleText(event, userId) {
+  async #handleText(event, userId, eventId = null) {
     const pairing = parsePairingText(event.message?.text);
     if (pairing) {
       return this.#handlePairingCommand({
@@ -1337,7 +1878,7 @@ export class BudgetGuardService {
       });
     }
     const parsed = parseBudgetText(event.message?.text);
-    if (!parsed) return;
+    if (!parsed) return this.#handleControlCommand(event, userId, null, eventId);
     const candidates = this.store.listBudgetRequests({ state: RequestState.PENDING_INPUT, limit: 1000 });
     const matches = candidates.filter((item) => {
       try {
@@ -1405,8 +1946,11 @@ export class BudgetGuardService {
           results.push({ eventId, status: "IGNORED_NO_USER" });
           continue;
         }
-        if (event.type === "postback") await this.#handlePostback(event, userId);
-        if (event.type === "message" && event.message?.type === "text") await this.#handleText(event, userId);
+        if (event.type === "postback") {
+          const handledControl = await this.#handleControlPostback(event, userId);
+          if (!handledControl) await this.#handlePostback(event, userId);
+        }
+        if (event.type === "message" && event.message?.type === "text") await this.#handleText(event, userId, eventId);
         this.store.markWebhookEvent({ provider: "LINE", eventId, leaseToken, status: "PROCESSED", processedAt: this.now() });
         results.push({ eventId, status: "PROCESSED" });
       } catch (error) {
@@ -1425,10 +1969,134 @@ export class BudgetGuardService {
     return results;
   }
 
+  #controlCommandAlreadyApplied(command, eventId) {
+    const control = command.command;
+    const client = this.#lineControlClient(control.clientAlias, command.userId);
+    if (new Set(["menu", "help", "status", "shortcut_list"]).has(control.kind)) return true;
+    if (new Set(["action", "coupon_schedule"]).has(control.kind)) {
+      return Boolean(this.store.getCampaignControlRequest(controlRequestIdForEvent(eventId)));
+    }
+    if (control.kind === "report_subscribe") {
+      const subscription = this.store.getReportSubscription({
+        clientId: client.id,
+        lineUserId: command.userId
+      });
+      return subscription?.enabled === true
+        && subscription.intervalMinutes === control.intervalHours * 60;
+    }
+    if (control.kind === "report_unsubscribe") {
+      const subscription = this.store.getReportSubscription({
+        clientId: client.id,
+        lineUserId: command.userId
+      });
+      return !subscription?.enabled;
+    }
+    if (control.kind === "shortcut_upsert") {
+      const shortcut = this.store.getCampaignShortcut({
+        clientId: client.id,
+        shortcutName: control.shortcutName
+      });
+      if (!shortcut) return false;
+      return shortcut.campaignNameTemplate === this.#validateCampaignNameTemplate(
+        client,
+        control.campaignNameTemplate
+      )
+        && shortcut.dailyBudgetMinor === this.#validateControlBudget(client, control.dailyBudget)
+        && shortcut.targetRoiMilli === this.#validateControlRoi(client, control.targetRoi)
+        && shortcut.topUpThresholdBps === this.#validateTopUpThreshold(
+          client,
+          control.topUpThresholdPercent
+        );
+    }
+    // Cancelling pending coupon schedules is itself idempotent.
+    if (control.kind === "coupon_cancel") return false;
+    return true;
+  }
+
   async #sendRecoveredLineResponse(command, eventId) {
     let message = null;
     let requestId = null;
-    if (command.kind === "postback") {
+    let controlRequestId = null;
+    if (command.kind === "control_postback") {
+      if (command.sourceType && command.sourceType !== "user") return null;
+      const parsed = parseControlPostbackData(command.data);
+      controlRequestId = parsed?.requestId ?? null;
+      const request = controlRequestId
+        ? this.store.getCampaignControlRequest(controlRequestId)
+        : null;
+      if (request) {
+        const client = this.#clientById(request.clientId);
+        if (!client || !this.#isCurrentApprover(client, command.userId)) return null;
+        const couponSchedule = request.action === "SCHEDULE_COUPON_BOOST"
+          ? this.store.getCouponScheduleByControlRequestId(request.id)
+          : null;
+        message = {
+          type: "text",
+          text: couponSchedule && request.state === "CONFIRMED_DRY_RUN"
+            ? "✅ ระบบกู้คำยืนยันแล้ว: บันทึก Coupon Boost แบบทดสอบเรียบร้อย"
+            : request.state === "CONFIRMED_DRY_RUN"
+              ? "🧪 ระบบกู้คำยืนยันแล้ว — ไม่มีการเปลี่ยนแปลง TikTok ในโหมดทดสอบ"
+            : request.state === "CANCELLED"
+              ? "ระบบกู้คำสั่งแล้ว: ยกเลิกคำสั่งเรียบร้อย"
+              : `ระบบกู้คำสั่งแล้ว แต่คำสั่งอยู่ในสถานะ ${request.state}`
+        };
+      } else {
+        message = { type: "text", text: "ไม่พบคำสั่งที่ต้องกู้คืน กรุณาส่งคำสั่งใหม่อีกครั้ง" };
+      }
+    } else if (command.kind === "control_command") {
+      if (command.sourceType && command.sourceType !== "user") return null;
+      const control = command.command;
+      let client;
+      try {
+        client = this.#lineControlClient(control.clientAlias, command.userId);
+      } catch (error) {
+        if (error?.code === "LINE_NOT_AUTHORIZED") return null;
+        throw error;
+      }
+      if (control.kind === "menu") {
+        message = buildControlMenuMessage(client);
+      } else if (control.kind === "help") {
+        message = { type: "text", text: controlHelpText(client) };
+      } else if (control.kind === "status") {
+        const { snapshot, stale } = this.#latestControlSnapshot(client);
+        message = buildPerformanceReportMessage({ client, snapshot, stale, now: this.now() });
+      } else if (new Set(["shortcut_list", "shortcut_upsert"]).has(control.kind)) {
+        message = buildShortcutListMessage({
+          client,
+          shortcuts: this.store.listCampaignShortcuts({ clientId: client.id })
+        });
+      } else if (control.kind === "report_subscribe") {
+        const subscription = this.store.getReportSubscription({
+          clientId: client.id,
+          lineUserId: command.userId
+        });
+        message = {
+          type: "text",
+          text: subscription?.enabled
+            ? `✅ กู้คำสั่งแล้ว: รายงาน ${client.name} ทุก ${subscription.intervalMinutes / 60} ชั่วโมงเปิดอยู่`
+            : `ตั้งรายงาน ${client.name} ไม่สำเร็จ กรุณาส่งคำสั่งใหม่`
+        };
+      } else if (control.kind === "report_unsubscribe") {
+        const subscription = this.store.getReportSubscription({
+          clientId: client.id,
+          lineUserId: command.userId
+        });
+        message = {
+          type: "text",
+          text: !subscription?.enabled
+            ? `กู้คำสั่งแล้ว: รายงานตามเวลาของ ${client.name} ถูกหยุดแล้ว`
+            : `หยุดรายงาน ${client.name} ไม่สำเร็จ กรุณาส่งคำสั่งใหม่`
+        };
+      } else if (new Set(["action", "coupon_schedule"]).has(control.kind)) {
+        controlRequestId = controlRequestIdForEvent(eventId);
+        const request = this.store.getCampaignControlRequest(controlRequestId);
+        message = request
+          ? buildControlConfirmationMessage(request)
+          : { type: "text", text: `คำสั่ง ${client.name} ไม่ได้ถูกบันทึก กรุณาส่งคำสั่งใหม่` };
+      } else {
+        message = { type: "text", text: `ระบบกู้คำสั่ง ${client.name} แล้ว กรุณาตรวจสถานะจากเมนู` };
+      }
+    } else if (command.kind === "postback") {
       const parsed = parsePostbackData(command.data);
       requestId = parsed?.requestId ?? null;
       const request = requestId ? this.store.getBudgetRequest(requestId) : null;
@@ -1478,7 +2146,7 @@ export class BudgetGuardService {
       eventType: "LINE_WEBHOOK_RECOVERY_RESPONSE_SENT",
       actorType: "SYSTEM",
       occurredAt: this.now(),
-      details: { eventId, retryKey }
+      details: { eventId, retryKey, controlRequestId }
     });
     return requestId;
   }
@@ -1502,12 +2170,49 @@ export class BudgetGuardService {
       const command = event.payload.command;
       let requestId = null;
       try {
-        if (command?.kind === "postback") {
+        const replyOnlyRecovery = claim.priorStatus === "FAILED"
+          && claim.priorErrorCode === "LINE_CONTROL_REPLY_FAILED";
+        if (command?.kind === "control_postback") {
+          const parsed = parseControlPostbackData(command.data);
+          const controlRequest = parsed?.requestId
+            ? this.store.getCampaignControlRequest(parsed.requestId)
+            : null;
+          if (!replyOnlyRecovery && controlRequest?.state === "PENDING_CONFIRMATION") {
+            await this.#handleControlPostback(
+              {
+                type: "postback",
+                source: { userId: command.userId, type: command.sourceType },
+                postback: { data: command.data }
+              },
+              command.userId
+            );
+          }
+        } else if (command?.kind === "control_command") {
+          if (
+            !replyOnlyRecovery
+            && !this.#controlCommandAlreadyApplied(command, event.eventId)
+          ) {
+            await this.#handleControlCommand(
+              {
+                type: "message",
+                source: { userId: command.userId, type: command.sourceType },
+                message: { type: "text", text: "" }
+              },
+              command.userId,
+              command.command,
+              event.eventId
+            );
+          }
+        } else if (command?.kind === "postback") {
           const parsed = parsePostbackData(command.data);
           requestId = parsed?.requestId ?? null;
           await this.#handlePostback({ type: "postback", source: { userId: command.userId }, postback: { data: command.data } }, command.userId);
         } else if (command?.kind === "budget_text") {
-          await this.#handleText({ type: "message", source: { userId: command.userId }, message: { type: "text", text: command.text } }, command.userId);
+          await this.#handleText(
+            { type: "message", source: { userId: command.userId }, message: { type: "text", text: command.text } },
+            command.userId,
+            event.eventId
+          );
         } else if (command?.kind === "pairing") {
           await this.#handlePairingCommand({
             clientId: command.clientId,
@@ -1539,6 +2244,148 @@ export class BudgetGuardService {
           processedAt: this.now()
         });
         outcomes.push({ eventId: event.eventId, status: "FAILED", error: safe });
+      }
+    }
+    return outcomes;
+  }
+
+  async processScheduledLineControls({ reportLimit = 100, couponLimit = 20 } = {}) {
+    const outcomes = [];
+    // Coupon boosts are time-critical, so they are always claimed before
+    // periodic reports. Each item gets a fresh clock rather than inheriting a
+    // stale cycle timestamp after slow LINE requests.
+    for (const schedule of this.store.claimDueCouponSchedules({
+      now: this.now(),
+      limit: couponLimit
+    })) {
+      const client = this.#clientById(schedule.clientId);
+      try {
+        const itemNow = this.now();
+        if (!client || !this.#isCurrentApprover(client, schedule.lineUserId)) {
+          throw new DomainError("LINE_NOT_AUTHORIZED", "Coupon schedule approver is no longer authorized");
+        }
+        if (itemNow.getTime() > Date.parse(schedule.eventAt) + 15 * 60_000) {
+          throw new DomainError("COUPON_SCHEDULE_EXPIRED", "Coupon reminder is more than 15 minutes late");
+        }
+        this.#validateControlBudget(client, schedule.budgetMinor / 100);
+        const { snapshot, stale } = this.#latestControlSnapshot(client);
+        const requestId = controlRequestIdForEvent(`coupon:${schedule.id}`);
+        const request = this.#createControlRequest({
+          client,
+          userId: schedule.lineUserId,
+          action: "UPDATE_BUDGET",
+          source: "COUPON_REMINDER",
+          requestId,
+          before: this.#beforeFromSnapshot(snapshot, stale),
+          desired: {
+            dailyBudgetMinor: schedule.budgetMinor,
+            couponScheduleId: schedule.id,
+            eventAt: schedule.eventAt
+          }
+        });
+        const retryKey = stableRetryKey("coupon-reminder", schedule.id, schedule.lineUserId);
+        await this.line.push(
+          schedule.lineUserId,
+          buildCouponReminderMessage({
+            clientName: client.name,
+            eventAt: schedule.eventAt,
+            budgetMinor: schedule.budgetMinor,
+            request
+          }),
+          retryKey
+        );
+        this.store.finishCouponSchedule({ id: schedule.id, ok: true, now: this.now() });
+        outcomes.push({ type: "COUPON", clientId: client.id, status: "SENT", requestId });
+      } catch (error) {
+        this.store.finishCouponSchedule({
+          id: schedule.id,
+          ok: false,
+          now: this.now(),
+          error: error?.message ?? error
+        });
+        outcomes.push({
+          type: "COUPON",
+          clientId: schedule.clientId,
+          status: "FAILED",
+          error: safeError(error)
+        });
+      }
+    }
+
+    for (const subscription of this.store.claimDueReportSubscriptions({
+      now: this.now(),
+      limit: reportLimit
+    })) {
+      const client = this.#clientById(subscription.clientId);
+      const itemNow = this.now();
+      if (!client || !this.#isCurrentApprover(client, subscription.lineUserId)) {
+        this.store.disableReportSubscription({
+          clientId: subscription.clientId,
+          lineUserId: subscription.lineUserId,
+          now: itemNow
+        });
+        outcomes.push({
+          type: "REPORT",
+          clientId: subscription.clientId,
+          status: "SKIP_NOT_AUTHORIZED"
+        });
+        continue;
+      }
+      const { snapshot, stale } = this.#latestControlSnapshot(client);
+      const retryKey = stableRetryKey(
+        "scheduled-report",
+        client.id,
+        subscription.lineUserId,
+        subscription.occurrenceAt
+      );
+      try {
+        await this.line.push(
+          subscription.lineUserId,
+          buildPerformanceReportMessage({ client, snapshot, stale, now: itemNow }),
+          retryKey
+        );
+        this.store.completeReportOccurrence({
+          clientId: client.id,
+          lineUserId: subscription.lineUserId,
+          occurrenceAt: subscription.occurrenceAt,
+          now: this.now()
+        });
+        this.store.appendAuditEvent({
+          eventType: "SCHEDULED_REPORT_SENT",
+          actorType: "SYSTEM",
+          occurredAt: this.now(),
+          details: {
+            clientId: client.id,
+            occurrenceAt: subscription.occurrenceAt,
+            snapshotId: snapshot?.snapshotId ?? null,
+            stale,
+            retryKey
+          }
+        });
+        outcomes.push({ type: "REPORT", clientId: client.id, status: "SENT" });
+      } catch (error) {
+        // Advance this occurrence even on failure. This prevents a blocked LINE
+        // user or permanent 4xx from being retried every 10 seconds forever.
+        // The following scheduled occurrence remains active.
+        this.store.completeReportOccurrence({
+          clientId: client.id,
+          lineUserId: subscription.lineUserId,
+          occurrenceAt: subscription.occurrenceAt,
+          now: this.now()
+        });
+        this.store.appendAuditEvent({
+          eventType: "SCHEDULED_REPORT_FAILED",
+          actorType: "SYSTEM",
+          occurredAt: this.now(),
+          details: {
+            clientId: client.id,
+            occurrenceAt: subscription.occurrenceAt,
+            retryKey,
+            error: String(error?.message ?? error).slice(0, 500),
+            retryPolicy: "NEXT_INTERVAL"
+          }
+        });
+        outcomes.push({ type: "REPORT", clientId: client.id, status: "FAILED_NEXT_INTERVAL" });
       }
     }
     return outcomes;
