@@ -116,7 +116,13 @@ test("LINE control policy is bounded and aliases are unambiguous", () => {
     minReportIntervalHours: 1,
     maxReportIntervalHours: 24,
     minCouponLeadMinutes: 5,
-    maxCouponLeadMinutes: 180
+    maxCouponLeadMinutes: 180,
+    autoBoost: {
+      enabled: true,
+      boostPercent: 10,
+      leadMinutes: 10,
+      maxWindows: 24
+    }
   };
   const chromeBinding = {
     shopBinding: { mode: "observe-and-pin" },
@@ -130,6 +136,12 @@ test("LINE control policy is bounded and aliases are unambiguous", () => {
   const client = validateConfig(dynamicInput({ lineControl, ...chromeBinding })).clients[0];
   assert.deepEqual(client.lineControl.aliases, ["Ppan"]);
   assert.equal(client.lineControl.minDailyBudget, 100);
+  assert.deepEqual(client.lineControl.autoBoost, {
+    enabled: true,
+    boostPercent: 10,
+    leadMinutes: 10,
+    maxWindows: 24
+  });
 
   assert.throws(() => validateConfig(dynamicInput({
     lineControl: { ...lineControl, minDailyBudget: 7000 },
@@ -139,6 +151,13 @@ test("LINE control policy is bounded and aliases are unambiguous", () => {
     lineControl: { ...lineControl, aliases: ["two words"] },
     ...chromeBinding
   })), /single tokens/);
+  assert.throws(() => validateConfig(dynamicInput({
+    lineControl: {
+      ...lineControl,
+      autoBoost: { ...lineControl.autoBoost, leadMinutes: 10.5 }
+    },
+    ...chromeBinding
+  })), /must be integers/);
 
   const second = validDynamicClient({
     id: "dynamic-client-2",

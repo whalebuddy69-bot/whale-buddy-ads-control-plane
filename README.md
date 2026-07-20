@@ -1,6 +1,6 @@
 # LIVE GMV Max Budget Guard
 
-Ppan LINE control commands, scheduled reports, versioned shortcuts, and coupon reminders are documented in [`docs/line-controls-ppan.md`](docs/line-controls-ppan.md). Campaign mutation commands remain fail-closed DRY-RUN until the official TikTok executor is connected and verified.
+Ppan LINE control commands, scheduled reports, versioned shortcuts, coupon reminders, and recurring Auto Boost are documented in [`docs/line-controls-ppan.md`](docs/line-controls-ppan.md). Campaign mutation and Auto Boost commands remain fail-closed DRY-RUN until the official TikTok executor is connected and verified.
 
 ระบบ MVP สำหรับเฝ้าระวังงบ TikTok Shop LIVE GMV Max, ขออนุมัติผ่าน LINE และแก้ daily budget ผ่าน TikTok API for Business โดยตรง
 

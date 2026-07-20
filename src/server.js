@@ -215,7 +215,12 @@ export function createHttpServer({
           lineControls: {
             enabled: config.clients.some((client) => client.lineControl?.enabled === true),
             configuredClients: config.clients.filter((client) => client.lineControl?.enabled === true).length,
-            writeMode: "dry-run"
+            writeMode: "dry-run",
+            autoBoostClients: config.clients.filter(
+              (client) => client.lineControl?.enabled === true
+                && client.lineControl?.autoBoost?.enabled === true
+            ).length,
+            autoBoostWriteMode: "dry-run"
           },
           adapters
         });
@@ -529,11 +534,15 @@ export function createHttpServer({
 }
 
 export async function runNotificationCycle({ service, telemetryAlertsEnabled = false } = {}) {
+  if (typeof service.processScheduledLineControls === "function") {
+    await service.processScheduledLineControls({
+      autoBoostLimit: 40,
+      reportLimit: 100,
+      couponLimit: 20
+    });
+  }
   if (telemetryAlertsEnabled) {
     await service.processLatestTelemetryDryRunAlerts({ limit: 100 });
-  }
-  if (typeof service.processScheduledLineControls === "function") {
-    await service.processScheduledLineControls({ reportLimit: 100, couponLimit: 20 });
   }
   await service.recoverLineWebhookEvents({ maxEvents: 20 });
   await service.retryPendingAlerts({ limit: 100 });

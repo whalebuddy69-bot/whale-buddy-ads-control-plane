@@ -118,6 +118,54 @@ test("LINE push does not accept an arbitrary 409", async () => {
   });
   await assert.rejects(
     client.push("U123", { type: "text", text: "hello" }, crypto.randomUUID()),
-    /LINE API 409/
+    (error) => error.status === 409 && error.retryable === false
   );
+});
+
+test("LINE push marks only an explicit invalid recipient as recipient-permanent", async () => {
+  const client = new LineClient({
+    accessToken: "token",
+    fetchImpl: async () => new Response(JSON.stringify({
+      message: "Failed to send messages",
+      details: [{ message: "The property, to, is invalid.", property: "to" }]
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json" }
+    })
+  });
+  await assert.rejects(
+    client.push("invalid", { type: "text", text: "hello" }, crypto.randomUUID()),
+    (error) => error.status === 400
+      && error.retryable === false
+      && error.recipientPermanent === true
+  );
+});
+
+test("LINE auth and malformed-message failures do not revoke a viable recipient", async () => {
+  for (const response of [
+    new Response(JSON.stringify({ message: "Authentication failed" }), {
+      status: 401,
+      headers: { "content-type": "application/json" }
+    }),
+    new Response(JSON.stringify({
+      message: "The request body has 1 error(s)",
+      details: [{ message: "May not be empty", property: "messages[0].text" }]
+    }), {
+      status: 400,
+      headers: { "content-type": "application/json" }
+    }),
+    new Response(JSON.stringify({ message: "Failed to send messages" }), {
+      status: 400,
+      headers: { "content-type": "application/json" }
+    })
+  ]) {
+    const client = new LineClient({
+      accessToken: "token",
+      fetchImpl: async () => response
+    });
+    await assert.rejects(
+      client.push("U123", { type: "text", text: "hello" }, crypto.randomUUID()),
+      (error) => error.retryable === false && error.recipientPermanent === false
+    );
+  }
 });

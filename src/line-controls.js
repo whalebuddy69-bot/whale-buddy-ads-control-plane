@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 
+import { parseAutoBoostTimeWindow } from "./auto-boost.js";
+
 const CONTROL_REQUEST_ID = /^ca_[A-Za-z0-9-]{16,80}$/;
 const SHORTCUT_NAME = /^[A-Za-z0-9ก-๙_-]{1,32}$/u;
 const CLIENT_ALIAS = /^[A-Za-z0-9ก-๙_.-]{1,80}$/u;
@@ -79,6 +81,41 @@ function parseShortcutDefinition(text) {
   return { kind: "shortcut_upsert", clientAlias, shortcutName, ...values };
 }
 
+function parseAutoBoostDefinition(text) {
+  const lines = String(text).replace(/\r/g, "").split("\n").map(cleanText).filter(Boolean);
+  const header = lines[0]?.match(/^ตั้ง\s+Auto\s+Boost\s+(\S+)$/iu);
+  if (!header || lines.length < 6 || lines[4] !== "ช่วงเวลา") return null;
+  const clientAlias = commandClientAlias(header[1]);
+  if (!clientAlias) return null;
+
+  const baseMatch = lines[1].match(/^งบฐาน\s+(.+)$/u);
+  const boostMatch = lines[2].match(/^เพิ่ม\s+(\d+(?:\.\d{1,2})?)\s*%$/u);
+  const leadMatch = lines[3].match(/^ก่อน\s+(\d{1,4})\s*นาที$/u);
+  if (!baseMatch || !boostMatch || !leadMatch) return null;
+
+  const baseBudget = parseAmount(baseMatch[1]);
+  const boostPercent = Number(boostMatch[1]);
+  const leadMinutes = Number(leadMatch[1]);
+  if (
+    baseBudget === null ||
+    !Number.isFinite(boostPercent) || boostPercent <= 0 || boostPercent > 1_000 ||
+    !Number.isSafeInteger(leadMinutes) || leadMinutes < 1 || leadMinutes > 1_440
+  ) return null;
+
+  const windowLines = lines.slice(5);
+  if (windowLines.length < 1 || windowLines.length > 24) return null;
+  const windows = windowLines.map(parseAutoBoostTimeWindow);
+  if (windows.some((window) => window === null)) return null;
+  return {
+    kind: "auto_boost_upsert",
+    clientAlias,
+    baseBudget,
+    boostPercent,
+    leadMinutes,
+    windows
+  };
+}
+
 /**
  * Exact, bounded LINE commands for campaign operations. Advertiser, BC, Shop,
  * and TikTok account identities are deliberately never accepted from chat.
@@ -88,8 +125,23 @@ export function parseControlCommand(text) {
   const value = cleanText(text);
   const shortcut = parseShortcutDefinition(text);
   if (shortcut) return shortcut;
+  const autoBoost = parseAutoBoostDefinition(text);
+  if (autoBoost) return autoBoost;
 
-  let match = value.match(/^(?:เมนู|menu)\s+(\S+)$/iu);
+  let match = value.match(/^ดู\s+Auto\s+Boost\s+(\S+)$/iu);
+  if (match) {
+    const clientAlias = commandClientAlias(match[1]);
+    return clientAlias ? { kind: "auto_boost_status", clientAlias } : null;
+  }
+  match = value.match(/^(เปิด|ปิด)\s+Auto\s+Boost\s+(\S+)$/iu);
+  if (match) {
+    const clientAlias = commandClientAlias(match[2]);
+    return clientAlias
+      ? { kind: "auto_boost_toggle", clientAlias, enabled: match[1] === "เปิด" }
+      : null;
+  }
+
+  match = value.match(/^(?:เมนู|menu)\s+(\S+)$/iu);
   if (match) {
     const clientAlias = commandClientAlias(match[1]);
     return clientAlias ? { kind: "menu", clientAlias } : null;
@@ -219,7 +271,7 @@ function detailRow(label, value) {
 
 function accountSuffix(advertiserId) {
   const id = String(advertiserId ?? "");
-  return id.length <= 4 ? id : `••••${id.slice(-4)}`;
+  return id ? `••••${id.slice(-4)}` : "—";
 }
 
 export function formatMinor(minor, currency = "THB") {
@@ -279,11 +331,120 @@ export function buildControlMenuMessage(client) {
         contents: [
           { type: "button", style: "primary", color: "#06C755", action: { type: "message", label: "สถานะตอนนี้", text: `สถานะ ${alias}` } },
           { type: "button", action: { type: "message", label: "ดู Shortcut", text: `ดู shortcut ${alias}` } },
+          { type: "button", action: { type: "message", label: "Auto Boost", text: `ดู Auto Boost ${alias}` } },
           { type: "button", action: { type: "message", label: "ตัวอย่างคำสั่ง", text: `วิธีใช้ ${alias}` } }
         ]
       }
     }
   };
+}
+
+function autoBoostWindowText(windows) {
+  if (!Array.isArray(windows) || windows.length === 0) return "ยังไม่ได้ตั้งเวลา";
+  return windows.map((window) => `${window.start}-${window.end}`).join("\n");
+}
+
+/** Build the LINE Flex status card; LINE message buttons act as the ON/OFF toggle. */
+export function buildAutoBoostStatusMessage(input) {
+  const client = input?.client;
+  const profile = input?.plan ?? input?.profile;
+  if (!client || !profile) throw new TypeError("client and Auto Boost plan are required");
+  const alias = client.lineControl?.aliases?.[0] ?? client.name;
+  const enabled = profile.enabled === true;
+  const isDryRun = profile.executionMode !== "LIVE";
+  const boostBps = profile.boostBps ?? Math.round(Number(profile.boostPercent ?? 0) * 100);
+  const originalWindows = profile.originalWindows ?? profile.windows ?? [];
+  const targetBudgetMinor = profile.targetBudgetMinor;
+  const nextAction = input.nextAction ?? profile.nextAction;
+  const restoreDraining = !enabled
+    && nextAction?.phase === "RESTORE"
+    && new Set(["PENDING", "PROCESSING"]).has(nextAction?.status);
+  const rows = [
+    detailRow("สถานะ", enabled ? "🟢 เปิด" : "⚪ ปิด"),
+    detailRow("Ad account", accountSuffix(client.advertiserId)),
+    detailRow("งบฐาน", formatMinor(profile.baseBudgetMinor)),
+    detailRow("งบช่วงพิเศษ", formatMinor(targetBudgetMinor)),
+    detailRow("เพิ่ม", Number.isSafeInteger(boostBps) ? `${boostBps / 100}%` : "—"),
+    detailRow("เริ่มก่อน", `${profile.leadMinutes} นาที`),
+    lineText("ช่วงเวลาประจำวัน", { size: "sm", color: "#777777", margin: "md" }),
+    lineText(autoBoostWindowText(originalWindows), { size: "sm", color: "#111111" })
+  ];
+  if (nextAction?.dueAt) {
+    rows.push(detailRow(
+      nextAction.phase === "RESTORE" ? "คืนงบครั้งถัดไป" : "เพิ่มงบครั้งถัดไป",
+      bangkokTime(nextAction.dueAt)
+    ));
+  }
+  rows.push(lineText(
+    isDryRun
+      ? "🧪 DRY-RUN: ระบบจะแจ้งเหตุการณ์ตามเวลา แต่ยังไม่เปลี่ยนงบใน TikTok"
+      : "ระบบจะตรวจงบและบัญชีล่าสุดก่อนเปลี่ยนทุกครั้ง",
+    { size: "xs", color: isDryRun ? "#8A4B00" : "#666666", margin: "md" }
+  ));
+
+  const toggleText = `${enabled ? "ปิด" : "เปิด"} Auto Boost ${alias}`;
+  return {
+    type: "flex",
+    altText: `Auto Boost ${client.name}: ${enabled ? "ON" : "OFF"}${isDryRun ? " (DRY-RUN)" : ""}`,
+    contents: {
+      type: "bubble",
+      header: {
+        type: "box",
+        layout: "vertical",
+        backgroundColor: enabled ? "#EAF7F0" : "#F3F4F6",
+        contents: [lineText(`⚡ Auto Boost — ${client.name}`, {
+          weight: "bold", size: "lg", color: enabled ? "#135C3B" : "#555555"
+        })]
+      },
+      body: { type: "box", layout: "vertical", spacing: "sm", contents: rows },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm", contents: [
+          {
+            type: "button",
+            style: restoreDraining ? "secondary" : "primary",
+            ...(restoreDraining ? {} : { color: enabled ? "#D14343" : "#06C755" }),
+            action: restoreDraining
+              ? { type: "message", label: "กำลังรอคืนงบ", text: `ดู Auto Boost ${alias}` }
+              : { type: "message", label: enabled ? "ปิด Auto Boost" : "เปิด Auto Boost", text: toggleText }
+          },
+          {
+            type: "button",
+            action: { type: "message", label: "ดูสถานะอีกครั้ง", text: `ดู Auto Boost ${alias}` }
+          }
+        ]
+      }
+    }
+  };
+}
+
+/** Build the notification for one scheduled occurrence while writes remain disabled. */
+export function buildAutoBoostDryRunOccurrenceMessage(input) {
+  const client = input?.client;
+  const profile = input?.plan ?? input?.profile;
+  const occurrence = input?.occurrence;
+  if (!client || !profile || !occurrence) {
+    throw new TypeError("client, Auto Boost plan, and occurrence are required");
+  }
+  const restore = occurrence.phase === "RESTORE";
+  if (!restore && occurrence.phase !== "BOOST") {
+    throw new RangeError("Auto Boost occurrence phase must be BOOST or RESTORE");
+  }
+  const fromMinor = restore ? profile.targetBudgetMinor : profile.baseBudgetMinor;
+  const toMinor = restore ? profile.baseBudgetMinor : profile.targetBudgetMinor;
+  return {
+    type: "text",
+    text: [
+      `🧪 DRY-RUN ${restore ? "คืนงบ Auto Boost" : "Auto Boost"} — ${client.name}`,
+      `Ad account: ${accountSuffix(client.advertiserId)}`,
+      `งบ: ${formatMinor(fromMinor)} → ${formatMinor(toMinor)}`,
+      `เวลาจำลอง: ${bangkokTime(occurrence.dueAt)}`,
+      "ระบบยังไม่ได้เปลี่ยนงบใน TikTok"
+    ].join("\n")
+  };
+}
+
+export function buildAutoBoostOccurrenceMessage(input) {
+  return buildAutoBoostDryRunOccurrenceMessage(input);
 }
 
 export function buildPerformanceReportMessage({ client, snapshot, now = new Date(), stale = false }) {
@@ -440,12 +601,24 @@ export function controlHelpText(client) {
     `• ตั้ง ROI ${alias} 3.5`,
     `• พัก ${alias} / เปิดใหม่ ${alias}`,
     `• คูปอง ${alias} 2026-07-21 20:00 ก่อน 30 นาที งบ 5000`,
+    `• ดู Auto Boost ${alias}`,
+    `• เปิด Auto Boost ${alias} / ปิด Auto Boost ${alias}`,
     "",
     "สร้างหรือแก้ Shortcut (ส่ง 5 บรรทัด):",
     `ตั้ง shortcut ${alias} main`,
     "ชื่อ {date} {start}:00",
     "งบ 3000",
     "ROI 3.5",
-    "เติมเมื่อ 80%"
+    "เติมเมื่อ 80%",
+    "",
+    "ตั้ง Auto Boost (ส่งทุกช่วงเวลาในข้อความเดียว):",
+    `ตั้ง Auto Boost ${alias}`,
+    "งบฐาน 3000",
+    "เพิ่ม 10%",
+    "ก่อน 10 นาที",
+    "ช่วงเวลา",
+    "12:00-13:00",
+    "15:00-16:00",
+    "20:00-21:00"
   ].join("\n");
 }

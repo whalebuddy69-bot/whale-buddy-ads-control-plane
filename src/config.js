@@ -197,6 +197,36 @@ function normalizeLineControl(value, label) {
   if (maxTopUpThresholdPercent <= minTopUpThresholdPercent) {
     throw new Error(`${label}.maxTopUpThresholdPercent must be greater than minTopUpThresholdPercent`);
   }
+  let autoBoost;
+  if (value.autoBoost != null) {
+    if (typeof value.autoBoost !== "object" || Array.isArray(value.autoBoost)) {
+      throw new Error(`${label}.autoBoost must be an object`);
+    }
+    const boostPercent = finiteNumber(
+      value.autoBoost.boostPercent ?? 10,
+      `${label}.autoBoost.boostPercent`,
+      { min: 1, max: 100 }
+    );
+    const leadMinutes = finiteNumber(
+      value.autoBoost.leadMinutes ?? 10,
+      `${label}.autoBoost.leadMinutes`,
+      { min: 1, max: 180 }
+    );
+    const maxWindows = finiteNumber(
+      value.autoBoost.maxWindows ?? 24,
+      `${label}.autoBoost.maxWindows`,
+      { min: 1, max: 24 }
+    );
+    if (![boostPercent, leadMinutes, maxWindows].every(Number.isInteger)) {
+      throw new Error(`${label}.autoBoost values must be integers`);
+    }
+    autoBoost = {
+      enabled: booleanValue(value.autoBoost.enabled ?? true, `${label}.autoBoost.enabled`),
+      boostPercent,
+      leadMinutes,
+      maxWindows
+    };
+  }
   return {
     enabled: booleanValue(value.enabled ?? true, `${label}.enabled`),
     aliases,
@@ -224,7 +254,8 @@ function normalizeLineControl(value, label) {
       value.maxCouponLeadMinutes ?? 180,
       `${label}.maxCouponLeadMinutes`,
       { min: 5, max: 180 }
-    )
+    ),
+    ...(autoBoost ? { autoBoost } : {})
   };
 }
 

@@ -57,7 +57,13 @@
         "minReportIntervalHours": 1,
         "maxReportIntervalHours": 24,
         "minCouponLeadMinutes": 5,
-        "maxCouponLeadMinutes": 180
+        "maxCouponLeadMinutes": 180,
+        "autoBoost": {
+          "enabled": true,
+          "boostPercent": 10,
+          "leadMinutes": 10,
+          "maxWindows": 24
+        }
       }
     }
   ]

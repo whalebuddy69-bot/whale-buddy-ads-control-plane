@@ -12,6 +12,12 @@ import {
 } from './domain.js';
 
 const WEBHOOK_STATUSES = new Set(['RECEIVED', 'PROCESSING', 'PROCESSED', 'FAILED']);
+const AUTO_BOOST_TERMINAL_STATUSES = new Set([
+  'DRY_RUN_COMPLETED',
+  'OUTCOME_UNKNOWN',
+  'SKIPPED',
+  'FAILED',
+]);
 const DEFAULT_WEBHOOK_LEASE_MS = 120_000;
 const MAX_WEBHOOK_LEASE_MS = 15 * 60_000;
 
@@ -86,6 +92,65 @@ function safeMinor(value, field, { positive = false } = {}) {
     );
   }
   return value;
+}
+
+function positiveInteger(value, field, maximum = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    throw new DomainError(
+      'INVALID_REQUEST',
+      `${field} must be an integer between 1 and ${maximum}`,
+      { field, value },
+    );
+  }
+  return value;
+}
+
+function optionalEpochMilliseconds(value, field) {
+  if (value === undefined || value === null) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new DomainError('INVALID_REQUEST', `${field} must be non-negative epoch milliseconds`, {
+      field,
+      value,
+    });
+  }
+  return value;
+}
+
+function compareAutoBoostCommandOrder(incomingTimestamp, incomingSequence, currentProfile) {
+  if (
+    incomingTimestamp !== null
+    && currentProfile.lastCommandTimestampMs !== null
+    && incomingTimestamp !== currentProfile.lastCommandTimestampMs
+  ) {
+    return incomingTimestamp < currentProfile.lastCommandTimestampMs ? -1 : 1;
+  }
+  if (incomingSequence === currentProfile.lastCommandSequence) return 0;
+  return incomingSequence < currentProfile.lastCommandSequence ? -1 : 1;
+}
+
+function localDate(value, field = 'localDate') {
+  const normalized = requiredString(value, field);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(normalized)) {
+    throw new DomainError('INVALID_REQUEST', `${field} must use YYYY-MM-DD`, {
+      field,
+      value,
+    });
+  }
+  const parsed = new Date(`${normalized}T00:00:00.000Z`);
+  if (Number.isNaN(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== normalized) {
+    throw new DomainError('INVALID_REQUEST', `${field} must be a valid calendar date`, {
+      field,
+      value,
+    });
+  }
+  return normalized;
+}
+
+function jsonArray(value, field) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new DomainError('INVALID_REQUEST', `${field} must be a non-empty array`, { field });
+  }
+  return parseJson(json(value, field));
 }
 
 /**
@@ -340,6 +405,63 @@ export class SqliteStore {
         FOREIGN KEY(control_request_id) REFERENCES campaign_control_requests(id)
       ) STRICT;
 
+      CREATE TABLE IF NOT EXISTS auto_boost_profiles (
+        client_id TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        activation_generation INTEGER NOT NULL DEFAULT 0
+          CHECK(activation_generation >= 0),
+        enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+        execution_mode TEXT NOT NULL CHECK(execution_mode = 'DRY_RUN'),
+        last_command_sequence INTEGER NOT NULL CHECK(last_command_sequence > 0),
+        last_command_timestamp_ms INTEGER CHECK(last_command_timestamp_ms >= 0),
+        base_budget_minor INTEGER NOT NULL CHECK(base_budget_minor > 0),
+        target_budget_minor INTEGER NOT NULL CHECK(target_budget_minor > 0),
+        policy_cap_minor INTEGER NOT NULL CHECK(policy_cap_minor > 0),
+        boost_bps INTEGER NOT NULL CHECK(boost_bps > 0 AND boost_bps <= 10000),
+        lead_minutes INTEGER NOT NULL CHECK(lead_minutes BETWEEN 1 AND 1440),
+        original_windows_json TEXT NOT NULL,
+        merged_windows_json TEXT NOT NULL,
+        source_event_id TEXT NOT NULL UNIQUE,
+        last_toggle_source_event_id TEXT,
+        last_toggle_enabled INTEGER CHECK(last_toggle_enabled IN (0, 1)),
+        owner_line_user_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK(target_budget_minor >= base_budget_minor),
+        CHECK(target_budget_minor <= policy_cap_minor)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS auto_boost_occurrences (
+        id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        activation_generation INTEGER NOT NULL CHECK(activation_generation > 0),
+        local_date TEXT NOT NULL,
+        block_index INTEGER NOT NULL CHECK(block_index >= 0),
+        phase TEXT NOT NULL CHECK(phase IN ('BOOST', 'RESTORE')),
+        due_at TEXT NOT NULL,
+        deadline_at TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN (
+          'PENDING', 'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN', 'SKIPPED',
+          'FAILED', 'CANCELLED'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+        lease_token TEXT,
+        lease_expires_at TEXT,
+        last_attempt_at TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        FOREIGN KEY(client_id) REFERENCES auto_boost_profiles(client_id),
+        UNIQUE(client_id, revision, activation_generation, local_date, block_index, phase),
+        CHECK(deadline_at >= due_at),
+        CHECK(
+          (status = 'PROCESSING' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
+          OR (status <> 'PROCESSING' AND lease_token IS NULL AND lease_expires_at IS NULL)
+        )
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS audit_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         request_id TEXT,
@@ -419,6 +541,15 @@ export class SqliteStore {
       CREATE UNIQUE INDEX IF NOT EXISTS coupon_schedules_control_request_idx
         ON coupon_schedules(control_request_id)
         WHERE control_request_id IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS auto_boost_profiles_toggle_event_idx
+        ON auto_boost_profiles(last_toggle_source_event_id)
+        WHERE last_toggle_source_event_id IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS auto_boost_occurrences_claim_idx
+        ON auto_boost_occurrences(status, due_at, deadline_at, lease_expires_at);
+      CREATE INDEX IF NOT EXISTS auto_boost_occurrences_profile_idx
+        ON auto_boost_occurrences(
+          client_id, revision, activation_generation, local_date, block_index, phase
+        );
       CREATE INDEX IF NOT EXISTS audit_events_request_idx
         ON audit_events(request_id, sequence);
     `);
@@ -1065,13 +1196,60 @@ export class SqliteStore {
           AND requested_by_line_user_id = ?
           AND state = 'PENDING_CONFIRMATION'
       `).run(at, normalizedClientId, normalizedLineUserId);
+      const autoBoostOccurrences = this.db.prepare(`
+        UPDATE auto_boost_occurrences
+        SET status = 'CANCELLED', lease_token = NULL, lease_expires_at = NULL,
+            updated_at = ?, completed_at = ?
+        WHERE client_id = ? AND status = 'PENDING'
+          AND EXISTS (
+            SELECT 1
+            FROM auto_boost_profiles profile
+            WHERE profile.client_id = auto_boost_occurrences.client_id
+              AND profile.owner_line_user_id = ?
+          )
+          AND (
+            phase = 'BOOST'
+            OR NOT EXISTS (
+              SELECT 1
+              FROM auto_boost_occurrences matching_boost
+              WHERE matching_boost.client_id = auto_boost_occurrences.client_id
+                AND matching_boost.revision = auto_boost_occurrences.revision
+                AND matching_boost.activation_generation = auto_boost_occurrences.activation_generation
+                AND matching_boost.local_date = auto_boost_occurrences.local_date
+                AND matching_boost.block_index = auto_boost_occurrences.block_index
+                AND matching_boost.phase = 'BOOST'
+                AND matching_boost.status IN (
+                  'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN'
+                )
+            )
+          )
+      `).run(at, at, normalizedClientId, normalizedLineUserId);
+      const autoBoostProfiles = this.db.prepare(`
+        UPDATE auto_boost_profiles
+        SET enabled = 0, updated_at = ?
+        WHERE client_id = ? AND owner_line_user_id = ? AND enabled = 1
+      `).run(at, normalizedClientId, normalizedLineUserId);
 
       const counts = Object.freeze({
         approversRevoked: Number(approver.changes),
         reportSubscriptionsDisabled: Number(reports.changes),
         couponSchedulesCancelled: Number(coupons.changes),
         campaignControlRequestsCancelled: Number(controls.changes),
+        autoBoostProfilesDisabled: Number(autoBoostProfiles.changes),
+        autoBoostOccurrencesCancelled: Number(autoBoostOccurrences.changes),
       });
+      if (autoBoostProfiles.changes > 0 || autoBoostOccurrences.changes > 0) {
+        this.#insertAudit({
+          eventType: 'AUTO_BOOST_PROFILE_DISABLED',
+          actorType: 'ADMIN',
+          occurredAt: at,
+          details: {
+            clientId: normalizedClientId,
+            reason: 'LINE_APPROVER_REVOKED',
+            cancelledOccurrenceCount: Number(autoBoostOccurrences.changes),
+          },
+        });
+      }
       this.#insertAudit({
         eventType: 'LINE_APPROVER_REVOKED',
         actorType: 'ADMIN',
@@ -1896,12 +2074,14 @@ export class SqliteStore {
 
   getWebhookEvent(provider, eventId) {
     const row = this.db.prepare(`
-      SELECT provider, event_id, status, received_at, processed_at, request_id, error_code,
+      SELECT rowid AS sequence, provider, event_id, status, received_at,
+             processed_at, request_id, error_code,
              attempt_count, lease_token, lease_expires_at, last_attempt_at, payload_json
       FROM webhook_events WHERE provider = ? AND event_id = ?
     `).get(requiredString(provider, 'provider'), requiredString(eventId, 'eventId'));
     if (!row) return null;
     return Object.freeze({
+      sequence: row.sequence,
       provider: row.provider,
       eventId: row.event_id,
       status: row.status,
@@ -2936,6 +3116,1263 @@ export class SqliteStore {
       });
       return this.getCouponSchedule(current.id);
     });
+  }
+
+  #mapAutoBoostProfile(row) {
+    const originalWindows = parseJson(row.original_windows_json);
+    const mergedWindows = parseJson(row.merged_windows_json);
+    return Object.freeze({
+      clientId: row.client_id,
+      revision: row.revision,
+      activationGeneration: row.activation_generation,
+      enabled: row.enabled === 1,
+      executionMode: row.execution_mode,
+      lastCommandSequence: row.last_command_sequence,
+      lastCommandTimestampMs: row.last_command_timestamp_ms,
+      baseBudgetMinor: row.base_budget_minor,
+      targetBudgetMinor: row.target_budget_minor,
+      policyCapMinor: row.policy_cap_minor,
+      boostBps: row.boost_bps,
+      leadMinutes: row.lead_minutes,
+      originalWindows: Object.freeze(originalWindows),
+      mergedWindows: Object.freeze(mergedWindows),
+      sourceEventId: row.source_event_id,
+      lastToggleSourceEventId: row.last_toggle_source_event_id,
+      ownerLineUserId: row.owner_line_user_id,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    });
+  }
+
+  #autoBoostProfileSelect() {
+    return `
+      SELECT client_id, revision, activation_generation, enabled, execution_mode,
+             last_command_sequence, last_command_timestamp_ms,
+             base_budget_minor, target_budget_minor,
+             policy_cap_minor, boost_bps,
+             lead_minutes, original_windows_json, merged_windows_json,
+             source_event_id, last_toggle_source_event_id, owner_line_user_id,
+             created_at, updated_at
+      FROM auto_boost_profiles
+    `;
+  }
+
+  #findAutoBoostSourceEvent(sourceEventId) {
+    const rows = this.db.prepare(`
+      SELECT event_type, details_json
+      FROM audit_events
+      WHERE event_type LIKE 'AUTO_BOOST_%'
+      ORDER BY sequence DESC
+    `).all();
+    for (const row of rows) {
+      const details = parseJson(row.details_json);
+      if (details?.sourceEventId === sourceEventId) {
+        return Object.freeze({ eventType: row.event_type, details });
+      }
+    }
+    return null;
+  }
+
+  #hasActiveAutoBoostRestoreDrain(clientId) {
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM auto_boost_occurrences restore
+      JOIN auto_boost_occurrences matching_boost
+        ON matching_boost.client_id = restore.client_id
+       AND matching_boost.revision = restore.revision
+       AND matching_boost.activation_generation = restore.activation_generation
+       AND matching_boost.local_date = restore.local_date
+       AND matching_boost.block_index = restore.block_index
+       AND matching_boost.phase = 'BOOST'
+      WHERE restore.client_id = ?
+        AND restore.phase = 'RESTORE'
+        AND restore.status IN ('PENDING', 'PROCESSING')
+        AND matching_boost.status IN (
+          'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN'
+        )
+      LIMIT 1
+    `).get(requiredString(clientId, 'clientId')));
+  }
+
+  getAutoBoostProfile({ clientId } = {}) {
+    const row = this.db.prepare(`
+      ${this.#autoBoostProfileSelect()}
+      WHERE client_id = ?
+    `).get(requiredString(clientId, 'clientId'));
+    return row ? this.#mapAutoBoostProfile(row) : null;
+  }
+
+  /**
+   * Stores the single current recurring Auto Boost profile for a client.
+   * Profiles are editable only while OFF. The provider event id makes webhook
+   * delivery replay-safe and a genuine edit advances the immutable revision.
+   */
+  saveAutoBoostProfile({
+    clientId,
+    baseBudgetMinor,
+    targetBudgetMinor,
+    policyCapMinor,
+    boostBps,
+    leadMinutes,
+    originalWindows,
+    mergedWindows,
+    sourceEventId,
+    ownerLineUserId,
+    lineUserId,
+    executionMode = 'DRY_RUN',
+    commandSequence,
+    commandTimestampMs = null,
+    now,
+    createdAt,
+  } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const baseBudget = safeMinor(baseBudgetMinor, 'baseBudgetMinor', { positive: true });
+    const targetBudget = safeMinor(targetBudgetMinor, 'targetBudgetMinor', { positive: true });
+    const policyCap = safeMinor(policyCapMinor, 'policyCapMinor', { positive: true });
+    const normalizedBoostBps = positiveInteger(boostBps, 'boostBps', 10_000);
+    const normalizedLeadMinutes = positiveInteger(leadMinutes, 'leadMinutes', 1_440);
+    const normalizedOriginalWindows = jsonArray(originalWindows, 'originalWindows');
+    const normalizedMergedWindows = jsonArray(mergedWindows, 'mergedWindows');
+    const normalizedSourceEventId = requiredString(sourceEventId, 'sourceEventId');
+    const normalizedOwner = requiredString(
+      ownerLineUserId ?? lineUserId,
+      'ownerLineUserId',
+    );
+    const normalizedMode = requiredString(executionMode, 'executionMode');
+    const normalizedCommandSequence = positiveInteger(commandSequence, 'commandSequence');
+    const normalizedCommandTimestamp = optionalEpochMilliseconds(
+      commandTimestampMs,
+      'commandTimestampMs',
+    );
+    const at = requiredIsoTime(now ?? createdAt, 'now');
+    if (normalizedMode !== 'DRY_RUN') {
+      throw new DomainError(
+        'INVALID_REQUEST',
+        'Auto Boost executionMode must be DRY_RUN until TikTok write access is approved',
+        { field: 'executionMode', value: normalizedMode },
+      );
+    }
+    if (targetBudget < baseBudget) {
+      throw new DomainError(
+        'INVALID_REQUEST',
+        'targetBudgetMinor must be greater than or equal to baseBudgetMinor',
+        { field: 'targetBudgetMinor' },
+      );
+    }
+    if (targetBudget > policyCap) {
+      throw new DomainError(
+        'POLICY_CAP_EXCEEDED',
+        'targetBudgetMinor must not exceed policyCapMinor',
+        { targetBudgetMinor: targetBudget, policyCapMinor: policyCap },
+      );
+    }
+
+    return this.#transaction(() => {
+      const existing = this.getAutoBoostProfile({ clientId: normalizedClientId });
+      if (existing?.sourceEventId === normalizedSourceEventId) return existing;
+
+      const priorEvent = this.#findAutoBoostSourceEvent(normalizedSourceEventId);
+      if (priorEvent) {
+        if (
+          (
+            priorEvent.eventType === 'AUTO_BOOST_PROFILE_SAVED'
+            || (
+              priorEvent.eventType === 'AUTO_BOOST_STALE_COMMAND_IGNORED'
+              && priorEvent.details.operation === 'SAVE'
+            )
+          )
+          && priorEvent.details.clientId === normalizedClientId
+        ) {
+          return existing;
+        }
+        throw new DomainError(
+          'AUTO_BOOST_SOURCE_EVENT_CONFLICT',
+          'Auto Boost source event was already used by another operation',
+          { sourceEventId: normalizedSourceEventId },
+        );
+      }
+
+      const commandOrder = existing
+        ? compareAutoBoostCommandOrder(
+            normalizedCommandTimestamp,
+            normalizedCommandSequence,
+            existing,
+          )
+        : 1;
+      if (existing && commandOrder < 0) {
+        this.#insertAudit({
+          eventType: 'AUTO_BOOST_STALE_COMMAND_IGNORED',
+          actorType: 'LINE_USER',
+          actorId: normalizedOwner,
+          occurredAt: at,
+          details: {
+            clientId: normalizedClientId,
+            operation: 'SAVE',
+            sourceEventId: normalizedSourceEventId,
+            commandSequence: normalizedCommandSequence,
+            commandTimestampMs: normalizedCommandTimestamp,
+            lastCommandSequence: existing.lastCommandSequence,
+            lastCommandTimestampMs: existing.lastCommandTimestampMs,
+          },
+        });
+        return existing;
+      }
+      if (existing && commandOrder === 0) {
+        throw new DomainError(
+          'AUTO_BOOST_COMMAND_ORDER_CONFLICT',
+          'Auto Boost command sequence was reused by another event',
+          { commandSequence: normalizedCommandSequence },
+        );
+      }
+
+      const eventOwner = this.db.prepare(`
+        SELECT client_id
+        FROM auto_boost_profiles
+        WHERE source_event_id = ?
+      `).get(normalizedSourceEventId);
+      if (eventOwner) {
+        throw new DomainError(
+          'AUTO_BOOST_SOURCE_EVENT_CONFLICT',
+          'Auto Boost source event was already used for another profile',
+          { sourceEventId: normalizedSourceEventId },
+        );
+      }
+      if (existing?.enabled) {
+        throw new DomainError(
+          'AUTO_BOOST_PROFILE_ENABLED',
+          'Turn Auto Boost OFF before editing its profile',
+          { clientId: normalizedClientId, revision: existing.revision },
+        );
+      }
+      if (existing && this.#hasActiveAutoBoostRestoreDrain(normalizedClientId)) {
+        throw new DomainError(
+          'AUTO_BOOST_RESTORE_PENDING',
+          'รอบ Auto Boost ที่เริ่มแล้วกำลังรอคืนงบ กรุณารอให้คืนงบเสร็จก่อนแก้ตาราง',
+          { clientId: normalizedClientId, revision: existing.revision },
+        );
+      }
+
+      const revision = (existing?.revision ?? 0) + 1;
+      const activationGeneration = existing?.activationGeneration ?? 0;
+      const firstCreatedAt = existing?.createdAt ?? at;
+      const cancelled = this.db.prepare(`
+        UPDATE auto_boost_occurrences
+        SET status = 'CANCELLED', lease_token = NULL, lease_expires_at = NULL,
+            updated_at = ?, completed_at = ?
+        WHERE client_id = ? AND status = 'PENDING'
+      `).run(at, at, normalizedClientId);
+
+      this.db.prepare(`
+        INSERT INTO auto_boost_profiles (
+          client_id, revision, activation_generation, enabled, execution_mode,
+          last_command_sequence, last_command_timestamp_ms,
+          base_budget_minor, target_budget_minor,
+          policy_cap_minor, boost_bps,
+          lead_minutes, original_windows_json, merged_windows_json,
+          source_event_id, last_toggle_source_event_id, last_toggle_enabled,
+          owner_line_user_id, created_at, updated_at
+        ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+        ON CONFLICT(client_id) DO UPDATE SET
+          revision = excluded.revision,
+          activation_generation = excluded.activation_generation,
+          enabled = 0,
+          execution_mode = excluded.execution_mode,
+          last_command_sequence = excluded.last_command_sequence,
+          last_command_timestamp_ms = excluded.last_command_timestamp_ms,
+          base_budget_minor = excluded.base_budget_minor,
+          target_budget_minor = excluded.target_budget_minor,
+          policy_cap_minor = excluded.policy_cap_minor,
+          boost_bps = excluded.boost_bps,
+          lead_minutes = excluded.lead_minutes,
+          original_windows_json = excluded.original_windows_json,
+          merged_windows_json = excluded.merged_windows_json,
+          source_event_id = excluded.source_event_id,
+          last_toggle_source_event_id = NULL,
+          last_toggle_enabled = NULL,
+          owner_line_user_id = excluded.owner_line_user_id,
+          updated_at = excluded.updated_at
+      `).run(
+        normalizedClientId,
+        revision,
+        activationGeneration,
+        normalizedMode,
+        normalizedCommandSequence,
+        normalizedCommandTimestamp,
+        baseBudget,
+        targetBudget,
+        policyCap,
+        normalizedBoostBps,
+        normalizedLeadMinutes,
+        json(normalizedOriginalWindows, 'originalWindows'),
+        json(normalizedMergedWindows, 'mergedWindows'),
+        normalizedSourceEventId,
+        normalizedOwner,
+        firstCreatedAt,
+        at,
+      );
+      this.#insertAudit({
+        eventType: 'AUTO_BOOST_PROFILE_SAVED',
+        actorType: 'LINE_USER',
+        actorId: normalizedOwner,
+        occurredAt: at,
+        details: {
+          clientId: normalizedClientId,
+          revision,
+          activationGeneration,
+          executionMode: normalizedMode,
+          baseBudgetMinor: baseBudget,
+          targetBudgetMinor: targetBudget,
+          policyCapMinor: policyCap,
+          boostBps: normalizedBoostBps,
+          leadMinutes: normalizedLeadMinutes,
+          cancelledOccurrenceCount: Number(cancelled.changes),
+          sourceEventId: normalizedSourceEventId,
+          commandSequence: normalizedCommandSequence,
+          commandTimestampMs: normalizedCommandTimestamp,
+        },
+      });
+      return this.getAutoBoostProfile({ clientId: normalizedClientId });
+    });
+  }
+
+  /** Compare-and-set toggle. OFF -> ON creates a fresh execution generation. */
+  setAutoBoostEnabled({
+    clientId,
+    enabled,
+    expectedRevision,
+    lineUserId,
+    sourceEventId = null,
+    commandSequence,
+    commandTimestampMs = null,
+    now,
+  } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    if (typeof enabled !== 'boolean') {
+      throw new DomainError('INVALID_REQUEST', 'enabled must be a boolean', { field: 'enabled' });
+    }
+    if (expectedRevision !== undefined) {
+      positiveInteger(expectedRevision, 'expectedRevision');
+    }
+    const normalizedUserId = requiredString(lineUserId, 'lineUserId');
+    const normalizedSourceEventId = sourceEventId === null || sourceEventId === undefined
+      ? null
+      : requiredString(sourceEventId, 'sourceEventId');
+    const normalizedCommandSequence = positiveInteger(commandSequence, 'commandSequence');
+    const normalizedCommandTimestamp = optionalEpochMilliseconds(
+      commandTimestampMs,
+      'commandTimestampMs',
+    );
+    const at = requiredIsoTime(now, 'now');
+
+    return this.#transaction(() => {
+      const current = this.getAutoBoostProfile({ clientId: normalizedClientId });
+      if (!current) {
+        throw new DomainError('AUTO_BOOST_PROFILE_NOT_FOUND', 'Auto Boost profile was not found', {
+          clientId: normalizedClientId,
+        });
+      }
+      if (current.lastToggleSourceEventId === normalizedSourceEventId && normalizedSourceEventId) {
+        const last = this.db.prepare(`
+          SELECT last_toggle_enabled
+          FROM auto_boost_profiles
+          WHERE client_id = ?
+        `).get(normalizedClientId);
+        if ((last.last_toggle_enabled === 1) !== enabled) {
+          throw new DomainError(
+            'AUTO_BOOST_SOURCE_EVENT_CONFLICT',
+            'Auto Boost toggle event was replayed with a different desired state',
+            { sourceEventId: normalizedSourceEventId },
+          );
+        }
+        return current;
+      }
+      if (normalizedSourceEventId) {
+        const priorEvent = this.#findAutoBoostSourceEvent(normalizedSourceEventId);
+        if (priorEvent) {
+          const priorEnabled = priorEvent.eventType === 'AUTO_BOOST_PROFILE_ENABLED'
+            ? true
+            : priorEvent.eventType === 'AUTO_BOOST_PROFILE_DISABLED'
+              ? false
+              : priorEvent.eventType === 'AUTO_BOOST_PROFILE_TOGGLE_NOOP'
+                ? priorEvent.details.enabled
+                : priorEvent.eventType === 'AUTO_BOOST_STALE_COMMAND_IGNORED'
+                  ? priorEvent.details.operation === 'ENABLE'
+                    ? true
+                    : priorEvent.details.operation === 'DISABLE'
+                      ? false
+                      : null
+                : null;
+          if (priorEvent.details.clientId !== normalizedClientId || priorEnabled !== enabled) {
+            throw new DomainError(
+              'AUTO_BOOST_SOURCE_EVENT_CONFLICT',
+              'Auto Boost source event was already used by another operation',
+              { sourceEventId: normalizedSourceEventId },
+            );
+          }
+          return current;
+        }
+      }
+      const commandOrder = compareAutoBoostCommandOrder(
+        normalizedCommandTimestamp,
+        normalizedCommandSequence,
+        current,
+      );
+      if (commandOrder < 0) {
+        this.#insertAudit({
+          eventType: 'AUTO_BOOST_STALE_COMMAND_IGNORED',
+          actorType: 'LINE_USER',
+          actorId: normalizedUserId,
+          occurredAt: at,
+          details: {
+            clientId: normalizedClientId,
+            operation: enabled ? 'ENABLE' : 'DISABLE',
+            sourceEventId: normalizedSourceEventId,
+            commandSequence: normalizedCommandSequence,
+            commandTimestampMs: normalizedCommandTimestamp,
+            lastCommandSequence: current.lastCommandSequence,
+            lastCommandTimestampMs: current.lastCommandTimestampMs,
+          },
+        });
+        return current;
+      }
+      if (commandOrder === 0) {
+        throw new DomainError(
+          'AUTO_BOOST_COMMAND_ORDER_CONFLICT',
+          'Auto Boost command sequence was reused by another event',
+          { commandSequence: normalizedCommandSequence },
+        );
+      }
+      if (expectedRevision !== undefined && current.revision !== expectedRevision) {
+        throw new DomainError(
+          'CONCURRENT_MODIFICATION',
+          'Auto Boost profile revision changed',
+          { expectedRevision, actualRevision: current.revision },
+        );
+      }
+      if (enabled && !current.enabled && this.#hasActiveAutoBoostRestoreDrain(normalizedClientId)) {
+        throw new DomainError(
+          'AUTO_BOOST_RESTORE_PENDING',
+          'รอบ Auto Boost ที่เริ่มแล้วกำลังรอคืนงบ กรุณารอให้คืนงบเสร็จก่อนเปิดรอบใหม่',
+          { clientId: normalizedClientId, revision: current.revision },
+        );
+      }
+      if (normalizedSourceEventId) {
+        const reused = this.db.prepare(`
+          SELECT client_id
+          FROM auto_boost_profiles
+          WHERE last_toggle_source_event_id = ?
+        `).get(normalizedSourceEventId);
+        if (reused) {
+          throw new DomainError(
+            'AUTO_BOOST_SOURCE_EVENT_CONFLICT',
+            'Auto Boost toggle event was already used for another profile',
+            { sourceEventId: normalizedSourceEventId },
+          );
+        }
+      }
+
+      if (current.enabled === enabled) {
+        this.db.prepare(`
+          UPDATE auto_boost_profiles
+          SET last_toggle_source_event_id = ?, last_toggle_enabled = ?,
+              last_command_sequence = ?, last_command_timestamp_ms = ?, updated_at = ?
+          WHERE client_id = ? AND revision = ? AND enabled = ?
+        `).run(
+          normalizedSourceEventId,
+          enabled ? 1 : 0,
+          normalizedCommandSequence,
+          normalizedCommandTimestamp,
+          at,
+          normalizedClientId,
+          current.revision,
+          enabled ? 1 : 0,
+        );
+        this.#insertAudit({
+          eventType: 'AUTO_BOOST_PROFILE_TOGGLE_NOOP',
+          actorType: 'LINE_USER',
+          actorId: normalizedUserId,
+          occurredAt: at,
+          details: {
+            clientId: normalizedClientId,
+            revision: current.revision,
+            activationGeneration: current.activationGeneration,
+            enabled,
+            sourceEventId: normalizedSourceEventId,
+            commandSequence: normalizedCommandSequence,
+            commandTimestampMs: normalizedCommandTimestamp,
+          },
+        });
+        return this.getAutoBoostProfile({ clientId: normalizedClientId });
+      }
+
+      const nextGeneration = enabled
+        ? current.activationGeneration + 1
+        : current.activationGeneration;
+      const result = this.db.prepare(`
+        UPDATE auto_boost_profiles
+        SET enabled = ?, activation_generation = ?,
+            last_toggle_source_event_id = ?, last_toggle_enabled = ?,
+            last_command_sequence = ?, last_command_timestamp_ms = ?, updated_at = ?
+        WHERE client_id = ? AND revision = ? AND activation_generation = ? AND enabled = ?
+      `).run(
+        enabled ? 1 : 0,
+        nextGeneration,
+        normalizedSourceEventId,
+        enabled ? 1 : 0,
+        normalizedCommandSequence,
+        normalizedCommandTimestamp,
+        at,
+        normalizedClientId,
+        current.revision,
+        current.activationGeneration,
+        current.enabled ? 1 : 0,
+      );
+      if (result.changes !== 1) {
+        throw new DomainError('CONCURRENT_MODIFICATION', 'Auto Boost profile changed concurrently');
+      }
+
+      let cancelledOccurrenceCount = 0;
+      if (enabled && current.executionMode === 'DRY_RUN') {
+        const cancelled = this.db.prepare(`
+          UPDATE auto_boost_occurrences
+          SET status = 'CANCELLED', lease_token = NULL, lease_expires_at = NULL,
+              updated_at = ?, completed_at = ?
+          WHERE client_id = ? AND revision = ? AND activation_generation = ?
+            AND status = 'PENDING'
+        `).run(
+          at,
+          at,
+          normalizedClientId,
+          current.revision,
+          current.activationGeneration,
+        );
+        cancelledOccurrenceCount = Number(cancelled.changes);
+      }
+      if (!enabled && current.executionMode === 'DRY_RUN') {
+        const cancelled = this.db.prepare(`
+          UPDATE auto_boost_occurrences
+          SET status = 'CANCELLED', lease_token = NULL, lease_expires_at = NULL,
+              updated_at = ?, completed_at = ?
+          WHERE client_id = ? AND revision = ? AND activation_generation = ?
+            AND status = 'PENDING'
+            AND (
+              phase = 'BOOST'
+              OR NOT EXISTS (
+                SELECT 1
+                FROM auto_boost_occurrences matching_boost
+                WHERE matching_boost.client_id = auto_boost_occurrences.client_id
+                  AND matching_boost.revision = auto_boost_occurrences.revision
+                  AND matching_boost.activation_generation = auto_boost_occurrences.activation_generation
+                  AND matching_boost.local_date = auto_boost_occurrences.local_date
+                  AND matching_boost.block_index = auto_boost_occurrences.block_index
+                  AND matching_boost.phase = 'BOOST'
+                  AND matching_boost.status IN (
+                    'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN'
+                  )
+              )
+            )
+        `).run(
+          at,
+          at,
+          normalizedClientId,
+          current.revision,
+          current.activationGeneration,
+        );
+        cancelledOccurrenceCount = Number(cancelled.changes);
+      }
+      this.#insertAudit({
+        eventType: enabled ? 'AUTO_BOOST_PROFILE_ENABLED' : 'AUTO_BOOST_PROFILE_DISABLED',
+        actorType: 'LINE_USER',
+        actorId: normalizedUserId,
+        occurredAt: at,
+        details: {
+          clientId: normalizedClientId,
+          revision: current.revision,
+          fromActivationGeneration: current.activationGeneration,
+          activationGeneration: nextGeneration,
+          cancelledOccurrenceCount,
+          sourceEventId: normalizedSourceEventId,
+          commandSequence: normalizedCommandSequence,
+          commandTimestampMs: normalizedCommandTimestamp,
+        },
+      });
+      return this.getAutoBoostProfile({ clientId: normalizedClientId });
+    });
+  }
+
+  #mapAutoBoostOccurrence(row) {
+    return Object.freeze({
+      id: row.id,
+      clientId: row.client_id,
+      revision: row.revision,
+      activationGeneration: row.activation_generation,
+      localDate: row.local_date,
+      blockIndex: row.block_index,
+      phase: row.phase,
+      dueAt: row.due_at,
+      deadlineAt: row.deadline_at,
+      status: row.status,
+      attemptCount: row.attempt_count,
+      leaseToken: row.lease_token,
+      leaseExpiresAt: row.lease_expires_at,
+      lastAttemptAt: row.last_attempt_at,
+      lastError: row.last_error,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      completedAt: row.completed_at,
+    });
+  }
+
+  #autoBoostOccurrenceSelect() {
+    return `
+      SELECT id, client_id, revision, activation_generation, local_date,
+             block_index, phase, due_at, deadline_at, status, attempt_count,
+             lease_token, lease_expires_at, last_attempt_at, last_error,
+             created_at, updated_at, completed_at
+      FROM auto_boost_occurrences
+    `;
+  }
+
+  getAutoBoostOccurrence(id) {
+    const row = this.db.prepare(`
+      ${this.#autoBoostOccurrenceSelect()}
+      WHERE id = ?
+    `).get(requiredString(id, 'id'));
+    return row ? this.#mapAutoBoostOccurrence(row) : null;
+  }
+
+  getBlockingAutoBoostRestore({ clientId, beforeAt } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const cutoff = requiredIsoTime(beforeAt, 'beforeAt');
+    const row = this.db.prepare(`
+      SELECT required_restore.*
+      FROM auto_boost_occurrences required_restore
+      JOIN auto_boost_occurrences required_boost
+        ON required_boost.client_id = required_restore.client_id
+       AND required_boost.revision = required_restore.revision
+       AND required_boost.activation_generation = required_restore.activation_generation
+       AND required_boost.local_date = required_restore.local_date
+       AND required_boost.block_index = required_restore.block_index
+       AND required_boost.phase = 'BOOST'
+      WHERE required_restore.client_id = ?
+        AND required_restore.phase = 'RESTORE'
+        AND required_restore.status IN ('PENDING', 'PROCESSING')
+        AND required_restore.due_at <= ?
+        AND required_boost.status IN (
+          'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN'
+        )
+      ORDER BY required_restore.due_at ASC, required_restore.id ASC
+      LIMIT 1
+    `).get(normalizedClientId, cutoff);
+    return row ? this.#mapAutoBoostOccurrence(row) : null;
+  }
+
+  materializeAutoBoostOccurrences({
+    clientId,
+    localDate: occurrenceLocalDate,
+    intervals,
+    blocks,
+    now,
+    deadlineMinutes,
+  } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedLocalDate = localDate(occurrenceLocalDate);
+    const normalizedIntervals = jsonArray(intervals ?? blocks, 'intervals');
+    const at = requiredIsoTime(now, 'now');
+
+    return this.#transaction(() => {
+      const profile = this.getAutoBoostProfile({ clientId: normalizedClientId });
+      if (!profile) {
+        throw new DomainError('AUTO_BOOST_PROFILE_NOT_FOUND', 'Auto Boost profile was not found', {
+          clientId: normalizedClientId,
+        });
+      }
+      if (!profile.enabled || profile.activationGeneration < 1) {
+        throw new DomainError(
+          'AUTO_BOOST_PROFILE_DISABLED',
+          'Auto Boost must be ON before occurrences can be materialized',
+          { clientId: normalizedClientId, revision: profile.revision },
+        );
+      }
+      const deadlineWindow = deadlineMinutes === undefined
+        ? profile.leadMinutes
+        : positiveInteger(deadlineMinutes, 'deadlineMinutes', 1_440);
+      const deadlineMs = deadlineWindow * 60_000;
+      const sortedIntervals = normalizedIntervals.map((interval, inputIndex) => {
+        if (!interval || typeof interval !== 'object' || Array.isArray(interval)) {
+          throw new DomainError('INVALID_REQUEST', 'Each interval must be an object', {
+            field: `intervals[${inputIndex}]`,
+          });
+        }
+        const startAt = requiredIsoTime(
+          interval.boostAt ?? interval.startAt,
+          `intervals[${inputIndex}].startAt`,
+        );
+        const endAt = requiredIsoTime(
+          interval.restoreAt ?? interval.endAt,
+          `intervals[${inputIndex}].endAt`,
+        );
+        if (Date.parse(endAt) <= Date.parse(startAt)) {
+          throw new DomainError('INVALID_REQUEST', 'Interval endAt must be later than startAt', {
+            field: `intervals[${inputIndex}].endAt`,
+          });
+        }
+        const boostDeadlineAt = interval.boostDeadlineAt === undefined
+          ? new Date(Date.parse(startAt) + deadlineMs).toISOString()
+          : requiredIsoTime(interval.boostDeadlineAt, `intervals[${inputIndex}].boostDeadlineAt`);
+        const restoreDeadlineAt = interval.restoreDeadlineAt === undefined
+          ? new Date(Date.parse(endAt) + deadlineMs).toISOString()
+          : requiredIsoTime(interval.restoreDeadlineAt, `intervals[${inputIndex}].restoreDeadlineAt`);
+        if (Date.parse(boostDeadlineAt) < Date.parse(startAt)) {
+          throw new DomainError('INVALID_REQUEST', 'boostDeadlineAt cannot be earlier than startAt');
+        }
+        if (Date.parse(restoreDeadlineAt) < Date.parse(endAt)) {
+          throw new DomainError('INVALID_REQUEST', 'restoreDeadlineAt cannot be earlier than endAt');
+        }
+        return { startAt, endAt, boostDeadlineAt, restoreDeadlineAt };
+      }).sort((left, right) => left.startAt.localeCompare(right.startAt)
+        || left.endAt.localeCompare(right.endAt));
+
+      for (let index = 1; index < sortedIntervals.length; index += 1) {
+        if (Date.parse(sortedIntervals[index].startAt) < Date.parse(sortedIntervals[index - 1].endAt)) {
+          throw new DomainError(
+            'INVALID_REQUEST',
+            'Materialized Auto Boost intervals must not overlap',
+            { field: 'intervals', blockIndex: index },
+          );
+        }
+      }
+
+      let createdCount = 0;
+      for (const [blockIndex, interval] of sortedIntervals.entries()) {
+        const phases = [
+          {
+            phase: 'BOOST',
+            dueAt: interval.startAt,
+            deadlineAt: interval.boostDeadlineAt,
+          },
+          {
+            phase: 'RESTORE',
+            dueAt: interval.endAt,
+            deadlineAt: interval.restoreDeadlineAt,
+          },
+        ];
+        for (const phase of phases) {
+          const id = `ab:${encodeURIComponent(normalizedClientId)}:r${profile.revision}`
+            + `:g${profile.activationGeneration}:${normalizedLocalDate}:b${blockIndex}:${phase.phase}`;
+          const inserted = this.db.prepare(`
+            INSERT OR IGNORE INTO auto_boost_occurrences (
+              id, client_id, revision, activation_generation, local_date,
+              block_index, phase, due_at, deadline_at, status, attempt_count,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, ?, ?)
+          `).run(
+            id,
+            normalizedClientId,
+            profile.revision,
+            profile.activationGeneration,
+            normalizedLocalDate,
+            blockIndex,
+            phase.phase,
+            phase.dueAt,
+            phase.deadlineAt,
+            at,
+            at,
+          );
+          if (inserted.changes === 1) {
+            createdCount += 1;
+            continue;
+          }
+          const existing = this.getAutoBoostOccurrence(id);
+          if (
+            !existing
+            || existing.dueAt !== phase.dueAt
+            || existing.deadlineAt !== phase.deadlineAt
+          ) {
+            throw new DomainError(
+              'AUTO_BOOST_OCCURRENCE_CONFLICT',
+              'Deterministic Auto Boost occurrence has different timing',
+              { occurrenceId: id },
+            );
+          }
+        }
+      }
+      if (createdCount > 0) {
+        this.#insertAudit({
+          eventType: 'AUTO_BOOST_OCCURRENCES_MATERIALIZED',
+          actorType: 'SYSTEM',
+          occurredAt: at,
+          details: {
+            clientId: normalizedClientId,
+            revision: profile.revision,
+            activationGeneration: profile.activationGeneration,
+            localDate: normalizedLocalDate,
+            blockCount: sortedIntervals.length,
+            occurrenceCount: createdCount,
+          },
+        });
+      }
+      return this.listAutoBoostOccurrences({
+        clientId: normalizedClientId,
+        revision: profile.revision,
+        activationGeneration: profile.activationGeneration,
+        localDate: normalizedLocalDate,
+        limit: 1_000,
+      });
+    });
+  }
+
+  claimDueAutoBoostOccurrences({ now, limit = 20, leaseDurationMs } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new DomainError('INVALID_REQUEST', 'limit must be between 1 and 1000');
+    }
+    const duration = leaseDuration(leaseDurationMs);
+    const leaseExpiresAt = new Date(Date.parse(at) + duration).toISOString();
+
+    return this.#transaction(() => {
+      const overdue = this.db.prepare(`
+        SELECT occurrence.id, occurrence.client_id, occurrence.revision,
+               occurrence.activation_generation, occurrence.phase,
+               occurrence.status, occurrence.attempt_count
+        FROM auto_boost_occurrences occurrence
+        JOIN auto_boost_profiles profile ON profile.client_id = occurrence.client_id
+        WHERE profile.revision = occurrence.revision
+          AND profile.activation_generation = occurrence.activation_generation
+          AND occurrence.deadline_at < ?
+          AND NOT (
+            occurrence.phase = 'RESTORE'
+            AND EXISTS (
+              SELECT 1
+              FROM auto_boost_occurrences matching_boost
+              WHERE matching_boost.client_id = occurrence.client_id
+                AND matching_boost.revision = occurrence.revision
+                AND matching_boost.activation_generation = occurrence.activation_generation
+                AND matching_boost.local_date = occurrence.local_date
+                AND matching_boost.block_index = occurrence.block_index
+                AND matching_boost.phase = 'BOOST'
+                AND matching_boost.status IN (
+                  'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN'
+                )
+            )
+          )
+          AND (
+            occurrence.status = 'PENDING'
+            OR (
+              occurrence.status = 'PROCESSING'
+              AND occurrence.lease_expires_at <= ?
+            )
+          )
+        ORDER BY occurrence.deadline_at ASC, occurrence.id ASC
+      `).all(at, at);
+      for (const occurrence of overdue) {
+        const outcomeUnknown = occurrence.phase === 'BOOST'
+          && occurrence.status === 'PROCESSING';
+        const terminalStatus = outcomeUnknown ? 'OUTCOME_UNKNOWN' : 'SKIPPED';
+        const terminalError = outcomeUnknown
+          ? 'BOOST delivery outcome unknown after processing lease expired'
+          : 'Execution deadline elapsed';
+        const skipped = this.db.prepare(`
+          UPDATE auto_boost_occurrences
+          SET status = ?, lease_token = NULL, lease_expires_at = NULL,
+              last_error = ?, updated_at = ?, completed_at = ?
+          WHERE id = ? AND deadline_at < ?
+            AND (
+              status = 'PENDING'
+              OR (status = 'PROCESSING' AND lease_expires_at <= ?)
+            )
+        `).run(terminalStatus, terminalError, at, at, occurrence.id, at, at);
+        if (skipped.changes === 1) {
+          this.#insertAudit({
+            eventType: outcomeUnknown
+              ? 'AUTO_BOOST_OCCURRENCE_OUTCOME_UNKNOWN'
+              : 'AUTO_BOOST_OCCURRENCE_SKIPPED',
+            actorType: 'SYSTEM',
+            occurredAt: at,
+            details: {
+              occurrenceId: occurrence.id,
+              clientId: occurrence.client_id,
+              revision: occurrence.revision,
+              activationGeneration: occurrence.activation_generation,
+              phase: occurrence.phase,
+              reason: outcomeUnknown ? 'PROCESSING_LEASE_EXPIRED' : 'DEADLINE_ELAPSED',
+            },
+          });
+        }
+      }
+
+      const candidates = this.db.prepare(`
+        SELECT occurrence.id, occurrence.status
+        FROM auto_boost_occurrences occurrence
+        JOIN auto_boost_profiles profile ON profile.client_id = occurrence.client_id
+        WHERE profile.execution_mode = 'DRY_RUN'
+          AND profile.revision = occurrence.revision
+          AND profile.activation_generation = occurrence.activation_generation
+          AND (
+            profile.enabled = 1
+            OR occurrence.phase = 'RESTORE'
+            OR occurrence.status = 'PROCESSING'
+          )
+          AND occurrence.due_at <= ?
+          AND (
+            occurrence.deadline_at >= ?
+            OR (
+              occurrence.phase = 'RESTORE'
+              AND EXISTS (
+                SELECT 1
+                FROM auto_boost_occurrences completed_boost
+                WHERE completed_boost.client_id = occurrence.client_id
+                  AND completed_boost.revision = occurrence.revision
+                  AND completed_boost.activation_generation = occurrence.activation_generation
+                  AND completed_boost.local_date = occurrence.local_date
+                  AND completed_boost.block_index = occurrence.block_index
+                  AND completed_boost.phase = 'BOOST'
+                  AND completed_boost.status IN ('DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN')
+              )
+            )
+          )
+          AND (
+            occurrence.phase = 'BOOST'
+            OR EXISTS (
+              SELECT 1
+              FROM auto_boost_occurrences matching_boost
+              WHERE matching_boost.client_id = occurrence.client_id
+                AND matching_boost.revision = occurrence.revision
+                AND matching_boost.activation_generation = occurrence.activation_generation
+                AND matching_boost.local_date = occurrence.local_date
+                AND matching_boost.block_index = occurrence.block_index
+                AND matching_boost.phase = 'BOOST'
+                AND matching_boost.status NOT IN ('PENDING', 'PROCESSING')
+            )
+          )
+          AND (
+            occurrence.phase = 'RESTORE'
+            OR NOT EXISTS (
+              SELECT 1
+              FROM auto_boost_occurrences required_restore
+              JOIN auto_boost_occurrences required_boost
+                ON required_boost.client_id = required_restore.client_id
+               AND required_boost.revision = required_restore.revision
+               AND required_boost.activation_generation = required_restore.activation_generation
+               AND required_boost.local_date = required_restore.local_date
+               AND required_boost.block_index = required_restore.block_index
+               AND required_boost.phase = 'BOOST'
+              WHERE required_restore.client_id = occurrence.client_id
+                AND required_restore.phase = 'RESTORE'
+                AND required_restore.status IN ('PENDING', 'PROCESSING')
+                AND required_restore.due_at <= occurrence.due_at
+                AND required_boost.status IN (
+                  'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN'
+                )
+            )
+          )
+          AND (
+            occurrence.status = 'PENDING'
+            OR (
+              occurrence.status = 'PROCESSING'
+              AND occurrence.lease_expires_at <= ?
+            )
+          )
+        ORDER BY occurrence.due_at ASC,
+          CASE occurrence.phase WHEN 'RESTORE' THEN 0 ELSE 1 END ASC,
+          occurrence.id ASC
+        LIMIT ?
+      `).all(at, at, at, limit);
+
+      const claimed = [];
+      for (const candidate of candidates) {
+        const leaseToken = randomUUID();
+        const result = this.db.prepare(`
+          UPDATE auto_boost_occurrences
+          SET status = 'PROCESSING', attempt_count = attempt_count + 1,
+              lease_token = ?, lease_expires_at = ?, last_attempt_at = ?,
+              last_error = NULL, updated_at = ?, completed_at = NULL
+          WHERE id = ?
+            AND due_at <= ?
+            AND (
+              deadline_at >= ?
+              OR (
+                phase = 'RESTORE'
+                AND EXISTS (
+                  SELECT 1
+                  FROM auto_boost_occurrences completed_boost
+                  WHERE completed_boost.client_id = auto_boost_occurrences.client_id
+                    AND completed_boost.revision = auto_boost_occurrences.revision
+                    AND completed_boost.activation_generation = auto_boost_occurrences.activation_generation
+                    AND completed_boost.local_date = auto_boost_occurrences.local_date
+                    AND completed_boost.block_index = auto_boost_occurrences.block_index
+                    AND completed_boost.phase = 'BOOST'
+                    AND completed_boost.status IN ('DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN')
+                )
+              )
+            )
+            AND (
+              status = 'PENDING'
+              OR (status = 'PROCESSING' AND lease_expires_at <= ?)
+            )
+            AND (
+              phase = 'RESTORE'
+              OR NOT EXISTS (
+                SELECT 1
+                FROM auto_boost_occurrences required_restore
+                JOIN auto_boost_occurrences required_boost
+                  ON required_boost.client_id = required_restore.client_id
+                 AND required_boost.revision = required_restore.revision
+                 AND required_boost.activation_generation = required_restore.activation_generation
+                 AND required_boost.local_date = required_restore.local_date
+                 AND required_boost.block_index = required_restore.block_index
+                 AND required_boost.phase = 'BOOST'
+                WHERE required_restore.client_id = auto_boost_occurrences.client_id
+                  AND required_restore.phase = 'RESTORE'
+                  AND required_restore.status IN ('PENDING', 'PROCESSING')
+                  AND required_restore.due_at <= auto_boost_occurrences.due_at
+                  AND required_boost.status IN (
+                    'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN'
+                  )
+              )
+            )
+        `).run(leaseToken, leaseExpiresAt, at, at, candidate.id, at, at, at);
+        if (result.changes !== 1) continue;
+        const occurrence = this.getAutoBoostOccurrence(candidate.id);
+        this.#insertAudit({
+          eventType: 'AUTO_BOOST_OCCURRENCE_CLAIMED',
+          actorType: 'SYSTEM',
+          occurredAt: at,
+          details: {
+            occurrenceId: occurrence.id,
+            clientId: occurrence.clientId,
+            revision: occurrence.revision,
+            activationGeneration: occurrence.activationGeneration,
+            phase: occurrence.phase,
+            attemptCount: occurrence.attemptCount,
+            leaseExpiresAt: occurrence.leaseExpiresAt,
+            reclaimed: candidate.status === 'PROCESSING',
+          },
+        });
+        claimed.push(occurrence);
+      }
+      return claimed;
+    });
+  }
+
+  /** Release claimed work so a prerequisite can finish before it is retried. */
+  releaseAutoBoostOccurrence({ id, leaseToken, now, error = null } = {}) {
+    const normalizedId = requiredString(id, 'id');
+    const normalizedLeaseToken = requiredString(leaseToken, 'leaseToken');
+    const at = requiredIsoTime(now, 'now');
+    const normalizedError = error === null || error === undefined
+      ? null
+      : String(error).slice(0, 1_000);
+
+    return this.#transaction(() => {
+      const current = this.getAutoBoostOccurrence(normalizedId);
+      if (!current) {
+        throw new DomainError(
+          'AUTO_BOOST_OCCURRENCE_NOT_FOUND',
+          'Auto Boost occurrence was not found',
+          { occurrenceId: normalizedId },
+        );
+      }
+      if (current.status !== 'PROCESSING') {
+        throw new DomainError(
+          'AUTO_BOOST_OCCURRENCE_NOT_PROCESSING',
+          'Auto Boost occurrence is not in PROCESSING state',
+          { occurrenceId: normalizedId, status: current.status },
+        );
+      }
+      if (current.leaseToken !== normalizedLeaseToken) {
+        throw new DomainError(
+          'AUTO_BOOST_LEASE_MISMATCH',
+          'Auto Boost occurrence lease belongs to another worker',
+          { occurrenceId: normalizedId },
+        );
+      }
+      if (!current.leaseExpiresAt || Date.parse(current.leaseExpiresAt) <= Date.parse(at)) {
+        throw new DomainError(
+          'AUTO_BOOST_LEASE_EXPIRED',
+          'Auto Boost occurrence lease has expired',
+          { occurrenceId: normalizedId, leaseExpiresAt: current.leaseExpiresAt },
+        );
+      }
+      const result = this.db.prepare(`
+        UPDATE auto_boost_occurrences
+        SET status = 'PENDING', lease_token = NULL, lease_expires_at = NULL,
+            last_error = ?, updated_at = ?, completed_at = NULL
+        WHERE id = ? AND status = 'PROCESSING' AND lease_token = ?
+          AND lease_expires_at > ?
+      `).run(normalizedError, at, normalizedId, normalizedLeaseToken, at);
+      if (result.changes !== 1) {
+        throw new DomainError(
+          'CONCURRENT_MODIFICATION',
+          'Auto Boost occurrence lease changed concurrently',
+          { occurrenceId: normalizedId },
+        );
+      }
+      this.#insertAudit({
+        eventType: 'AUTO_BOOST_OCCURRENCE_DEFERRED',
+        actorType: 'SYSTEM',
+        occurredAt: at,
+        details: {
+          occurrenceId: current.id,
+          clientId: current.clientId,
+          revision: current.revision,
+          activationGeneration: current.activationGeneration,
+          phase: current.phase,
+          attemptCount: current.attemptCount,
+          error: normalizedError,
+        },
+      });
+      return this.getAutoBoostOccurrence(normalizedId);
+    });
+  }
+
+  finishAutoBoostOccurrence({ id, leaseToken, status, now, error = null } = {}) {
+    const normalizedId = requiredString(id, 'id');
+    const normalizedLeaseToken = requiredString(leaseToken, 'leaseToken');
+    const normalizedStatus = requiredString(status, 'status');
+    if (!AUTO_BOOST_TERMINAL_STATUSES.has(normalizedStatus)) {
+      throw new DomainError(
+        'INVALID_REQUEST',
+        'status must be DRY_RUN_COMPLETED, OUTCOME_UNKNOWN, SKIPPED, or FAILED',
+        { field: 'status', value: normalizedStatus },
+      );
+    }
+    const at = requiredIsoTime(now, 'now');
+    const normalizedError = error === null || error === undefined
+      ? null
+      : String(error).slice(0, 1_000);
+
+    return this.#transaction(() => {
+      const current = this.getAutoBoostOccurrence(normalizedId);
+      if (!current) {
+        throw new DomainError(
+          'AUTO_BOOST_OCCURRENCE_NOT_FOUND',
+          'Auto Boost occurrence was not found',
+          { occurrenceId: normalizedId },
+        );
+      }
+      if (current.status !== 'PROCESSING') {
+        throw new DomainError(
+          'AUTO_BOOST_OCCURRENCE_NOT_PROCESSING',
+          'Auto Boost occurrence is not in PROCESSING state',
+          { occurrenceId: normalizedId, status: current.status },
+        );
+      }
+      if (current.leaseToken !== normalizedLeaseToken) {
+        throw new DomainError(
+          'AUTO_BOOST_LEASE_MISMATCH',
+          'Auto Boost occurrence lease belongs to another worker',
+          { occurrenceId: normalizedId },
+        );
+      }
+      if (!current.leaseExpiresAt || Date.parse(current.leaseExpiresAt) <= Date.parse(at)) {
+        throw new DomainError(
+          'AUTO_BOOST_LEASE_EXPIRED',
+          'Auto Boost occurrence lease has expired',
+          { occurrenceId: normalizedId, leaseExpiresAt: current.leaseExpiresAt },
+        );
+      }
+
+      const result = this.db.prepare(`
+        UPDATE auto_boost_occurrences
+        SET status = ?, lease_token = NULL, lease_expires_at = NULL,
+            last_error = ?, updated_at = ?, completed_at = ?
+        WHERE id = ? AND status = 'PROCESSING' AND lease_token = ?
+          AND lease_expires_at > ?
+      `).run(
+        normalizedStatus,
+        normalizedError,
+        at,
+        at,
+        normalizedId,
+        normalizedLeaseToken,
+        at,
+      );
+      if (result.changes !== 1) {
+        throw new DomainError(
+          'CONCURRENT_MODIFICATION',
+          'Auto Boost occurrence lease changed concurrently',
+          { occurrenceId: normalizedId },
+        );
+      }
+      this.#insertAudit({
+        eventType: `AUTO_BOOST_OCCURRENCE_${normalizedStatus}`,
+        actorType: 'SYSTEM',
+        occurredAt: at,
+        details: {
+          occurrenceId: current.id,
+          clientId: current.clientId,
+          revision: current.revision,
+          activationGeneration: current.activationGeneration,
+          phase: current.phase,
+          attemptCount: current.attemptCount,
+          status: normalizedStatus,
+          error: normalizedError,
+        },
+      });
+      return this.getAutoBoostOccurrence(normalizedId);
+    });
+  }
+
+  listAutoBoostOccurrences({
+    clientId,
+    revision,
+    activationGeneration,
+    localDate: occurrenceLocalDate,
+    status,
+    phase,
+    limit = 100,
+  } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new DomainError('INVALID_REQUEST', 'limit must be between 1 and 1000');
+    }
+    const clauses = [];
+    const parameters = [];
+    if (clientId !== undefined) {
+      clauses.push('client_id = ?');
+      parameters.push(requiredString(clientId, 'clientId'));
+    }
+    if (revision !== undefined) {
+      clauses.push('revision = ?');
+      parameters.push(positiveInteger(revision, 'revision'));
+    }
+    if (activationGeneration !== undefined) {
+      clauses.push('activation_generation = ?');
+      parameters.push(positiveInteger(activationGeneration, 'activationGeneration'));
+    }
+    if (occurrenceLocalDate !== undefined) {
+      clauses.push('local_date = ?');
+      parameters.push(localDate(occurrenceLocalDate));
+    }
+    if (status !== undefined) {
+      const normalizedStatus = requiredString(status, 'status');
+      const allowed = new Set([
+        'PENDING', 'PROCESSING', 'DRY_RUN_COMPLETED', 'OUTCOME_UNKNOWN', 'SKIPPED',
+        'FAILED', 'CANCELLED',
+      ]);
+      if (!allowed.has(normalizedStatus)) {
+        throw new DomainError('INVALID_REQUEST', 'status is not a valid Auto Boost status');
+      }
+      clauses.push('status = ?');
+      parameters.push(normalizedStatus);
+    }
+    if (phase !== undefined) {
+      const normalizedPhase = requiredString(phase, 'phase');
+      if (!['BOOST', 'RESTORE'].includes(normalizedPhase)) {
+        throw new DomainError('INVALID_REQUEST', 'phase must be BOOST or RESTORE');
+      }
+      clauses.push('phase = ?');
+      parameters.push(normalizedPhase);
+    }
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
+    return this.db.prepare(`
+      ${this.#autoBoostOccurrenceSelect()}
+      ${where}
+      ORDER BY due_at ASC,
+        CASE phase WHEN 'RESTORE' THEN 0 ELSE 1 END ASC,
+        id ASC
+      LIMIT ?
+    `).all(...parameters, limit).map((row) => this.#mapAutoBoostOccurrence(row));
   }
 
   appendAuditEvent(input) {

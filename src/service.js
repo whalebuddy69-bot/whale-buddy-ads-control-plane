@@ -12,6 +12,8 @@ import {
 } from "./line.js";
 import { fromMinor, toMinor } from "./money.js";
 import {
+  buildAutoBoostDryRunOccurrenceMessage,
+  buildAutoBoostStatusMessage,
   buildControlConfirmationMessage,
   buildControlMenuMessage,
   buildCouponReminderMessage,
@@ -22,6 +24,14 @@ import {
   parseControlCommand,
   parseControlPostbackData
 } from "./line-controls.js";
+import {
+  bangkokLocalDate,
+  buildBangkokDailyIntervals,
+  calculateAutoBoostTargetMinor,
+  mergeEffectiveIntervals,
+  percentToBasisPoints,
+  validateAutoBoostWindows
+} from "./auto-boost.js";
 import {
   TELEMETRY_UI_SCHEMA_FINGERPRINT_V1,
   TELEMETRY_UI_SCHEMA_FINGERPRINT_V2,
@@ -407,6 +417,228 @@ export class BudgetGuardService {
       );
     }
     return normalized;
+  }
+
+  #autoBoostPolicy(client) {
+    if (client.lineControl?.enabled !== true) {
+      throw new DomainError(
+        "LINE_CONTROLS_DISABLED",
+        `ระบบควบคุมผ่าน LINE ของ ${client.name} ถูกปิดอยู่`
+      );
+    }
+    const policy = client.lineControl?.autoBoost;
+    if (!policy || policy.enabled !== true) {
+      throw new DomainError(
+        "AUTO_BOOST_DISABLED",
+        `Auto Boost ยังไม่ได้เปิดใช้งานในนโยบายของ ${client.name}`
+      );
+    }
+    if (client.timezone !== "Asia/Bangkok") {
+      throw new DomainError(
+        "AUTO_BOOST_TIMEZONE_UNSUPPORTED",
+        "Auto Boost รุ่น Pilot รองรับเขตเวลา Asia/Bangkok เท่านั้น"
+      );
+    }
+    return policy;
+  }
+
+  #autoBoostCommandContext(event, eventId) {
+    const sourceEventId = String(eventId ?? webhookEventId(event));
+    const durableEvent = this.store.getWebhookEvent("LINE", sourceEventId);
+    if (!Number.isSafeInteger(durableEvent?.sequence) || durableEvent.sequence < 1) {
+      throw new DomainError(
+        "AUTO_BOOST_COMMAND_NOT_DURABLE",
+        "คำสั่ง Auto Boost ยังไม่ได้ถูกบันทึกอย่างปลอดภัย กรุณาส่งใหม่"
+      );
+    }
+    const timestamp = durableEvent.payload?.timestamp;
+    return {
+      sourceEventId,
+      commandSequence: durableEvent.sequence,
+      commandTimestampMs: Number.isSafeInteger(timestamp) && timestamp >= 0
+        ? timestamp
+        : null
+    };
+  }
+
+  #prepareAutoBoostProfile(client, command) {
+    const policy = this.#autoBoostPolicy(client);
+    if (command.boostPercent !== policy.boostPercent) {
+      throw new DomainError(
+        "AUTO_BOOST_PERCENT_OUT_OF_POLICY",
+        `Pilot นี้กำหนดให้เพิ่มจากงบฐาน ${policy.boostPercent}% เท่านั้น`
+      );
+    }
+    if (command.leadMinutes !== policy.leadMinutes) {
+      throw new DomainError(
+        "AUTO_BOOST_LEAD_OUT_OF_POLICY",
+        `Pilot นี้กำหนดให้เริ่มก่อน ${policy.leadMinutes} นาทีเท่านั้น`
+      );
+    }
+    if (command.windows.length > policy.maxWindows) {
+      throw new DomainError(
+        "AUTO_BOOST_TOO_MANY_WINDOWS",
+        `ตั้งช่วงเวลาได้ไม่เกิน ${policy.maxWindows} ช่วงต่อวัน`
+      );
+    }
+
+    let normalized;
+    try {
+      normalized = validateAutoBoostWindows(command.windows);
+    } catch (error) {
+      throw new DomainError("AUTO_BOOST_INVALID_WINDOWS", error.message);
+    }
+    const liveStart = timeMinutes(client.liveWindow.start);
+    const liveEnd = timeMinutes(client.liveWindow.end);
+    if (liveStart >= liveEnd) {
+      throw new DomainError(
+        "AUTO_BOOST_LIVE_WINDOW_UNSUPPORTED",
+        "Auto Boost รุ่น Pilot ยังไม่รองรับ LIVE ที่ข้ามวัน"
+      );
+    }
+    for (const window of normalized) {
+      if (window.startMinute < liveStart || window.endMinute > liveEnd) {
+        throw new DomainError(
+          "AUTO_BOOST_OUTSIDE_LIVE_WINDOW",
+          `ช่วงเวลา Auto Boost ต้องอยู่ภายในเวลา LIVE ${client.liveWindow.start}–${client.liveWindow.end}`
+        );
+      }
+      if (window.startMinute < command.leadMinutes) {
+        throw new DomainError(
+          "AUTO_BOOST_PREVIOUS_DAY_UNSUPPORTED",
+          "Auto Boost รุ่น Pilot ยังไม่รองรับเวลาเริ่มที่ทำให้ช่วงล่วงหน้าข้ามไปวันก่อน"
+        );
+      }
+    }
+
+    const baseBudgetMinor = this.#validateControlBudget(client, command.baseBudget);
+    const boostBps = percentToBasisPoints(command.boostPercent);
+    const targetBudgetMinor = calculateAutoBoostTargetMinor(baseBudgetMinor, boostBps);
+    const policyCapMinor = toMinor(
+      client.budgetPolicy.maxDailyBudget,
+      client.campaignSelector.currency
+    );
+    if (targetBudgetMinor > policyCapMinor) {
+      throw new DomainError(
+        "AUTO_BOOST_POLICY_CAP_EXCEEDED",
+        `งบช่วงพิเศษเกินเพดาน ${client.budgetPolicy.maxDailyBudget} THB กรุณาลดงบฐาน`
+      );
+    }
+    const originalWindows = normalized.map(({ start, end }) => ({ start, end }));
+    const mergedWindows = mergeEffectiveIntervals(originalWindows, command.leadMinutes);
+    return {
+      baseBudgetMinor,
+      targetBudgetMinor,
+      policyCapMinor,
+      boostBps,
+      leadMinutes: command.leadMinutes,
+      originalWindows,
+      mergedWindows
+    };
+  }
+
+  #assertAutoBoostProfileCurrent(client, profile) {
+    const policy = this.#autoBoostPolicy(client);
+    const policyCapMinor = toMinor(
+      client.budgetPolicy.maxDailyBudget,
+      client.campaignSelector.currency
+    );
+    const expectedBoostBps = percentToBasisPoints(policy.boostPercent);
+    const expectedTargetMinor = calculateAutoBoostTargetMinor(
+      profile.baseBudgetMinor,
+      expectedBoostBps
+    );
+    let normalizedWindows = [];
+    try {
+      normalizedWindows = validateAutoBoostWindows(profile.originalWindows);
+    } catch {
+      normalizedWindows = [];
+    }
+    const liveStart = timeMinutes(client.liveWindow.start);
+    const liveEnd = timeMinutes(client.liveWindow.end);
+    const windowsMatchPolicy = normalizedWindows.length === profile.originalWindows.length
+      && liveStart < liveEnd
+      && normalizedWindows.every((window) =>
+        window.startMinute >= liveStart
+        && window.endMinute <= liveEnd
+        && window.startMinute >= profile.leadMinutes
+      );
+    const expectedMergedWindows = windowsMatchPolicy
+      ? mergeEffectiveIntervals(profile.originalWindows, profile.leadMinutes)
+      : [];
+    if (
+      profile.executionMode !== "DRY_RUN"
+      || profile.boostBps !== expectedBoostBps
+      || profile.leadMinutes !== policy.leadMinutes
+      || profile.originalWindows.length > policy.maxWindows
+      || profile.policyCapMinor !== policyCapMinor
+      || profile.baseBudgetMinor < toMinor(
+        client.lineControl.minDailyBudget,
+        client.campaignSelector.currency
+      )
+      || profile.targetBudgetMinor !== expectedTargetMinor
+      || profile.targetBudgetMinor > policyCapMinor
+      || !windowsMatchPolicy
+      || JSON.stringify(profile.mergedWindows) !== JSON.stringify(expectedMergedWindows)
+    ) {
+      throw new DomainError(
+        "AUTO_BOOST_POLICY_CHANGED",
+        "นโยบาย Auto Boost เปลี่ยนแล้ว กรุณาปิดและส่งตาราง Auto Boost ใหม่"
+      );
+    }
+    if (!this.#isCurrentApprover(client, profile.ownerLineUserId)) {
+      throw new DomainError(
+        "LINE_NOT_AUTHORIZED",
+        "ผู้ตั้ง Auto Boost ไม่ได้เป็นผู้อนุมัติของบัญชีนี้แล้ว"
+      );
+    }
+    return profile;
+  }
+
+  #materializeAutoBoostToday(client, profile, at = this.now()) {
+    this.#assertAutoBoostProfileCurrent(client, profile);
+    if (!profile.enabled) return [];
+    const localDate = bangkokLocalDate(at);
+    const intervals = buildBangkokDailyIntervals({
+      localDate,
+      windows: profile.originalWindows,
+      leadMinutes: profile.leadMinutes
+    });
+    return this.store.materializeAutoBoostOccurrences({
+      clientId: client.id,
+      localDate,
+      intervals,
+      now: at,
+      deadlineMinutes: profile.leadMinutes
+    });
+  }
+
+  #autoBoostStatusMessage(client, profile) {
+    const nowMs = this.now().getTime();
+    const occurrences = profile.activationGeneration > 0
+      ? this.store.listAutoBoostOccurrences({
+          clientId: client.id,
+          revision: profile.revision,
+          activationGeneration: profile.activationGeneration,
+          limit: 1_000
+        })
+      : [];
+    const nextAction = occurrences.find((item) => {
+      const matchingBoost = item.phase === "RESTORE"
+        ? occurrences.find((candidate) =>
+            candidate.phase === "BOOST" && candidate.blockIndex === item.blockIndex
+          )
+        : null;
+      const requiredRestore = item.phase === "RESTORE"
+        && new Set(["PROCESSING", "DRY_RUN_COMPLETED", "OUTCOME_UNKNOWN"])
+          .has(matchingBoost?.status);
+      return (
+          new Set(["PENDING", "PROCESSING"]).has(item.status)
+          && (Date.parse(item.deadlineAt) >= nowMs || requiredRestore)
+          && (profile.enabled || item.phase === "RESTORE")
+      );
+    });
+    return buildAutoBoostStatusMessage({ client, plan: profile, nextAction });
   }
 
   #createControlRequest({ client, userId, action, desired, before = null, source = "LINE", requestId = null }) {
@@ -1545,6 +1777,76 @@ export class BudgetGuardService {
         }));
         return true;
       }
+      if (command.kind === "auto_boost_status") {
+        this.#autoBoostPolicy(client);
+        const profile = this.store.getAutoBoostProfile({ clientId: client.id });
+        await this.#replyControlDurably(
+          event.replyToken,
+          profile
+            ? this.#autoBoostStatusMessage(client, profile)
+            : {
+                type: "text",
+                text: `ยังไม่ได้ตั้ง Auto Boost ของ ${client.name}\nพิมพ์ “วิธีใช้ ${client.lineControl.aliases[0]}” เพื่อดูรูปแบบคำสั่ง`
+              }
+        );
+        return true;
+      }
+      if (command.kind === "auto_boost_upsert") {
+        const prepared = this.#prepareAutoBoostProfile(client, command);
+        const commandContext = this.#autoBoostCommandContext(event, eventId);
+        const profile = this.store.saveAutoBoostProfile({
+          clientId: client.id,
+          ...prepared,
+          ...commandContext,
+          ownerLineUserId: userId,
+          executionMode: "DRY_RUN",
+          now: this.now()
+        });
+        const applied = profile.lastCommandSequence === commandContext.commandSequence;
+        await this.#replyControlDurably(event.replyToken, [
+          {
+            type: "text",
+            text: applied
+              ? "✅ บันทึกตาราง Auto Boost แล้ว โดยเริ่มต้นเป็น OFF กรุณาตรวจแล้วกดเปิดจากปุ่มด้านล่าง"
+              : "ℹ️ ข้ามคำสั่ง Auto Boost เก่าแล้ว แสดงสถานะล่าสุดของระบบแทน"
+          },
+          this.#autoBoostStatusMessage(client, profile)
+        ]);
+        return true;
+      }
+      if (command.kind === "auto_boost_toggle") {
+        const profile = this.store.getAutoBoostProfile({ clientId: client.id });
+        if (!profile) {
+          throw new DomainError(
+            "AUTO_BOOST_PROFILE_NOT_FOUND",
+            "ยังไม่มีตาราง Auto Boost กรุณาตั้งตารางก่อนเปิดใช้งาน"
+          );
+        }
+        if (command.enabled) this.#assertAutoBoostProfileCurrent(client, profile);
+        const commandContext = this.#autoBoostCommandContext(event, eventId);
+        const updated = this.store.setAutoBoostEnabled({
+          clientId: client.id,
+          enabled: command.enabled,
+          expectedRevision: profile.revision,
+          lineUserId: userId,
+          ...commandContext,
+          now: this.now()
+        });
+        const applied = updated.lastCommandSequence === commandContext.commandSequence;
+        if (applied && updated.enabled) this.#materializeAutoBoostToday(client, updated, this.now());
+        await this.#replyControlDurably(event.replyToken, [
+          {
+            type: "text",
+            text: !applied
+              ? "ℹ️ ข้ามคำสั่ง Auto Boost เก่าแล้ว แสดงสถานะล่าสุดของระบบแทน"
+              : updated.enabled
+                ? `🟢 เปิด Auto Boost แล้ว ระบบจะจำลองเพิ่ม ${updated.boostBps / 100}% ก่อนแต่ละช่วง ${updated.leadMinutes} นาที และจำลองคืนงบเมื่อจบ`
+                : "⚪ ปิด Auto Boost แล้ว ระบบยกเลิกรอบเพิ่มงบในอนาคต ส่วนรอบที่เริ่มแล้วจะยังจำลองคืนงบให้ครบ"
+          },
+          this.#autoBoostStatusMessage(client, updated)
+        ]);
+        return true;
+      }
       if (command.kind === "report_subscribe") {
         if (
           command.intervalHours < client.lineControl.minReportIntervalHours
@@ -1680,7 +1982,7 @@ export class BudgetGuardService {
       const safe = safeError(error);
       await this.#replyControlDurably(event.replyToken, {
         type: "text",
-        text: `คำสั่งยังทำไม่ได้: ${safe.message}`
+        text: `${command.kind.startsWith("auto_boost_") ? "🧪 DRY-RUN — " : ""}คำสั่งยังทำไม่ได้: ${safe.message}`
       });
       return true;
     }
@@ -1972,7 +2274,9 @@ export class BudgetGuardService {
   #controlCommandAlreadyApplied(command, eventId) {
     const control = command.command;
     const client = this.#lineControlClient(control.clientAlias, command.userId);
-    if (new Set(["menu", "help", "status", "shortcut_list"]).has(control.kind)) return true;
+    if (new Set(["menu", "help", "status", "shortcut_list", "auto_boost_status"]).has(control.kind)) {
+      return true;
+    }
     if (new Set(["action", "coupon_schedule"]).has(control.kind)) {
       return Boolean(this.store.getCampaignControlRequest(controlRequestIdForEvent(eventId)));
     }
@@ -2007,6 +2311,15 @@ export class BudgetGuardService {
           client,
           control.topUpThresholdPercent
         );
+    }
+    if (control.kind === "auto_boost_upsert") {
+      const profile = this.store.getAutoBoostProfile({ clientId: client.id });
+      return profile?.sourceEventId === String(eventId);
+    }
+    if (control.kind === "auto_boost_toggle") {
+      const profile = this.store.getAutoBoostProfile({ clientId: client.id });
+      return profile?.lastToggleSourceEventId === String(eventId)
+        && profile.enabled === control.enabled;
     }
     // Cancelling pending coupon schedules is itself idempotent.
     if (control.kind === "coupon_cancel") return false;
@@ -2060,6 +2373,18 @@ export class BudgetGuardService {
       } else if (control.kind === "status") {
         const { snapshot, stale } = this.#latestControlSnapshot(client);
         message = buildPerformanceReportMessage({ client, snapshot, stale, now: this.now() });
+      } else if (new Set([
+        "auto_boost_status",
+        "auto_boost_upsert",
+        "auto_boost_toggle"
+      ]).has(control.kind)) {
+        const profile = this.store.getAutoBoostProfile({ clientId: client.id });
+        message = profile
+          ? this.#autoBoostStatusMessage(client, profile)
+          : {
+              type: "text",
+              text: `ไม่พบตาราง Auto Boost ของ ${client.name} กรุณาส่งคำสั่งตั้งตารางใหม่`
+            };
       } else if (new Set(["shortcut_list", "shortcut_upsert"]).has(control.kind)) {
         message = buildShortcutListMessage({
           client,
@@ -2249,11 +2574,34 @@ export class BudgetGuardService {
     return outcomes;
   }
 
-  async processScheduledLineControls({ reportLimit = 100, couponLimit = 20 } = {}) {
+  async processScheduledLineControls({
+    reportLimit = 100,
+    couponLimit = 20,
+    autoBoostLimit = 40
+  } = {}) {
     const outcomes = [];
-    // Coupon boosts are time-critical, so they are always claimed before
-    // periodic reports. Each item gets a fresh clock rather than inheriting a
-    // stale cycle timestamp after slow LINE requests.
+    // Auto Boost is materialized deterministically for the current Bangkok
+    // date. Re-running this on every worker cycle is safe across restarts.
+    for (const client of this.config.clients) {
+      const profile = client.lineControl?.enabled === true
+        && client.lineControl?.autoBoost?.enabled === true
+        ? this.store.getAutoBoostProfile({ clientId: client.id })
+        : null;
+      if (!profile?.enabled) continue;
+      try {
+        this.#materializeAutoBoostToday(client, profile, this.now());
+      } catch (error) {
+        outcomes.push({
+          type: "AUTO_BOOST",
+          clientId: client.id,
+          status: "MATERIALIZE_SKIPPED",
+          error: safeError(error)
+        });
+      }
+    }
+
+    // Coupon reminders get the first LINE delivery slot so a degraded LINE API
+    // cannot let a batch of Auto Boost retries hold them past their event.
     for (const schedule of this.store.claimDueCouponSchedules({
       now: this.now(),
       limit: couponLimit
@@ -2307,6 +2655,251 @@ export class BudgetGuardService {
           type: "COUPON",
           clientId: schedule.clientId,
           status: "FAILED",
+          error: safeError(error)
+        });
+      }
+    }
+
+    // The pilot deliberately sends only LINE DRY-RUN messages and never calls
+    // TikTok. Auto Boost still runs before lower-priority periodic reports.
+    for (const occurrence of this.store.claimDueAutoBoostOccurrences({
+      now: this.now(),
+      limit: autoBoostLimit
+    })) {
+      const client = this.#clientById(occurrence.clientId);
+      const profile = this.store.getAutoBoostProfile({ clientId: occurrence.clientId });
+      let deliveryAttempted = false;
+      try {
+        if (!profile) {
+          throw new DomainError("AUTO_BOOST_PROFILE_MISSING", "Auto Boost profile is no longer available");
+        }
+        if (occurrence.phase === "BOOST") {
+          const blockingRestore = this.store.getBlockingAutoBoostRestore({
+            clientId: occurrence.clientId,
+            beforeAt: occurrence.dueAt
+          });
+          if (blockingRestore) {
+            this.store.releaseAutoBoostOccurrence({
+              id: occurrence.id,
+              leaseToken: occurrence.leaseToken,
+              now: this.now(),
+              error: `Waiting for required RESTORE (${blockingRestore.id})`
+            });
+            outcomes.push({
+              type: "AUTO_BOOST",
+              clientId: occurrence.clientId,
+              phase: occurrence.phase,
+              status: "DEFERRED_WAITING_FOR_RESTORE"
+            });
+            continue;
+          }
+          const markOutcomeUnknown = (reason) => {
+            this.store.finishAutoBoostOccurrence({
+              id: occurrence.id,
+              leaseToken: occurrence.leaseToken,
+              status: "OUTCOME_UNKNOWN",
+              now: this.now(),
+              error: reason
+            });
+            outcomes.push({
+              type: "AUTO_BOOST",
+              clientId: occurrence.clientId,
+              phase: occurrence.phase,
+              status: "OUTCOME_UNKNOWN"
+            });
+          };
+          if (!profile.enabled) {
+            if (occurrence.attemptCount > 1) {
+              markOutcomeUnknown("BOOST was already attempted before Auto Boost was disabled");
+              continue;
+            }
+            throw new DomainError("AUTO_BOOST_PROFILE_DISABLED", "Auto Boost is no longer enabled");
+          }
+          if (!client) {
+            if (occurrence.attemptCount > 1) {
+              markOutcomeUnknown("BOOST was already attempted before its client configuration disappeared");
+              continue;
+            }
+            throw new DomainError("CLIENT_NOT_FOUND", "Auto Boost client is no longer configured");
+          }
+          try {
+            this.#assertAutoBoostProfileCurrent(client, profile);
+          } catch (error) {
+            if (occurrence.attemptCount > 1) {
+              markOutcomeUnknown(
+                `BOOST was already attempted before its policy changed: ${error?.message ?? error}`
+              );
+              continue;
+            }
+            throw error;
+          }
+        } else {
+          if (profile.executionMode !== "DRY_RUN") {
+            throw new DomainError(
+              "AUTO_BOOST_EXECUTION_MODE_UNSAFE",
+              "Auto Boost restore drain must remain DRY-RUN"
+            );
+          }
+        }
+        if (
+          occurrence.revision !== profile.revision
+          || occurrence.activationGeneration !== profile.activationGeneration
+        ) {
+          throw new DomainError(
+            "AUTO_BOOST_OCCURRENCE_STALE",
+            "Auto Boost occurrence belongs to an older profile activation"
+          );
+        }
+        if (occurrence.phase === "RESTORE") {
+          const matchingBoost = this.store.listAutoBoostOccurrences({
+            clientId: occurrence.clientId,
+            revision: occurrence.revision,
+            activationGeneration: occurrence.activationGeneration,
+            localDate: occurrence.localDate,
+            phase: "BOOST",
+            limit: 1_000
+          }).find((candidate) => candidate.blockIndex === occurrence.blockIndex);
+          if (new Set(["PENDING", "PROCESSING"]).has(matchingBoost?.status)) {
+            this.store.releaseAutoBoostOccurrence({
+              id: occurrence.id,
+              leaseToken: occurrence.leaseToken,
+              now: this.now(),
+              error: `Waiting for matching BOOST (${matchingBoost.status})`
+            });
+            outcomes.push({
+              type: "AUTO_BOOST",
+              clientId: occurrence.clientId,
+              phase: occurrence.phase,
+              status: "DEFERRED_WAITING_FOR_BOOST"
+            });
+            continue;
+          }
+          if (!new Set(["DRY_RUN_COMPLETED", "OUTCOME_UNKNOWN"]).has(matchingBoost?.status)) {
+            throw new DomainError(
+              "AUTO_BOOST_RESTORE_WITHOUT_BOOST",
+              "ข้ามการจำลองคืนงบ เพราะรอบเพิ่มงบที่ตรงกันไม่เคยสำเร็จ"
+            );
+          }
+        }
+        const currentApprovers = client ? this.#approversForClient(client) : [];
+        const notificationLineUserIds = client
+          ? [...new Set([
+              ...(currentApprovers.includes(profile.ownerLineUserId)
+                ? [profile.ownerLineUserId]
+                : []),
+              ...currentApprovers
+            ])]
+          : [];
+        if (notificationLineUserIds.length === 0) {
+          this.store.finishAutoBoostOccurrence({
+            id: occurrence.id,
+            leaseToken: occurrence.leaseToken,
+            status: "DRY_RUN_COMPLETED",
+            now: this.now(),
+            error: "Safety RESTORE simulated without LINE notification: no current approver"
+          });
+          outcomes.push({
+            type: "AUTO_BOOST",
+            clientId: occurrence.clientId,
+            phase: occurrence.phase,
+            status: "DRY_RUN_COMPLETED_NO_RECIPIENT"
+          });
+          continue;
+        }
+        const message = buildAutoBoostDryRunOccurrenceMessage({ client, plan: profile, occurrence });
+        const permanentErrors = [];
+        let delivered = false;
+        for (const notificationLineUserId of notificationLineUserIds) {
+          const retryKey = stableRetryKey(
+            "auto-boost-dry-run",
+            occurrence.id,
+            notificationLineUserId
+          );
+          deliveryAttempted = true;
+          try {
+            await this.line.push(notificationLineUserId, message, retryKey);
+            delivered = true;
+            break;
+          } catch (error) {
+            const permanentlyRejected = error?.recipientPermanent === true;
+            if (!permanentlyRejected) throw error;
+            permanentErrors.push(`${notificationLineUserId}: ${error?.message ?? error}`);
+          }
+        }
+        if (!delivered) {
+          const error = `LINE permanently rejected every current approver: ${permanentErrors.join(" | ")}`;
+          const terminalStatus = occurrence.phase === "RESTORE" ? "DRY_RUN_COMPLETED" : "FAILED";
+          this.store.finishAutoBoostOccurrence({
+            id: occurrence.id,
+            leaseToken: occurrence.leaseToken,
+            status: terminalStatus,
+            now: this.now(),
+            error
+          });
+          outcomes.push({
+            type: "AUTO_BOOST",
+            clientId: occurrence.clientId,
+            phase: occurrence.phase,
+            status: occurrence.phase === "RESTORE"
+              ? "DRY_RUN_COMPLETED_NO_RECIPIENT"
+              : "LINE_REJECTED"
+          });
+          continue;
+        }
+        this.store.finishAutoBoostOccurrence({
+          id: occurrence.id,
+          leaseToken: occurrence.leaseToken,
+          status: "DRY_RUN_COMPLETED",
+          now: this.now()
+        });
+        outcomes.push({
+          type: "AUTO_BOOST",
+          clientId: client.id,
+          phase: occurrence.phase,
+          status: "DRY_RUN_COMPLETED"
+        });
+      } catch (error) {
+        if (deliveryAttempted) {
+          this.store.appendAuditEvent({
+            eventType: "AUTO_BOOST_LINE_DELIVERY_FAILED",
+            actorType: "SYSTEM",
+            occurredAt: this.now(),
+            details: {
+              occurrenceId: occurrence.id,
+              clientId: occurrence.clientId,
+              phase: occurrence.phase,
+              status: Number.isInteger(Number(error?.status)) ? Number(error.status) : null,
+              retryable: error?.retryable !== false,
+              error: String(error?.message ?? error).slice(0, 500)
+            }
+          });
+          this.logger.error("auto boost LINE delivery failed", {
+            occurrenceId: occurrence.id,
+            phase: occurrence.phase,
+            error: error?.message ?? error
+          });
+        }
+        if (!deliveryAttempted) {
+          try {
+            this.store.finishAutoBoostOccurrence({
+              id: occurrence.id,
+              leaseToken: occurrence.leaseToken,
+              status: "SKIPPED",
+              now: this.now(),
+              error: error?.message ?? error
+            });
+          } catch (finishError) {
+            this.logger.error("auto boost skip finalization failed", {
+              occurrenceId: occurrence.id,
+              error: finishError?.message ?? finishError
+            });
+          }
+        }
+        outcomes.push({
+          type: "AUTO_BOOST",
+          clientId: occurrence.clientId,
+          phase: occurrence.phase,
+          status: deliveryAttempted ? "LINE_RETRY_PENDING" : "SKIPPED",
           error: safeError(error)
         });
       }

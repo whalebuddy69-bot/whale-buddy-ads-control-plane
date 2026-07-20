@@ -307,8 +307,18 @@ export class LineClient {
     }
     if (!response.ok) {
       const body = await response.text();
+      let lineError = null;
+      try {
+        lineError = JSON.parse(body);
+      } catch {
+        // LINE occasionally returns a non-JSON proxy response; retain only the
+        // bounded text already included in the Error message below.
+      }
       const error = new Error(`LINE API ${response.status}: ${body.slice(0, 500)}`);
       error.status = response.status;
+      error.retryable = response.status === 429 || response.status >= 500;
+      error.recipientPermanent = response.status === 400
+        && lineError?.details?.some((detail) => detail?.property === "to") === true;
       throw error;
     }
     return { duplicate: false };

@@ -66,6 +66,17 @@
         "maxDailyBudget": 6000,
         "effectiveFrom": "2026-07-19",
         "revision": 1
+      },
+      "lineControl": {
+        "enabled": true,
+        "aliases": ["Ppan"],
+        "minDailyBudget": 100,
+        "autoBoost": {
+          "enabled": true,
+          "boostPercent": 10,
+          "leadMinutes": 10,
+          "maxWindows": 24
+        }
       }
     }
   ]
