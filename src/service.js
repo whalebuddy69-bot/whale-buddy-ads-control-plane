@@ -12,8 +12,15 @@ import {
 } from "./line.js";
 import { fromMinor, toMinor } from "./money.js";
 import {
+  buildAgencyClientPickerMessage,
+  buildAgencyControlMenuMessage,
+  buildAgencyPerformanceReportMessage,
   buildAutoBoostDryRunOccurrenceMessage,
+  buildAutoBoostSetupTemplateMessage,
   buildAutoBoostStatusMessage,
+  buildCampaignAdjustmentMessage,
+  buildCampaignCreateTemplateMessage,
+  buildCampaignPauseChoicesMessage,
   buildControlConfirmationMessage,
   buildControlMenuMessage,
   buildCouponReminderMessage,
@@ -126,6 +133,11 @@ function normalizedLineCommand(event) {
         sourceType: event.source?.type ?? null
       };
     }
+    return {
+      kind: "control_fallback",
+      userId,
+      sourceType: event.source?.type ?? null
+    };
   }
   return null;
 }
@@ -326,6 +338,136 @@ export class BudgetGuardService {
 
   #isCurrentApprover(client, userId) {
     return this.#approversForClient(client).includes(userId);
+  }
+
+  #authorizedLineControlClients(userId) {
+    if (!userId) return [];
+    return this.config.clients
+      .filter((client) => client.lineControl?.enabled === true && this.#isCurrentApprover(client, userId))
+      .sort((left, right) => {
+        const leftName = left.lineControl?.aliases?.[0] ?? left.name ?? left.id;
+        const rightName = right.lineControl?.aliases?.[0] ?? right.name ?? right.id;
+        return String(leftName).localeCompare(String(rightName), "th");
+      });
+  }
+
+  #privateChatOnlyMessage() {
+    return {
+      type: "text",
+      text: "กรุณาใช้คำสั่งควบคุมโฆษณาในแชตส่วนตัวกับ LINE OA เท่านั้น"
+    };
+  }
+
+  #lineControlPairingRequiredMessage() {
+    return {
+      type: "text",
+      text: "LINE นี้ยังไม่มีสิทธิ์ใช้คำสั่งดังกล่าว กรุณาเลือกบัญชีจากเมนูหรือขอรหัสจับคู่จากผู้ดูแลระบบ"
+    };
+  }
+
+  #lineControlSelectionRequiredMessage() {
+    return {
+      type: "text",
+      text: "ไม่สามารถใช้บัญชีจากคำสั่งนี้ได้ กรุณาเลือกบัญชีจากเมนู"
+    };
+  }
+
+  #invalidControlTemplateMessage(template) {
+    const text = template === "shortcut"
+      ? "Template Shortcut ยังไม่ครบ 5 บรรทัด กรุณาตรวจชื่อ, งบ, ROI และจุดเติมงบ หรือกดสร้างแคมเปญใหม่จากเมนู"
+      : template === "auto_boost"
+        ? "Template Auto Boost ยังไม่ครบ กรุณาตรวจงบฐาน, เปอร์เซ็นต์, นาทีล่วงหน้า และช่วงเวลา หรือกด Auto Boost จากเมนู"
+        : "คำสั่งปรับค่ายังไม่ถูกรูปแบบ จำนวนต้องเป็นเลขบวก กรุณาคัดลอก Template จากเมนู “ปรับเพิ่ม / ลด”";
+    return {
+      type: "text",
+      text,
+      quickReply: {
+        items: [{
+          type: "action",
+          action: { type: "message", label: "กลับเมนู", text: "เมนู" }
+        }]
+      }
+    };
+  }
+
+  #agencySnapshotEntries(clients) {
+    return clients.map((client) => {
+      const { snapshot, stale } = this.#latestControlSnapshot(client);
+      return { client, snapshot, stale };
+    });
+  }
+
+  #agencyCommandMessage(command, userId) {
+    if (!new Set(["agency_menu", "agency_report", "agency_section", "invalid_template"]).has(command?.kind)) {
+      return null;
+    }
+    const clients = this.#authorizedLineControlClients(userId);
+    if (clients.length === 0) return this.#lineControlPairingRequiredMessage();
+    if (command.kind === "invalid_template") {
+      return this.#invalidControlTemplateMessage(command.template);
+    }
+    if (command.kind === "agency_menu") {
+      return buildAgencyControlMenuMessage({ clients });
+    }
+    if (command.kind === "agency_report") {
+      return buildAgencyPerformanceReportMessage({
+        entries: this.#agencySnapshotEntries(clients),
+        now: this.now(),
+        page: command.page ?? 1
+      });
+    }
+    if (command.section === "close") {
+      const activeEntries = this.#agencySnapshotEntries(clients)
+        .filter(({ snapshot }) => snapshot?.campaignStatus === "ACTIVE");
+      return buildCampaignPauseChoicesMessage({
+        entries: activeEntries,
+        now: this.now(),
+        page: command.page ?? 1
+      });
+    }
+    if (new Set(["create", "adjust", "auto_boost"]).has(command.section)) {
+      return buildAgencyClientPickerMessage({
+        clients,
+        section: command.section,
+        page: command.page ?? 1
+      });
+    }
+    throw new DomainError("CONTROL_SECTION_UNSUPPORTED", "เมนูส่วนนี้ยังไม่รองรับ");
+  }
+
+  #controlFallbackMessage(userId) {
+    const clients = this.#authorizedLineControlClients(userId);
+    return clients.length > 0
+      ? buildAgencyControlMenuMessage({ clients })
+      : this.#lineControlPairingRequiredMessage();
+  }
+
+  #selectedControlPageMessage(command, client) {
+    if (command.kind === "campaign_create_template") {
+      return buildCampaignCreateTemplateMessage({
+        client,
+        shortcuts: this.store.listCampaignShortcuts({ clientId: client.id })
+      });
+    }
+    if (command.kind === "campaign_close_menu") {
+      const entry = { client, ...this.#latestControlSnapshot(client) };
+      return buildCampaignPauseChoicesMessage({
+        entries: entry.snapshot?.campaignStatus === "ACTIVE" ? [entry] : [],
+        now: this.now()
+      });
+    }
+    if (command.kind === "campaign_adjust_menu") {
+      const { snapshot, stale } = this.#latestControlSnapshot(client);
+      return buildCampaignAdjustmentMessage({ client, snapshot, stale, now: this.now() });
+    }
+    if (command.kind === "auto_boost_setup") {
+      this.#autoBoostPolicy(client);
+      const profile = this.store.getAutoBoostProfile({ clientId: client.id });
+      if (profile) return this.#autoBoostStatusMessage(client, profile);
+      const { snapshot, stale } = this.#latestControlSnapshot(client);
+      return buildAutoBoostSetupTemplateMessage({ client, snapshot, stale, now: this.now() });
+    }
+    return null;
   }
 
   #lineControlClient(alias, userId) {
@@ -721,6 +863,9 @@ export class BudgetGuardService {
     }
     if (command.action === "UPDATE_BUDGET") {
       if (!snapshot) throw new DomainError("TELEMETRY_UNAVAILABLE", "ยังไม่มีข้อมูลแคมเปญจาก Chrome reader");
+      if (stale) {
+        throw new DomainError("TELEMETRY_STALE", "ข้อมูลจาก Chrome reader เก่าเกินไป กรุณารอข้อมูลล่าสุดก่อนปรับงบ");
+      }
       return this.#createControlRequest({
         client,
         userId,
@@ -730,8 +875,43 @@ export class BudgetGuardService {
         requestId
       });
     }
+    if (command.action === "ADJUST_BUDGET") {
+      if (!snapshot) {
+        throw new DomainError("TELEMETRY_UNAVAILABLE", "ยังไม่มีข้อมูลแคมเปญจาก Chrome reader");
+      }
+      if (stale) {
+        throw new DomainError(
+          "TELEMETRY_STALE",
+          "ข้อมูลจาก Chrome reader เก่าเกินไป กรุณารอข้อมูลล่าสุดก่อนปรับงบ"
+        );
+      }
+      const direction = command.direction === -1 ? -1 : command.direction === 1 ? 1 : 0;
+      if (direction === 0) {
+        throw new DomainError("INVALID_REQUEST", "ทิศทางการปรับงบไม่ถูกต้อง");
+      }
+      const deltaMinor = toMinor(command.amount, client.campaignSelector.currency) * direction;
+      const targetMinor = snapshot.dailyBudgetMinor + deltaMinor;
+      const validatedTargetMinor = this.#validateControlBudget(
+        client,
+        fromMinor(targetMinor, client.campaignSelector.currency)
+      );
+      return this.#createControlRequest({
+        client,
+        userId,
+        action: command.action,
+        before,
+        desired: {
+          dailyBudgetMinor: validatedTargetMinor,
+          budgetDeltaMinor: deltaMinor
+        },
+        requestId
+      });
+    }
     if (command.action === "UPDATE_ROI") {
       if (!snapshot) throw new DomainError("TELEMETRY_UNAVAILABLE", "ยังไม่มีข้อมูลแคมเปญจาก Chrome reader");
+      if (stale) {
+        throw new DomainError("TELEMETRY_STALE", "ข้อมูลจาก Chrome reader เก่าเกินไป กรุณารอข้อมูลล่าสุดก่อนปรับ ROI");
+      }
       return this.#createControlRequest({
         client,
         userId,
@@ -743,6 +923,9 @@ export class BudgetGuardService {
     }
     if (new Set(["PAUSE", "RESUME"]).has(command.action)) {
       if (!snapshot) throw new DomainError("TELEMETRY_UNAVAILABLE", "ยังไม่มีข้อมูลแคมเปญจาก Chrome reader");
+      if (stale) {
+        throw new DomainError("TELEMETRY_STALE", "ข้อมูลจาก Chrome reader เก่าเกินไป กรุณารอข้อมูลล่าสุดก่อนเปลี่ยนสถานะ");
+      }
       return this.#createControlRequest({
         client,
         userId,
@@ -1749,16 +1932,26 @@ export class BudgetGuardService {
 
   async #handleControlCommand(event, userId, parsedCommand = null, eventId = null) {
     const command = parsedCommand ?? parseControlCommand(event.message?.text);
-    if (!command) return false;
     if (event.source?.type && event.source.type !== "user") {
-      await this.#replyControlDurably(event.replyToken, {
-        type: "text",
-        text: "กรุณาใช้คำสั่งควบคุมโฆษณาในแชตส่วนตัวกับ LINE OA เท่านั้น"
-      });
+      await this.#replyControlDurably(event.replyToken, this.#privateChatOnlyMessage());
+      return true;
+    }
+    if (!command) {
+      await this.#replyControlDurably(event.replyToken, this.#controlFallbackMessage(userId));
       return true;
     }
     try {
+      const agencyMessage = this.#agencyCommandMessage(command, userId);
+      if (agencyMessage) {
+        await this.#replyControlDurably(event.replyToken, agencyMessage);
+        return true;
+      }
       const client = this.#lineControlClient(command.clientAlias, userId);
+      const selectedPageMessage = this.#selectedControlPageMessage(command, client);
+      if (selectedPageMessage) {
+        await this.#replyControlDurably(event.replyToken, selectedPageMessage);
+        return true;
+      }
       if (command.kind === "menu") {
         await this.#replyControlDurably(event.replyToken, buildControlMenuMessage(client));
         return true;
@@ -1979,6 +2172,19 @@ export class BudgetGuardService {
       return false;
     } catch (error) {
       if (error?.code === "LINE_CONTROL_REPLY_FAILED") throw error;
+      if (new Set([
+        "CLIENT_NOT_FOUND",
+        "CLIENT_ALIAS_AMBIGUOUS",
+        "LINE_NOT_AUTHORIZED"
+      ]).has(error?.code)) {
+        await this.#replyControlDurably(
+          event.replyToken,
+          command.kind === "menu"
+            ? this.#controlFallbackMessage(userId)
+            : this.#lineControlSelectionRequiredMessage()
+        );
+        return true;
+      }
       const safe = safeError(error);
       await this.#replyControlDurably(event.replyToken, {
         type: "text",
@@ -2273,8 +2479,31 @@ export class BudgetGuardService {
 
   #controlCommandAlreadyApplied(command, eventId) {
     const control = command.command;
-    const client = this.#lineControlClient(control.clientAlias, command.userId);
-    if (new Set(["menu", "help", "status", "shortcut_list", "auto_boost_status"]).has(control.kind)) {
+    if (new Set(["agency_menu", "agency_report", "agency_section", "invalid_template"]).has(control.kind)) {
+      return true;
+    }
+    let client;
+    try {
+      client = this.#lineControlClient(control.clientAlias, command.userId);
+    } catch (error) {
+      if (new Set([
+        "CLIENT_NOT_FOUND",
+        "CLIENT_ALIAS_AMBIGUOUS",
+        "LINE_NOT_AUTHORIZED"
+      ]).has(error?.code)) return true;
+      throw error;
+    }
+    if (new Set([
+      "menu",
+      "help",
+      "status",
+      "shortcut_list",
+      "auto_boost_status",
+      "campaign_create_template",
+      "campaign_close_menu",
+      "campaign_adjust_menu",
+      "auto_boost_setup"
+    ]).has(control.kind)) {
       return true;
     }
     if (new Set(["action", "coupon_schedule"]).has(control.kind)) {
@@ -2356,70 +2585,96 @@ export class BudgetGuardService {
       } else {
         message = { type: "text", text: "ไม่พบคำสั่งที่ต้องกู้คืน กรุณาส่งคำสั่งใหม่อีกครั้ง" };
       }
+    } else if (command.kind === "control_fallback") {
+      if (command.sourceType && command.sourceType !== "user") return null;
+      message = this.#controlFallbackMessage(command.userId);
     } else if (command.kind === "control_command") {
       if (command.sourceType && command.sourceType !== "user") return null;
       const control = command.command;
-      let client;
-      try {
-        client = this.#lineControlClient(control.clientAlias, command.userId);
-      } catch (error) {
-        if (error?.code === "LINE_NOT_AUTHORIZED") return null;
-        throw error;
-      }
-      if (control.kind === "menu") {
-        message = buildControlMenuMessage(client);
-      } else if (control.kind === "help") {
-        message = { type: "text", text: controlHelpText(client) };
-      } else if (control.kind === "status") {
-        const { snapshot, stale } = this.#latestControlSnapshot(client);
-        message = buildPerformanceReportMessage({ client, snapshot, stale, now: this.now() });
-      } else if (new Set([
-        "auto_boost_status",
-        "auto_boost_upsert",
-        "auto_boost_toggle"
-      ]).has(control.kind)) {
-        const profile = this.store.getAutoBoostProfile({ clientId: client.id });
-        message = profile
-          ? this.#autoBoostStatusMessage(client, profile)
-          : {
-              type: "text",
-              text: `ไม่พบตาราง Auto Boost ของ ${client.name} กรุณาส่งคำสั่งตั้งตารางใหม่`
-            };
-      } else if (new Set(["shortcut_list", "shortcut_upsert"]).has(control.kind)) {
-        message = buildShortcutListMessage({
-          client,
-          shortcuts: this.store.listCampaignShortcuts({ clientId: client.id })
-        });
-      } else if (control.kind === "report_subscribe") {
-        const subscription = this.store.getReportSubscription({
-          clientId: client.id,
-          lineUserId: command.userId
-        });
-        message = {
-          type: "text",
-          text: subscription?.enabled
-            ? `✅ กู้คำสั่งแล้ว: รายงาน ${client.name} ทุก ${subscription.intervalMinutes / 60} ชั่วโมงเปิดอยู่`
-            : `ตั้งรายงาน ${client.name} ไม่สำเร็จ กรุณาส่งคำสั่งใหม่`
-        };
-      } else if (control.kind === "report_unsubscribe") {
-        const subscription = this.store.getReportSubscription({
-          clientId: client.id,
-          lineUserId: command.userId
-        });
-        message = {
-          type: "text",
-          text: !subscription?.enabled
-            ? `กู้คำสั่งแล้ว: รายงานตามเวลาของ ${client.name} ถูกหยุดแล้ว`
-            : `หยุดรายงาน ${client.name} ไม่สำเร็จ กรุณาส่งคำสั่งใหม่`
-        };
-      } else if (new Set(["action", "coupon_schedule"]).has(control.kind)) {
-        controlRequestId = controlRequestIdForEvent(eventId);
-        const request = this.store.getCampaignControlRequest(controlRequestId);
-        message = request
-          ? buildControlConfirmationMessage(request)
-          : { type: "text", text: `คำสั่ง ${client.name} ไม่ได้ถูกบันทึก กรุณาส่งคำสั่งใหม่` };
+      const agencyMessage = this.#agencyCommandMessage(control, command.userId);
+      if (agencyMessage) {
+        message = agencyMessage;
       } else {
-        message = { type: "text", text: `ระบบกู้คำสั่ง ${client.name} แล้ว กรุณาตรวจสถานะจากเมนู` };
+        let client;
+        try {
+          client = this.#lineControlClient(control.clientAlias, command.userId);
+        } catch (error) {
+          if (new Set([
+            "CLIENT_NOT_FOUND",
+            "CLIENT_ALIAS_AMBIGUOUS",
+            "LINE_NOT_AUTHORIZED"
+          ]).has(error?.code)) {
+            message = control.kind === "menu"
+              ? this.#controlFallbackMessage(command.userId)
+              : this.#lineControlSelectionRequiredMessage();
+            client = null;
+          } else {
+            throw error;
+          }
+        }
+        const selectedPageMessage = client
+          ? this.#selectedControlPageMessage(control, client)
+          : null;
+        if (selectedPageMessage) {
+          message = selectedPageMessage;
+        } else if (message) {
+          // Authorization and unknown-alias recovery responses are intentionally
+          // generic and must never include a configured client name.
+        } else if (control.kind === "menu") {
+          message = buildControlMenuMessage(client);
+        } else if (control.kind === "help") {
+          message = { type: "text", text: controlHelpText(client) };
+        } else if (control.kind === "status") {
+          const { snapshot, stale } = this.#latestControlSnapshot(client);
+          message = buildPerformanceReportMessage({ client, snapshot, stale, now: this.now() });
+        } else if (new Set([
+          "auto_boost_status",
+          "auto_boost_upsert",
+          "auto_boost_toggle"
+        ]).has(control.kind)) {
+          const profile = this.store.getAutoBoostProfile({ clientId: client.id });
+          message = profile
+            ? this.#autoBoostStatusMessage(client, profile)
+            : {
+                type: "text",
+                text: `ไม่พบตาราง Auto Boost ของ ${client.name} กรุณาส่งคำสั่งตั้งตารางใหม่`
+              };
+        } else if (new Set(["shortcut_list", "shortcut_upsert"]).has(control.kind)) {
+          message = buildShortcutListMessage({
+            client,
+            shortcuts: this.store.listCampaignShortcuts({ clientId: client.id })
+          });
+        } else if (control.kind === "report_subscribe") {
+          const subscription = this.store.getReportSubscription({
+            clientId: client.id,
+            lineUserId: command.userId
+          });
+          message = {
+            type: "text",
+            text: subscription?.enabled
+              ? `✅ กู้คำสั่งแล้ว: รายงาน ${client.name} ทุก ${subscription.intervalMinutes / 60} ชั่วโมงเปิดอยู่`
+              : `ตั้งรายงาน ${client.name} ไม่สำเร็จ กรุณาส่งคำสั่งใหม่`
+          };
+        } else if (control.kind === "report_unsubscribe") {
+          const subscription = this.store.getReportSubscription({
+            clientId: client.id,
+            lineUserId: command.userId
+          });
+          message = {
+            type: "text",
+            text: !subscription?.enabled
+              ? `กู้คำสั่งแล้ว: รายงานตามเวลาของ ${client.name} ถูกหยุดแล้ว`
+              : `หยุดรายงาน ${client.name} ไม่สำเร็จ กรุณาส่งคำสั่งใหม่`
+          };
+        } else if (new Set(["action", "coupon_schedule"]).has(control.kind)) {
+          controlRequestId = controlRequestIdForEvent(eventId);
+          const request = this.store.getCampaignControlRequest(controlRequestId);
+          message = request
+            ? buildControlConfirmationMessage(request)
+            : { type: "text", text: `คำสั่ง ${client.name} ไม่ได้ถูกบันทึก กรุณาส่งคำสั่งใหม่` };
+        } else {
+          message = { type: "text", text: `ระบบกู้คำสั่ง ${client.name} แล้ว กรุณาตรวจสถานะจากเมนู` };
+        }
       }
     } else if (command.kind === "postback") {
       const parsed = parsePostbackData(command.data);

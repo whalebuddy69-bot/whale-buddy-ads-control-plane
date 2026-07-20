@@ -82,12 +82,12 @@ function controlConfig() {
   };
 }
 
-function lineEvent({ id, text, sourceType = "user", timestamp }) {
+function lineEvent({ id, text, sourceType = "user", timestamp, userId = "U1" }) {
   return {
     webhookEventId: id,
     type: "message",
     timestamp,
-    source: { type: sourceType, userId: "U1" },
+    source: { type: sourceType, userId },
     replyToken: `reply-${id}`,
     message: { type: "text", text }
   };
@@ -105,6 +105,36 @@ function autoBoostDefinition({
     "ช่วงเวลา",
     ...windows
   ].join("\n");
+}
+
+function controlSnapshot(client, overrides = {}) {
+  return {
+    snapshotId: `ts_${client.id}_latest`,
+    clientId: client.id,
+    campaignName: `${client.id} LIVE`,
+    campaignRef: `ui:${client.id}`,
+    campaignStatus: "ACTIVE",
+    currency: client.campaignSelector.currency,
+    dailyBudgetMinor: 300_000,
+    totalBudgetMinor: 300_000,
+    costMinor: 240_000,
+    netCostMinor: 240_000,
+    grossRevenueMinor: 900_000,
+    grossRoiMilli: 3_750,
+    netRevenueMinor: 840_000,
+    netRoiMilli: 3_500,
+    gmvMinor: 900_000,
+    schemaVersion: 2,
+    observedAt: "2026-07-20T09:59:00.000Z",
+    ...overrides
+  };
+}
+
+function installControlSnapshots(store, snapshots) {
+  const byClient = new Map(snapshots.map((snapshot) => [snapshot.clientId, snapshot]));
+  store.getLatestTelemetry = ({ clientId }) => byClient.get(clientId) ?? null;
+  store.isTelemetrySnapshotCredentialActive = (snapshotId) =>
+    snapshots.some((snapshot) => snapshot.snapshotId === snapshotId);
 }
 
 test("Ppan shortcut launch is authorized, versioned, and always dry-run before an executor exists", async (t) => {
@@ -213,6 +243,288 @@ test("campaign controls are refused in a group chat", async (t) => {
     sourceType: "group"
   })]);
   assert.match(line.replies[0].message.text, /แชตส่วนตัว/);
+});
+
+test("global command center and unknown text expose only authorized clients", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const config = controlConfig();
+  const hidden = structuredClone(config.clients[0]);
+  hidden.id = "hidden_client";
+  hidden.name = "TOP SECRET CLIENT";
+  hidden.lineApproverUserIds = ["U2"];
+  hidden.advertiserId = "9999999999999999999";
+  hidden.lineControl.aliases = ["SecretAlias"];
+  config.clients.push(hidden);
+  const service = new BudgetGuardService({
+    config,
+    store,
+    line,
+    tiktok: null,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  await service.handleLineEvents([lineEvent({ id: "agency-menu", text: "เมนู" })]);
+  const menu = JSON.stringify(line.replies.at(-1).message);
+  assert.match(menu, /สร้างแคมเปญใหม่/);
+  assert.match(menu, /ปิดแคมเปญ/);
+  assert.match(menu, /Auto Boost/);
+  assert.match(menu, /Report/);
+  assert.doesNotMatch(menu, /TOP SECRET CLIENT|SecretAlias|9999999999999999999|7646832328389263378/);
+
+  await service.handleLineEvents([lineEvent({
+    id: "agency-fallback",
+    text: "ช่วยดูโฆษณาให้หน่อย"
+  })]);
+  assert.match(JSON.stringify(line.replies.at(-1).message), /สร้างแคมเปญใหม่/);
+
+  await service.handleLineEvents([lineEvent({
+    id: "agency-invalid-shortcut",
+    text: "ตั้ง shortcut Ppan new\nงบ 3000"
+  })]);
+  assert.match(line.replies.at(-1).message.text, /Shortcut.*5 บรรทัด/);
+
+  await service.handleLineEvents([lineEvent({
+    id: "agency-create-picker",
+    text: "สร้างแคมเปญใหม่"
+  })]);
+  const picker = JSON.stringify(line.replies.at(-1).message);
+  assert.match(picker, /Ppan/);
+  assert.doesNotMatch(picker, /TOP SECRET CLIENT|SecretAlias|9999999999999999999/);
+
+  await service.handleLineEvents([lineEvent({ id: "probe-real-menu", text: "SecretAlias" })]);
+  const realAliasMenuResponse = JSON.stringify(line.replies.at(-1).message);
+  await service.handleLineEvents([lineEvent({ id: "probe-fake-menu", text: "NoSuchAlias" })]);
+  const fakeAliasMenuResponse = JSON.stringify(line.replies.at(-1).message);
+  assert.equal(realAliasMenuResponse, fakeAliasMenuResponse);
+  assert.doesNotMatch(realAliasMenuResponse, /TOP SECRET CLIENT|SecretAlias/);
+
+  await service.handleLineEvents([lineEvent({
+    id: "probe-real-specific",
+    text: "ปรับข้อมูล SecretAlias"
+  })]);
+  const realAliasSpecificResponse = JSON.stringify(line.replies.at(-1).message);
+  await service.handleLineEvents([lineEvent({
+    id: "probe-fake-specific",
+    text: "ปรับข้อมูล NoSuchAlias"
+  })]);
+  const fakeAliasSpecificResponse = JSON.stringify(line.replies.at(-1).message);
+  assert.equal(realAliasSpecificResponse, fakeAliasSpecificResponse);
+  assert.doesNotMatch(realAliasSpecificResponse, /TOP SECRET CLIENT|SecretAlias/);
+
+  await service.handleLineEvents([lineEvent({
+    id: "agency-unauthorized",
+    text: "เมนู",
+    userId: "U9"
+  })]);
+  const denied = JSON.stringify(line.replies.at(-1).message);
+  assert.match(denied, /จับคู่/);
+  assert.doesNotMatch(denied, /Ppan|punpan_020|TOP SECRET CLIENT|SecretAlias/);
+
+  await service.handleLineEvents([lineEvent({
+    id: "agency-invalid-unauthorized",
+    text: "เพิ่มงบ Ppan ห้าร้อย",
+    userId: "U9"
+  })]);
+  const invalidDenied = JSON.stringify(line.replies.at(-1).message);
+  assert.match(invalidDenied, /จับคู่/);
+  assert.doesNotMatch(invalidDenied, /Ppan|punpan_020|TOP SECRET CLIENT|SecretAlias/);
+});
+
+test("global report keeps authorized accounts separate and filters unauthorized accounts", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const config = controlConfig();
+  const second = structuredClone(config.clients[0]);
+  second.id = "client_beta";
+  second.name = "Beta Shop";
+  second.advertiserId = "1234567890123405678";
+  second.lineControl.aliases = ["Beta"];
+  second.campaignSelector.expectedTikTokAccountId = "2234567890123405678";
+  second.campaignSelector.currency = "USD";
+  const hidden = structuredClone(config.clients[0]);
+  hidden.id = "client_hidden";
+  hidden.name = "Hidden Shop";
+  hidden.advertiserId = "3234567890123405678";
+  hidden.lineApproverUserIds = ["U2"];
+  hidden.lineControl.aliases = ["Hidden"];
+  config.clients.push(second, hidden);
+  installControlSnapshots(store, [
+    controlSnapshot(config.clients[0]),
+    controlSnapshot(second, {
+      currency: "USD",
+      dailyBudgetMinor: 70_000,
+      costMinor: 35_000,
+      grossRevenueMinor: 140_000,
+      grossRoiMilli: 4_000,
+      netRevenueMinor: 105_000,
+      netRoiMilli: 3_000,
+      gmvMinor: 140_000
+    }),
+    controlSnapshot(hidden)
+  ]);
+  const service = new BudgetGuardService({
+    config,
+    store,
+    line,
+    tiktok: null,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  await service.handleLineEvents([lineEvent({
+    id: "agency-report",
+    text: "อัปเดต Report ล่าสุด"
+  })]);
+  const report = JSON.stringify(line.replies.at(-1).message);
+  assert.match(report, /punpan_020 LIVE/);
+  assert.match(report, /client_beta LIVE/);
+  assert.match(report, /Beta Shop/);
+  assert.doesNotMatch(report, /Hidden Shop|client_hidden LIVE|3234567890123405678/);
+  assert.doesNotMatch(report, /7646832328389263378|1234567890123405678/);
+  assert.doesNotMatch(report, /เฉลี่ย|average/i);
+});
+
+test("selected account pages return create, pause, adjustment, and Auto Boost controls", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const config = controlConfig();
+  installControlSnapshots(store, [controlSnapshot(config.clients[0])]);
+  const service = new BudgetGuardService({
+    config,
+    store,
+    line,
+    tiktok: null,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  for (const [id, text, expected] of [
+    ["page-create", "สร้างแคมเปญ Ppan", /ตั้ง shortcut Ppan new/],
+    ["page-pause", "ปิดแคมเปญ Ppan", /punpan_020 LIVE/],
+    ["page-adjust", "ปรับข้อมูล Ppan", /เพิ่มงบ Ppan/],
+    ["page-auto", "ตั้งค่า Auto Boost Ppan", /ตั้ง Auto Boost Ppan/]
+  ]) {
+    await service.handleLineEvents([lineEvent({ id, text })]);
+    assert.match(JSON.stringify(line.replies.at(-1).message), expected);
+  }
+});
+
+test("relative budget adjustment uses a fresh current snapshot and stays dry-run", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const config = controlConfig();
+  installControlSnapshots(store, [controlSnapshot(config.clients[0])]);
+  const service = new BudgetGuardService({
+    config,
+    store,
+    line,
+    tiktok: null,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  await service.handleLineEvents([lineEvent({
+    id: "relative-budget-up",
+    text: "เพิ่มงบ Ppan 500"
+  })]);
+  const confirmation = JSON.stringify(line.replies.at(-1).message);
+  const [, requestId] = confirmation.match(/op=confirm&id=(ca_[0-9a-f]+)&v=1/);
+  const request = store.getCampaignControlRequest(requestId);
+  assert.equal(request.action, "ADJUST_BUDGET");
+  assert.equal(request.data.before.dailyBudgetMinor, 300_000);
+  assert.equal(request.data.desired.budgetDeltaMinor, 50_000);
+  assert.equal(request.data.desired.dailyBudgetMinor, 350_000);
+  assert.equal(request.data.dryRun, true);
+
+  await service.handleLineEvents([lineEvent({
+    id: "relative-budget-down",
+    text: "ลดงบ Ppan 200"
+  })]);
+  const downConfirmation = JSON.stringify(line.replies.at(-1).message);
+  const [, downRequestId] = downConfirmation.match(/op=confirm&id=(ca_[0-9a-f]+)&v=1/);
+  assert.equal(
+    store.getCampaignControlRequest(downRequestId).data.desired.dailyBudgetMinor,
+    280_000
+  );
+});
+
+test("campaign mutations refuse stale telemetry before creating a request", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const config = controlConfig();
+  installControlSnapshots(store, [controlSnapshot(config.clients[0], {
+    observedAt: "2026-07-20T09:00:00.000Z"
+  })]);
+  const service = new BudgetGuardService({
+    config,
+    store,
+    line,
+    tiktok: null,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  await service.handleLineEvents([lineEvent({
+    id: "relative-budget-stale",
+    text: "เพิ่มงบ Ppan 500"
+  })]);
+  assert.match(line.replies.at(-1).message.text, /เก่าเกินไป/);
+  assert.equal(
+    store.db.prepare("SELECT COUNT(*) AS count FROM campaign_control_requests").get().count,
+    0
+  );
+  for (const [id, text] of [
+    ["absolute-budget-stale", "ตั้งงบ Ppan 3500"],
+    ["roi-stale", "ตั้ง ROI Ppan 4"],
+    ["pause-stale", "พัก Ppan"]
+  ]) {
+    await service.handleLineEvents([lineEvent({ id, text })]);
+    assert.match(line.replies.at(-1).message.text, /เก่าเกินไป/);
+  }
+  assert.equal(
+    store.db.prepare("SELECT COUNT(*) AS count FROM campaign_control_requests").get().count,
+    0
+  );
+});
+
+test("unknown-text menu reply recovers durably without leaking other clients", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const service = new BudgetGuardService({
+    config: controlConfig(),
+    store,
+    line,
+    tiktok: null,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  line.failNextReply = true;
+  const [failed] = await service.handleLineEvents([lineEvent({
+    id: "fallback-recovery",
+    text: "ช่วยแสดงตัวเลือก"
+  })]);
+  assert.equal(failed.status, "FAILED");
+  assert.equal(failed.error.code, "LINE_CONTROL_REPLY_FAILED");
+  assert.deepEqual(await service.recoverLineWebhookEvents({ maxEvents: 5 }), [{
+    eventId: "fallback-recovery",
+    status: "RECOVERED"
+  }]);
+  assert.match(JSON.stringify(line.pushes[0].message), /สร้างแคมเปญใหม่/);
 });
 
 test("coupon boost is approved in advance and produces a durable timed reminder", async (t) => {

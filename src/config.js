@@ -8,6 +8,14 @@ function requiredString(value, label) {
   return value.trim();
 }
 
+function requiredBoundedString(value, label, maximumLength) {
+  const normalized = requiredString(value, label);
+  if (Array.from(normalized).length > maximumLength) {
+    throw new Error(`${label} must be no longer than ${maximumLength} characters`);
+  }
+  return normalized;
+}
+
 function finiteNumber(value, label, { min = -Infinity, max = Infinity } = {}) {
   if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
     throw new Error(`${label} must be a number between ${min} and ${max}`);
@@ -391,7 +399,7 @@ export function validateConfig(input) {
 
     const client = {
       id,
-      name: requiredString(rawClient.name, `${id}.name`),
+      name: requiredBoundedString(rawClient.name, `${id}.name`, 80),
       lineApproverUserIds,
       linePairingEnabled,
       advertiserId,

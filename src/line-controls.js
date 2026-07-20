@@ -5,6 +5,7 @@ import { parseAutoBoostTimeWindow } from "./auto-boost.js";
 const CONTROL_REQUEST_ID = /^ca_[A-Za-z0-9-]{16,80}$/;
 const SHORTCUT_NAME = /^[A-Za-z0-9ก-๙_-]{1,32}$/u;
 const CLIENT_ALIAS = /^[A-Za-z0-9ก-๙_.-]{1,80}$/u;
+const CAROUSEL_PAGE_SIZE = 10;
 
 function cleanText(value) {
   return String(value ?? "").normalize("NFKC").trim();
@@ -128,7 +129,67 @@ export function parseControlCommand(text) {
   const autoBoost = parseAutoBoostDefinition(text);
   if (autoBoost) return autoBoost;
 
-  let match = value.match(/^ดู\s+Auto\s+Boost\s+(\S+)$/iu);
+  if (/^(?:เมนู|menu|เริ่มต้น|start)$/iu.test(value)) {
+    return { kind: "agency_menu" };
+  }
+  const reportPageMatch = value.match(
+    /^(?:(?:อัปเดต|อัพเดท|ดู)\s*(?:Report|รายงาน)\s*(?:ล่าสุด|ทั้งหมด)|รายงานทั้งหมด)(?:\s+หน้า\s+(\d{1,4}))?$/iu
+  );
+  if (reportPageMatch) {
+    const page = Number(reportPageMatch[1] ?? 1);
+    return page >= 1 ? { kind: "agency_report", ...(page > 1 ? { page } : {}) } : null;
+  }
+  const createPageMatch = value.match(/^(?:สร้างแคมเปญ(?:ใหม่)?|สร้างแอด)(?:\s+หน้า\s+(\d{1,4}))?$/u);
+  if (createPageMatch) {
+    const page = Number(createPageMatch[1] ?? 1);
+    return page >= 1
+      ? { kind: "agency_section", section: "create", ...(page > 1 ? { page } : {}) }
+      : null;
+  }
+  const closePageMatch = value.match(/^ปิดแคมเปญ(?:\s+หน้า\s+(\d{1,4}))?$/u);
+  if (closePageMatch) {
+    const page = Number(closePageMatch[1] ?? 1);
+    return page >= 1
+      ? { kind: "agency_section", section: "close", ...(page > 1 ? { page } : {}) }
+      : null;
+  }
+  const adjustPageMatch = value.match(/^(?:ปรับข้อมูล|ปรับ\s*เพิ่ม\s*\/\s*ลด(?:\s*ข้อมูล)?|ปรับเพิ่มลดข้อมูล|ปรับเพิ่มลด)(?:\s+หน้า\s+(\d{1,4}))?$/u);
+  if (adjustPageMatch) {
+    const page = Number(adjustPageMatch[1] ?? 1);
+    return page >= 1
+      ? { kind: "agency_section", section: "adjust", ...(page > 1 ? { page } : {}) }
+      : null;
+  }
+  const autoBoostPageMatch = value.match(/^(?:ตั้งค่า\s*)?Auto\s+Boost(?:\s+หน้า\s+(\d{1,4}))?$/iu);
+  if (autoBoostPageMatch) {
+    const page = Number(autoBoostPageMatch[1] ?? 1);
+    return page >= 1
+      ? { kind: "agency_section", section: "auto_boost", ...(page > 1 ? { page } : {}) }
+      : null;
+  }
+
+  let match = value.match(/^(?:สร้างแคมเปญ|สร้างแอด)\s+(\S+)$/u);
+  if (match) {
+    const clientAlias = commandClientAlias(match[1]);
+    return clientAlias ? { kind: "campaign_create_template", clientAlias } : null;
+  }
+  match = value.match(/^ปิดแคมเปญ\s+(\S+)$/u);
+  if (match) {
+    const clientAlias = commandClientAlias(match[1]);
+    return clientAlias ? { kind: "campaign_close_menu", clientAlias } : null;
+  }
+  match = value.match(/^(?:ปรับข้อมูล|ปรับเพิ่มลด)\s+(\S+)$/u);
+  if (match) {
+    const clientAlias = commandClientAlias(match[1]);
+    return clientAlias ? { kind: "campaign_adjust_menu", clientAlias } : null;
+  }
+  match = value.match(/^ตั้งค่า\s+Auto\s+Boost\s+(\S+)$/iu);
+  if (match) {
+    const clientAlias = commandClientAlias(match[1]);
+    return clientAlias ? { kind: "auto_boost_setup", clientAlias } : null;
+  }
+
+  match = value.match(/^ดู\s+Auto\s+Boost\s+(\S+)$/iu);
   if (match) {
     const clientAlias = commandClientAlias(match[1]);
     return clientAlias ? { kind: "auto_boost_status", clientAlias } : null;
@@ -185,13 +246,23 @@ export function parseControlCommand(text) {
       ? { kind: "action", action: "CREATE_FROM_SHORTCUT", clientAlias, shortcutName }
       : null;
   }
-  match = value.match(/^(?:ตั้งงบ|งบใหม่|เพิ่มงบ|ลดงบ)\s+(\S+)\s+(.+)$/u);
+  match = value.match(/^(ตั้งงบ|งบใหม่|เพิ่มงบ|ลดงบ)\s+(\S+)\s+(.+)$/u);
   if (match) {
-    const clientAlias = commandClientAlias(match[1]);
-    const amount = parseAmount(match[2]);
-    return clientAlias && amount !== null
-      ? { kind: "action", action: "UPDATE_BUDGET", clientAlias, amount }
-      : null;
+    const clientAlias = commandClientAlias(match[2]);
+    const amount = parseAmount(match[3]);
+    const relative = new Set(["เพิ่มงบ", "ลดงบ"]).has(match[1]);
+    if (!clientAlias || amount === null) {
+      return { kind: "invalid_template", template: "adjustment" };
+    }
+    return relative
+      ? {
+          kind: "action",
+          action: "ADJUST_BUDGET",
+          clientAlias,
+          amount,
+          direction: match[1] === "เพิ่มงบ" ? 1 : -1
+        }
+      : { kind: "action", action: "UPDATE_BUDGET", clientAlias, amount };
   }
   match = value.match(/^ตั้ง\s*ROI\s+(\S+)\s+(.+)$/iu);
   if (match) {
@@ -199,7 +270,7 @@ export function parseControlCommand(text) {
     const targetRoi = parseRoi(match[2]);
     return clientAlias && targetRoi !== null
       ? { kind: "action", action: "UPDATE_ROI", clientAlias, targetRoi }
-      : null;
+      : { kind: "invalid_template", template: "adjustment" };
   }
   match = value.match(/^(?:พัก|ปิด)\s+(\S+)$/u);
   if (match) {
@@ -233,6 +304,15 @@ export function parseControlCommand(text) {
   if (match) {
     const clientAlias = commandClientAlias(match[1]);
     return clientAlias ? { kind: "coupon_cancel", clientAlias } : null;
+  }
+  if (/^ตั้ง\s*shortcut(?:\s|$)/iu.test(value)) {
+    return { kind: "invalid_template", template: "shortcut" };
+  }
+  if (/^ตั้ง\s+Auto\s+Boost(?:\s|$)/iu.test(value)) {
+    return { kind: "invalid_template", template: "auto_boost" };
+  }
+  if (/^(?:ตั้งงบ|งบใหม่|เพิ่มงบ|ลดงบ|ตั้ง\s*ROI)(?:\s|$)/iu.test(value)) {
+    return { kind: "invalid_template", template: "adjustment" };
   }
   return null;
 }
@@ -299,8 +379,526 @@ function bangkokTime(value) {
   });
 }
 
+function primaryAlias(client) {
+  return cleanText(client?.lineControl?.aliases?.[0] ?? client?.name ?? client?.id ?? "");
+}
+
+function shortLabel(value, maximum = 20) {
+  const characters = Array.from(cleanText(value));
+  return characters.length <= maximum
+    ? characters.join("")
+    : `${characters.slice(0, Math.max(1, maximum - 1)).join("")}…`;
+}
+
+function messageAction(label, text) {
+  return { type: "message", label: shortLabel(label), text };
+}
+
+function clipboardAction(label, clipboardText) {
+  return { type: "clipboard", label: shortLabel(label), clipboardText };
+}
+
+function menuQuickReply() {
+  return {
+    items: [{ type: "action", action: messageAction("เมนูหลัก", "เมนู") }]
+  };
+}
+
+function helpQuickReply(alias) {
+  return {
+    items: [
+      { type: "action", action: messageAction("วิธีใช้ / Template", `วิธีใช้ ${alias}`) },
+      { type: "action", action: messageAction("เมนู", "เมนู") }
+    ]
+  };
+}
+
+function paginationQuickReply({ page, pageCount, previousText, nextText }) {
+  const items = [];
+  if (page > 1) {
+    items.push({ type: "action", action: messageAction("◀ หน้าก่อน", previousText) });
+  }
+  if (page < pageCount) {
+    items.push({ type: "action", action: messageAction("หน้าถัดไป ▶", nextText) });
+  }
+  items.push({ type: "action", action: messageAction("เมนู", "เมนู") });
+  return { items };
+}
+
+function snapshotAgeMinutes(snapshot, now = new Date()) {
+  const ageMs = new Date(now).getTime() - Date.parse(snapshot?.observedAt);
+  return Number.isFinite(ageMs) ? Math.max(0, Math.floor(ageMs / 60_000)) : null;
+}
+
+function snapshotSourceText(snapshot, now, stale) {
+  if (!snapshot) return "ยังไม่มีข้อมูลจาก Chrome reader";
+  const age = snapshotAgeMinutes(snapshot, now);
+  return `${stale ? "⚠️ ข้อมูลเก่า" : "🟢 ข้อมูลล่าสุด"} · Chrome${age === null ? "" : ` · ${age} นาที`}`;
+}
+
+function defaultBudgetMinor(client) {
+  const minimum = Math.round(Number(client?.lineControl?.minDailyBudget ?? 100) * 100);
+  const maximum = Math.round(Number(client?.budgetPolicy?.maxDailyBudget ?? 6_000) * 100);
+  return Math.min(maximum, Math.max(minimum, 300_000));
+}
+
+function plainMajor(minor) {
+  return Number.isSafeInteger(minor) ? String(minor / 100) : "3000";
+}
+
+function autoBoostTemplateText(client, input = {}) {
+  const alias = primaryAlias(client);
+  const windows = Array.isArray(input.windows) && input.windows.length > 0
+    ? input.windows
+    : [{ start: "12:00", end: "13:00" }, { start: "20:00", end: "21:00" }];
+  const boostPercent = Number.isSafeInteger(input.boostBps)
+    ? input.boostBps / 100
+    : Number(client?.lineControl?.autoBoost?.boostPercent ?? 10);
+  const leadMinutes = Number(input.leadMinutes ?? client?.lineControl?.autoBoost?.leadMinutes ?? 10);
+  return [
+    `ตั้ง Auto Boost ${alias}`,
+    `งบฐาน ${plainMajor(input.baseBudgetMinor ?? defaultBudgetMinor(client))}`,
+    `เพิ่ม ${boostPercent}%`,
+    `ก่อน ${leadMinutes} นาที`,
+    "ช่วงเวลา",
+    ...windows.map((window) => `${window.start}-${window.end}`)
+  ].join("\n");
+}
+
+/** Agency-level LINE Command Center. It never embeds account or campaign IDs. */
+export function buildAgencyControlMenuMessage({ clients = [] } = {}) {
+  const clientCount = clients.length;
+  return {
+    type: "flex",
+    altText: `Whale Buddy Ads · เมนูหลัก (${clientCount} บัญชี)`,
+    contents: {
+      type: "bubble",
+      header: {
+        type: "box",
+        layout: "vertical",
+        backgroundColor: "#EAF7F0",
+        contents: [
+          lineText("🐋 Whale Buddy Ads", { weight: "bold", size: "xl", color: "#135C3B" }),
+          lineText("LINE Command Center", { size: "sm", color: "#35745A", margin: "xs" })
+        ]
+      },
+      body: {
+        type: "box",
+        layout: "vertical",
+        spacing: "sm",
+        contents: [
+          detailRow("บัญชีที่มีสิทธิ์", clientCount),
+          lineText("เลือกงานที่ต้องการ ระบบจะแสดงเฉพาะลูกค้าที่ LINE นี้มีสิทธิ์", {
+            size: "sm", color: "#555555", wrap: true
+          }),
+          lineText("🧪 คำสั่งที่แก้ TikTok ยังเป็น DRY-RUN", {
+            size: "xs", color: "#8A4B00", margin: "md"
+          })
+        ]
+      },
+      footer: {
+        type: "box",
+        layout: "vertical",
+        spacing: "sm",
+        contents: [
+          { type: "button", style: "primary", color: "#06C755", action: messageAction("สร้างแคมเปญใหม่", "สร้างแคมเปญใหม่") },
+          { type: "button", action: messageAction("ปิดแคมเปญ", "ปิดแคมเปญ") },
+          { type: "button", action: messageAction("ปรับเพิ่ม / ลด", "ปรับเพิ่ม / ลด") },
+          { type: "button", action: messageAction("ตั้งค่า Auto Boost", "ตั้งค่า Auto Boost") },
+          { type: "button", action: messageAction("Report ล่าสุด", "อัปเดต Report ล่าสุด") }
+        ]
+      }
+    }
+  };
+}
+
+const CLIENT_PICKER_SECTIONS = Object.freeze({
+  create: { title: "สร้างแคมเปญใหม่", command: "สร้างแคมเปญ" },
+  adjust: { title: "ปรับเพิ่ม / ลด", command: "ปรับข้อมูล" },
+  auto_boost: { title: "ตั้งค่า Auto Boost", command: "ตั้งค่า Auto Boost" }
+});
+
+/** Quick Reply is capped at 13 actions: 10 clients, previous/next, and Menu. */
+export function buildAgencyClientPickerMessage({ clients = [], section, page = 1 } = {}) {
+  const definition = CLIENT_PICKER_SECTIONS[section];
+  if (!definition) throw new RangeError("Unsupported LINE client-picker section");
+  const pageCount = Math.max(1, Math.ceil(clients.length / 10));
+  const currentPage = Math.min(pageCount, Math.max(1, Number.isSafeInteger(page) ? page : 1));
+  const visible = clients.slice((currentPage - 1) * 10, currentPage * 10);
+  const lines = [
+    `${definition.title} — เลือกลูกค้า`,
+    "กดชื่อบัญชีด้านล่าง",
+    `หน้า ${currentPage}/${pageCount} · ทั้งหมด ${clients.length} บัญชี`
+  ];
+  if (visible.length === 0) lines.push("ยังไม่มีบัญชีที่เลือกได้");
+  const navigation = paginationQuickReply({
+    page: currentPage,
+    pageCount,
+    previousText: `${definition.title} หน้า ${currentPage - 1}`,
+    nextText: `${definition.title} หน้า ${currentPage + 1}`
+  }).items;
+  return {
+    type: "text",
+    text: lines.join("\n"),
+    quickReply: {
+      items: [
+        ...visible.map((client) => {
+          const alias = primaryAlias(client);
+          return {
+            type: "action",
+            action: messageAction(shortLabel(alias), `${definition.command} ${alias}`)
+          };
+        }),
+        ...navigation
+      ]
+    }
+  };
+}
+
+export function buildCampaignCreateTemplateMessage({ client, shortcuts = [] } = {}) {
+  if (!client) throw new TypeError("client is required");
+  const alias = primaryAlias(client);
+  const currency = client.campaignSelector?.currency ?? "THB";
+  const example = shortcuts[0];
+  const template = [
+    `ตั้ง shortcut ${alias} new`,
+    "ชื่อ {date} {start}:00",
+    `งบ ${plainMajor(example?.dailyBudgetMinor ?? defaultBudgetMinor(client))}`,
+    `ROI ${Number.isSafeInteger(example?.targetRoiMilli) ? example.targetRoiMilli / 1000 : 3.5}`,
+    `เติมเมื่อ ${Number.isSafeInteger(example?.topUpThresholdBps) ? example.topUpThresholdBps / 100 : 80}%`
+  ].join("\n");
+  const shortcutButtons = shortcuts.slice(0, 2).map((shortcut) => ({
+    type: "button",
+    action: messageAction(`เปิด ${shortcut.shortcutName}`, `เปิด ${alias} ${shortcut.shortcutName}`)
+  }));
+  const viewAllButton = shortcuts.length > 2
+    ? [{ type: "button", action: messageAction("ดู Shortcut ทั้งหมด", `ดู shortcut ${alias}`) }]
+    : [];
+  return {
+    type: "flex",
+    altText: `สร้างแคมเปญใหม่ · ${client.name}`,
+    contents: {
+      type: "bubble",
+      header: {
+        type: "box", layout: "vertical", backgroundColor: "#EAF7F0",
+        contents: [lineText(`➕ สร้างแคมเปญ — ${client.name}`, { weight: "bold", size: "lg", color: "#135C3B" })]
+      },
+      body: {
+        type: "box", layout: "vertical", spacing: "sm", contents: [
+          detailRow("เพดานงบ", formatMinor(Math.round(client.budgetPolicy.maxDailyBudget * 100), currency)),
+          detailRow("Shortcut", `${shortcuts.length} รายการ`),
+          lineText("ขั้น 1: คัดลอก Template แล้วแก้ชื่อ Shortcut, งบ, ROI และจุดเติมงบ", {
+            size: "sm", color: "#555555", margin: "md"
+          }),
+          lineText("คงบรรทัด “ชื่อ {date} {start}:00” ไว้เหมือนเดิมระหว่างใช้ Chrome reader", {
+            size: "xs", color: "#8A4B00", margin: "sm"
+          }),
+          lineText("ขั้น 2: หลังบันทึกแล้ว กดเปิด Shortcut เพื่อเข้าหน้าพรีวิว", {
+            size: "sm", color: "#555555", margin: "sm"
+          }),
+          lineText("ชื่อ Ad และชื่อช่องยังล็อกจาก config; จะเปิดให้เลือกหลัง TikTok API ยืนยัน identity ได้", {
+            size: "xs", color: "#8A4B00", margin: "md"
+          }),
+          lineText("🧪 การสร้าง/เปิดแคมเปญยังเป็น DRY-RUN", {
+            size: "xs", color: "#8A4B00", margin: "sm"
+          }),
+          lineText("ถ้าปุ่มคัดลอกใช้ไม่ได้ กด “วิธีใช้ / Template” ด้านล่าง", {
+            size: "xs", color: "#777777", margin: "sm"
+          })
+        ]
+      },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm", contents: [
+          ...shortcutButtons,
+          ...viewAllButton,
+          { type: "button", style: "primary", color: "#06C755", action: clipboardAction("คัดลอก Template", template) }
+        ]
+      }
+    },
+    quickReply: helpQuickReply(alias)
+  };
+}
+
+function campaignChoiceBubble({ client, snapshot, stale }, now, pageLabel) {
+  const alias = primaryAlias(client);
+  const source = snapshotSourceText(snapshot, now, stale);
+  const freshAndActive = snapshot?.campaignStatus === "ACTIVE" && !stale;
+  return {
+    type: "bubble",
+    header: {
+      type: "box", layout: "vertical", backgroundColor: freshAndActive ? "#FFF4E5" : "#F3F4F6",
+      contents: [lineText(`⏸️ ${client.name}`, { weight: "bold", size: "lg", color: freshAndActive ? "#8A4B00" : "#555555" })]
+    },
+    body: {
+      type: "box", layout: "vertical", spacing: "sm", contents: [
+        detailRow("Campaign", snapshot?.campaignName ?? "—"),
+        detailRow("Ad account", accountSuffix(client.advertiserId)),
+        detailRow("งบปัจจุบัน", formatMinor(snapshot?.dailyBudgetMinor, snapshot?.currency)),
+        detailRow("ใช้ไป", formatMinor(snapshot?.costMinor, snapshot?.currency)),
+        lineText(source, { size: "xs", color: stale ? "#B45309" : "#666666", margin: "md" }),
+        lineText("แหล่งรายการ: ACTIVE campaign ล่าสุดจาก Chrome reader", {
+          size: "xs", color: "#777777", margin: "sm"
+        }),
+        lineText("🧪 ปุ่มปิดจะเปิดหน้ายืนยัน DRY-RUN", {
+          size: "xs", color: "#8A4B00", margin: "sm"
+        }),
+        lineText(pageLabel, { size: "xs", color: "#777777", margin: "sm", align: "end" })
+      ]
+    },
+    footer: {
+      type: "box", layout: "vertical", spacing: "sm", contents: [
+        {
+          type: "button",
+          ...(freshAndActive ? { style: "primary", color: "#D14343" } : {}),
+          action: freshAndActive
+            ? messageAction("ปิดแคมเปญนี้", `พัก ${alias}`)
+            : messageAction("รีเฟรชสถานะ", `สถานะ ${alias}`)
+        },
+        { type: "button", action: messageAction("กลับเมนู", "เมนู") }
+      ]
+    }
+  };
+}
+
+export function buildCampaignPauseChoicesMessage({ entries = [], now = new Date(), page = 1 } = {}) {
+  if (entries.length === 0) {
+    return {
+      type: "text",
+      text: "ยังไม่พบแคมเปญ ACTIVE จาก Chrome reader ในบัญชีที่คุณมีสิทธิ์\nลองรีเฟรชหน้า TikTok หรือรอ API sync แล้วเปิดเมนูอีกครั้ง",
+      quickReply: menuQuickReply()
+    };
+  }
+  const pageCount = Math.max(1, Math.ceil(entries.length / CAROUSEL_PAGE_SIZE));
+  const currentPage = Math.min(pageCount, Math.max(1, Number.isSafeInteger(page) ? page : 1));
+  const visible = entries.slice(
+    (currentPage - 1) * CAROUSEL_PAGE_SIZE,
+    currentPage * CAROUSEL_PAGE_SIZE
+  );
+  const pageLabel = `หน้า ${currentPage}/${pageCount} · ทั้งหมด ${entries.length} แคมเปญ`;
+  return {
+    type: "flex",
+    altText: `เลือกแคมเปญที่จะปิด · ${pageLabel}`,
+    contents: {
+      type: "carousel",
+      contents: visible.map((entry) => campaignChoiceBubble(entry, now, pageLabel))
+    },
+    quickReply: paginationQuickReply({
+      page: currentPage,
+      pageCount,
+      previousText: `ปิดแคมเปญ หน้า ${currentPage - 1}`,
+      nextText: `ปิดแคมเปญ หน้า ${currentPage + 1}`
+    })
+  };
+}
+
+export function buildCampaignAdjustmentMessage({ client, snapshot, stale = false, now = new Date() } = {}) {
+  if (!client) throw new TypeError("client is required");
+  const alias = primaryAlias(client);
+  if (!snapshot) {
+    return {
+      type: "text",
+      text: `⚠️ ${client.name}: ยังไม่มีข้อมูลแคมเปญจาก Chrome reader จึงยังสร้างคำสั่งปรับไม่ได้`,
+      quickReply: {
+        items: [
+          { type: "action", action: messageAction("ดูสถานะ", `สถานะ ${alias}`) },
+          { type: "action", action: messageAction("เมนู", "เมนู") }
+        ]
+      }
+    };
+  }
+  const body = [
+    detailRow("Campaign", snapshot.campaignName),
+    detailRow("Ad account", accountSuffix(client.advertiserId)),
+    detailRow("TikTok account", accountSuffix(client.campaignSelector?.expectedTikTokAccountId)),
+    detailRow("งบปัจจุบัน", formatMinor(snapshot.dailyBudgetMinor, snapshot.currency)),
+    detailRow("ชื่อ Ad", "รอ TikTok API"),
+    detailRow("ชื่อช่อง", "รอ TikTok API"),
+    lineText(snapshotSourceText(snapshot, now, stale), {
+      size: "xs", color: stale ? "#B45309" : "#666666", margin: "md"
+    }),
+    lineText("🧪 คำสั่งปรับงบ/ROI ยังเป็น DRY-RUN", {
+      size: "xs", color: "#8A4B00", margin: "sm"
+    }),
+    lineText("ถ้าปุ่มคัดลอกใช้ไม่ได้ กด “วิธีใช้ / Template”", {
+      size: "xs", color: "#777777", margin: "sm"
+    })
+  ];
+  if (stale) {
+    body.push(lineText("ระบบซ่อน Template ปรับงบจนกว่าจะได้ข้อมูลล่าสุด", {
+      size: "xs", color: "#B45309", margin: "sm"
+    }));
+  }
+  const controls = stale
+    ? [{ type: "button", style: "primary", color: "#06C755", action: messageAction("รีเฟรชสถานะ", `สถานะ ${alias}`) }]
+    : [
+        { type: "button", style: "primary", color: "#06C755", action: clipboardAction("เพิ่มงบ Template", `เพิ่มงบ ${alias} 500`) },
+        { type: "button", action: clipboardAction("ลดงบ Template", `ลดงบ ${alias} 500`) },
+        { type: "button", action: clipboardAction("ตั้งงบ Template", `ตั้งงบ ${alias} ${plainMajor(snapshot.dailyBudgetMinor)}`) },
+        { type: "button", action: clipboardAction("ตั้ง ROI Template", `ตั้ง ROI ${alias} 3.5`) }
+      ];
+  return {
+    type: "flex",
+    altText: `ปรับข้อมูลแคมเปญ · ${client.name}`,
+    contents: {
+      type: "bubble",
+      header: {
+        type: "box", layout: "vertical", backgroundColor: stale ? "#F3F4F6" : "#EAF7F0",
+        contents: [lineText(`🛠️ ปรับเพิ่ม / ลด — ${client.name}`, { weight: "bold", size: "lg" })]
+      },
+      body: { type: "box", layout: "vertical", spacing: "sm", contents: body },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm", contents: [
+          ...controls
+        ]
+      }
+    },
+    quickReply: helpQuickReply(alias)
+  };
+}
+
+function performanceBubble({ client, snapshot, stale }, now, pageLabel) {
+  if (!snapshot) {
+    return {
+      type: "bubble",
+      header: {
+        type: "box", layout: "vertical", backgroundColor: "#F3F4F6",
+        contents: [lineText(`⚠️ ${client.name}`, { weight: "bold", size: "lg", color: "#555555" })]
+      },
+      body: {
+        type: "box", layout: "vertical", spacing: "sm", contents: [
+          lineText("ยังไม่มี snapshot จาก Chrome reader", { size: "sm", color: "#555555" }),
+          lineText(pageLabel, { size: "xs", color: "#777777", margin: "md", align: "end" })
+        ]
+      },
+      footer: {
+        type: "box", layout: "vertical", contents: [
+          { type: "button", action: messageAction("เมนูหลัก", "เมนู") }
+        ]
+      }
+    };
+  }
+  const usage = snapshot.dailyBudgetMinor > 0
+    ? `${((snapshot.costMinor / snapshot.dailyBudgetMinor) * 100).toFixed(1)}%`
+    : "—";
+  return {
+    type: "bubble",
+    header: {
+      type: "box", layout: "vertical", backgroundColor: stale ? "#FFF4E5" : "#EAF7F0",
+      contents: [lineText(`${stale ? "⚠️" : "📊"} ${client.name}`, {
+        weight: "bold", size: "lg", color: stale ? "#8A4B00" : "#135C3B"
+      })]
+    },
+    body: {
+      type: "box", layout: "vertical", spacing: "sm", contents: [
+        detailRow("Campaign", snapshot.campaignName),
+        detailRow("สถานะ", snapshot.campaignStatus ?? "—"),
+        detailRow("งบ", formatMinor(snapshot.dailyBudgetMinor, snapshot.currency)),
+        detailRow("ใช้ไป", `${formatMinor(snapshot.costMinor, snapshot.currency)} (${usage})`),
+        detailRow("ยอดขาย Gross", formatMinor(snapshot.grossRevenueMinor, snapshot.currency)),
+        detailRow("Gross ROI", formatRoiMilli(snapshot.grossRoiMilli)),
+        detailRow("ยอดขาย Net", formatMinor(snapshot.netRevenueMinor, snapshot.currency)),
+        detailRow("Net ROI", formatRoiMilli(snapshot.netRoiMilli)),
+        detailRow("GMV", formatMinor(snapshot.gmvMinor, snapshot.currency)),
+        lineText(snapshotSourceText(snapshot, now, stale), {
+          size: "xs", color: stale ? "#B45309" : "#666666", margin: "md"
+        }),
+        ...(snapshot.schemaVersion === 1
+          ? [lineText("Reader รุ่นเดิมยังไม่มียอดขายและ ROI กรุณาโหลด Extension รุ่นใหม่", {
+              size: "xs", color: "#B45309"
+            })]
+          : []),
+        ...(stale
+          ? [lineText("ไม่ใช้ข้อมูลชุดนี้ตัดสินใจแก้แคมเปญ", { size: "xs", color: "#B45309" })]
+          : []),
+        lineText(`แหล่ง: snapshot ล่าสุดที่ระบบได้รับ · 1 ${snapshot.campaignStatus ?? "unknown"} campaign/บัญชี`, {
+          size: "xs", color: "#777777", margin: "sm"
+        }),
+        lineText(pageLabel, { size: "xs", color: "#777777", margin: "sm", align: "end" })
+      ]
+    },
+    footer: {
+      type: "box", layout: "vertical", spacing: "sm", contents: [
+        { type: "button", action: messageAction("ปรับบัญชีนี้", `ปรับข้อมูล ${primaryAlias(client)}`) },
+        { type: "button", action: messageAction("เมนูหลัก", "เมนู") }
+      ]
+    }
+  };
+}
+
+export function buildAgencyPerformanceReportMessage({ entries = [], now = new Date(), page = 1 } = {}) {
+  if (entries.length === 0) {
+    return { type: "text", text: "ยังไม่มีบัญชีสำหรับออกรายงาน", quickReply: menuQuickReply() };
+  }
+  const pageCount = Math.max(1, Math.ceil(entries.length / CAROUSEL_PAGE_SIZE));
+  const currentPage = Math.min(pageCount, Math.max(1, Number.isSafeInteger(page) ? page : 1));
+  const visible = entries.slice(
+    (currentPage - 1) * CAROUSEL_PAGE_SIZE,
+    currentPage * CAROUSEL_PAGE_SIZE
+  );
+  const pageLabel = `หน้า ${currentPage}/${pageCount} · ทั้งหมด ${entries.length} บัญชี`;
+  return {
+    type: "flex",
+    altText: `Report ล่าสุด · ${pageLabel}`,
+    contents: {
+      type: "carousel",
+      contents: visible.map((entry) => performanceBubble(entry, now, pageLabel))
+    },
+    quickReply: paginationQuickReply({
+      page: currentPage,
+      pageCount,
+      previousText: `อัปเดต Report ล่าสุด หน้า ${currentPage - 1}`,
+      nextText: `อัปเดต Report ล่าสุด หน้า ${currentPage + 1}`
+    })
+  };
+}
+
+export function buildAutoBoostSetupTemplateMessage({ client, snapshot, stale = false, now = new Date() } = {}) {
+  if (!client) throw new TypeError("client is required");
+  const alias = primaryAlias(client);
+  const baseBudgetMinor = snapshot && !stale ? snapshot.dailyBudgetMinor : defaultBudgetMinor(client);
+  const template = autoBoostTemplateText(client, { baseBudgetMinor });
+  return {
+    type: "flex",
+    altText: `ตั้ง Auto Boost · ${client.name}`,
+    contents: {
+      type: "bubble",
+      header: {
+        type: "box", layout: "vertical", backgroundColor: "#EEF2FF",
+        contents: [lineText(`⚡ ตั้ง Auto Boost — ${client.name}`, { weight: "bold", size: "lg", color: "#3730A3" })]
+      },
+      body: {
+        type: "box", layout: "vertical", spacing: "sm", contents: [
+          detailRow("งบฐานแนะนำ", formatMinor(baseBudgetMinor, snapshot?.currency ?? client.campaignSelector?.currency)),
+          detailRow("เพิ่ม", `${client.lineControl?.autoBoost?.boostPercent ?? 10}%`),
+          detailRow("เริ่มก่อน", `${client.lineControl?.autoBoost?.leadMinutes ?? 10} นาที`),
+          ...(snapshot ? [detailRow("Campaign", snapshot.campaignName)] : []),
+          lineText(snapshotSourceText(snapshot, now, stale), {
+            size: "xs", color: stale ? "#B45309" : "#666666", margin: "md"
+          }),
+          lineText("กดคัดลอก แก้งบฐานและช่วงเวลา แล้วส่งกลับมาทั้งข้อความ", {
+            size: "sm", color: "#555555", margin: "md"
+          }),
+          lineText("🧪 Auto Boost ยังแจ้งเหตุการณ์แบบ DRY-RUN และไม่แก้ TikTok", {
+            size: "xs", color: "#8A4B00", margin: "sm"
+          }),
+          lineText("ถ้าปุ่มคัดลอกใช้ไม่ได้ กด “วิธีใช้ / Template”", {
+            size: "xs", color: "#777777", margin: "sm"
+          })
+        ]
+      },
+      footer: {
+        type: "box", layout: "vertical", spacing: "sm", contents: [
+          { type: "button", style: "primary", color: "#06C755", action: clipboardAction("คัดลอก Template", template) }
+        ]
+      }
+    },
+    quickReply: helpQuickReply(alias)
+  };
+}
+
 export function buildControlMenuMessage(client) {
   const alias = client.lineControl?.aliases?.[0] ?? client.name;
+  const currency = client.campaignSelector?.currency ?? "THB";
   return {
     type: "flex",
     altText: `เมนูควบคุมโฆษณา ${client.name}`,
@@ -318,7 +916,7 @@ export function buildControlMenuMessage(client) {
         spacing: "sm",
         contents: [
           detailRow("Ad account", accountSuffix(client.advertiserId)),
-          detailRow("เพดานงบ", formatMinor(Math.round(client.budgetPolicy.maxDailyBudget * 100))),
+          detailRow("เพดานงบ", formatMinor(Math.round(client.budgetPolicy.maxDailyBudget * 100), currency)),
           lineText("คำสั่งที่เขียน TikTok ยังเป็น DRY-RUN ระหว่างรอเชื่อม API", {
             size: "xs", color: "#8A4B00", margin: "md"
           })
@@ -353,6 +951,7 @@ export function buildAutoBoostStatusMessage(input) {
   const enabled = profile.enabled === true;
   const isDryRun = profile.executionMode !== "LIVE";
   const boostBps = profile.boostBps ?? Math.round(Number(profile.boostPercent ?? 0) * 100);
+  const currency = client.campaignSelector?.currency ?? "THB";
   const originalWindows = profile.originalWindows ?? profile.windows ?? [];
   const targetBudgetMinor = profile.targetBudgetMinor;
   const nextAction = input.nextAction ?? profile.nextAction;
@@ -362,8 +961,8 @@ export function buildAutoBoostStatusMessage(input) {
   const rows = [
     detailRow("สถานะ", enabled ? "🟢 เปิด" : "⚪ ปิด"),
     detailRow("Ad account", accountSuffix(client.advertiserId)),
-    detailRow("งบฐาน", formatMinor(profile.baseBudgetMinor)),
-    detailRow("งบช่วงพิเศษ", formatMinor(targetBudgetMinor)),
+    detailRow("งบฐาน", formatMinor(profile.baseBudgetMinor, currency)),
+    detailRow("งบช่วงพิเศษ", formatMinor(targetBudgetMinor, currency)),
     detailRow("เพิ่ม", Number.isSafeInteger(boostBps) ? `${boostBps / 100}%` : "—"),
     detailRow("เริ่มก่อน", `${profile.leadMinutes} นาที`),
     lineText("ช่วงเวลาประจำวัน", { size: "sm", color: "#777777", margin: "md" }),
@@ -381,8 +980,17 @@ export function buildAutoBoostStatusMessage(input) {
       : "ระบบจะตรวจงบและบัญชีล่าสุดก่อนเปลี่ยนทุกครั้ง",
     { size: "xs", color: isDryRun ? "#8A4B00" : "#666666", margin: "md" }
   ));
+  rows.push(lineText("ถ้าปุ่มคัดลอกใช้ไม่ได้ กด “วิธีใช้ / Template” ด้านล่าง", {
+    size: "xs", color: "#777777", margin: "sm"
+  }));
 
   const toggleText = `${enabled ? "ปิด" : "เปิด"} Auto Boost ${alias}`;
+  const editTemplate = autoBoostTemplateText(client, {
+    baseBudgetMinor: profile.baseBudgetMinor,
+    boostBps,
+    leadMinutes: profile.leadMinutes,
+    windows: originalWindows
+  });
   return {
     type: "flex",
     altText: `Auto Boost ${client.name}: ${enabled ? "ON" : "OFF"}${isDryRun ? " (DRY-RUN)" : ""}`,
@@ -410,10 +1018,19 @@ export function buildAutoBoostStatusMessage(input) {
           {
             type: "button",
             action: { type: "message", label: "ดูสถานะอีกครั้ง", text: `ดู Auto Boost ${alias}` }
+          },
+          {
+            type: "button",
+            action: clipboardAction("คัดลอกตารางเพื่อแก้", editTemplate)
+          },
+          {
+            type: "button",
+            action: messageAction("กลับเมนู", "เมนู")
           }
         ]
       }
-    }
+    },
+    quickReply: helpQuickReply(alias)
   };
 }
 
@@ -431,12 +1048,13 @@ export function buildAutoBoostDryRunOccurrenceMessage(input) {
   }
   const fromMinor = restore ? profile.targetBudgetMinor : profile.baseBudgetMinor;
   const toMinor = restore ? profile.baseBudgetMinor : profile.targetBudgetMinor;
+  const currency = client.campaignSelector?.currency ?? "THB";
   return {
     type: "text",
     text: [
       `🧪 DRY-RUN ${restore ? "คืนงบ Auto Boost" : "Auto Boost"} — ${client.name}`,
       `Ad account: ${accountSuffix(client.advertiserId)}`,
-      `งบ: ${formatMinor(fromMinor)} → ${formatMinor(toMinor)}`,
+      `งบ: ${formatMinor(fromMinor, currency)} → ${formatMinor(toMinor, currency)}`,
       `เวลาจำลอง: ${bangkokTime(occurrence.dueAt)}`,
       "ระบบยังไม่ได้เปลี่ยนงบใน TikTok"
     ].join("\n")
@@ -473,6 +1091,7 @@ export function buildPerformanceReportMessage({ client, snapshot, now = new Date
 }
 
 export function buildShortcutListMessage({ client, shortcuts }) {
+  const currency = client.campaignSelector?.currency ?? "THB";
   if (shortcuts.length === 0) {
     const alias = client.lineControl?.aliases?.[0] ?? client.name;
     return {
@@ -494,7 +1113,7 @@ export function buildShortcutListMessage({ client, shortcuts }) {
     const block = [
       `\n${shortcut.shortcutName} (rev ${shortcut.revision})`,
       `ชื่อ: ${shortcut.campaignNameTemplate}`,
-      `งบ: ${formatMinor(shortcut.dailyBudgetMinor)}`,
+      `งบ: ${formatMinor(shortcut.dailyBudgetMinor, currency)}`,
       `Target ROI: ${formatRoiMilli(shortcut.targetRoiMilli)}`,
       `เกณฑ์เติมงบที่บันทึก (ทดลอง): ${(shortcut.topUpThresholdBps / 100).toFixed(0)}%`
     ];
@@ -511,6 +1130,7 @@ export function buildShortcutListMessage({ client, shortcuts }) {
 const ACTION_LABELS = Object.freeze({
   CREATE_FROM_SHORTCUT: "สร้างและเปิดแคมเปญ",
   UPDATE_BUDGET: "เปลี่ยนงบรายวัน",
+  ADJUST_BUDGET: "ปรับเพิ่ม/ลดงบรายวัน",
   UPDATE_ROI: "เปลี่ยน Target ROI",
   PAUSE: "พักแคมเปญ",
   RESUME: "เปิดแคมเปญอีกครั้ง",
@@ -520,6 +1140,7 @@ const ACTION_LABELS = Object.freeze({
 export function buildControlConfirmationMessage(request) {
   const desired = request.data.desired ?? {};
   const before = request.data.before ?? {};
+  const currency = request.data.currency ?? "THB";
   const rows = [
     detailRow("ลูกค้า", request.data.clientName),
     detailRow("Ad account", accountSuffix(request.data.advertiserId)),
@@ -527,8 +1148,12 @@ export function buildControlConfirmationMessage(request) {
   ];
   if (before.campaignName) rows.push(detailRow("Campaign", before.campaignName));
   if (desired.campaignName) rows.push(detailRow("ชื่อใหม่", desired.campaignName));
-  if (Number.isSafeInteger(before.dailyBudgetMinor)) rows.push(detailRow("งบเดิม", formatMinor(before.dailyBudgetMinor)));
-  if (Number.isSafeInteger(desired.dailyBudgetMinor)) rows.push(detailRow("งบเป้าหมาย", formatMinor(desired.dailyBudgetMinor)));
+  if (Number.isSafeInteger(before.dailyBudgetMinor)) rows.push(detailRow("งบเดิม", formatMinor(before.dailyBudgetMinor, currency)));
+  if (Number.isSafeInteger(desired.budgetDeltaMinor)) {
+    const direction = desired.budgetDeltaMinor >= 0 ? "+" : "−";
+    rows.push(detailRow("ปรับงบ", `${direction}${formatMinor(Math.abs(desired.budgetDeltaMinor), currency)}`));
+  }
+  if (Number.isSafeInteger(desired.dailyBudgetMinor)) rows.push(detailRow("งบเป้าหมาย", formatMinor(desired.dailyBudgetMinor, currency)));
   if (Number.isSafeInteger(desired.targetRoiMilli)) rows.push(detailRow("Target ROI", formatRoiMilli(desired.targetRoiMilli)));
   if (Number.isSafeInteger(desired.topUpThresholdBps)) {
     rows.push(detailRow("เกณฑ์เติม (ทดลอง)", `${desired.topUpThresholdBps / 100}%`));
@@ -580,7 +1205,7 @@ export function buildCouponReminderMessage({ clientName, eventAt, budgetMinor, r
       text: [
         `🎟️ ใกล้ถึงเวลาคูปอง — ${clientName}`,
         `เวลาคูปอง: ${bangkokTime(eventAt)}`,
-        `งบพิเศษที่เตรียมไว้: ${formatMinor(budgetMinor)}`,
+        `งบพิเศษที่เตรียมไว้: ${formatMinor(budgetMinor, request?.data?.currency ?? "THB")}`,
         "โปรดตรวจ LIVE และใช้ปุ่มยืนยันด้านล่าง"
       ].join("\n")
     },
@@ -592,12 +1217,14 @@ export function controlHelpText(client) {
   const alias = client.lineControl?.aliases?.[0] ?? client.name;
   return [
     `วิธีใช้ ${client.name}`,
+    "• เมนู (เปิด Command Center)",
     `• สถานะ ${alias}`,
     `• รายงาน ${alias} ทุก 2 ชั่วโมง`,
     `• หยุดรายงาน ${alias}`,
     `• ดู shortcut ${alias}`,
     `• เปิด ${alias} main`,
     `• ตั้งงบ ${alias} 2500`,
+    `• เพิ่มงบ ${alias} 500 / ลดงบ ${alias} 500`,
     `• ตั้ง ROI ${alias} 3.5`,
     `• พัก ${alias} / เปิดใหม่ ${alias}`,
     `• คูปอง ${alias} 2026-07-21 20:00 ก่อน 30 นาที งบ 5000`,

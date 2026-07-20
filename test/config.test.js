@@ -74,6 +74,12 @@ test("config normalizes the safe pilot defaults", () => {
   assert.equal(Object.hasOwn(config.clients[0], "telemetry"), false);
 });
 
+test("client display names are bounded for downstream LINE payloads", () => {
+  const input = validInput();
+  input.clients[0].name = "x".repeat(81);
+  assert.throws(() => validateConfig(input), /no longer than 80 characters/);
+});
+
 test("pilot config requires a Business Center identity and THB", () => {
   const missingBc = validInput();
   delete missingBc.clients[0].storeAuthorizedBcId;
