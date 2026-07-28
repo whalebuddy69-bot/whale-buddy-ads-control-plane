@@ -124,6 +124,9 @@ function parseAutoBoostDefinition(text) {
 export function parseControlCommand(text) {
   if (typeof text !== "string" || text.length === 0 || text.length > 800) return null;
   const value = cleanText(text);
+  if (/^(?:LINE\s*ID|ไลน์\s*ไอดี)(?:\s+ของฉัน)?$/iu.test(value)) {
+    return { kind: "my_line_id" };
+  }
   const shortcut = parseShortcutDefinition(text);
   if (shortcut) return shortcut;
   const autoBoost = parseAutoBoostDefinition(text);
@@ -219,6 +222,16 @@ export function parseControlCommand(text) {
   if (match) {
     const clientAlias = commandClientAlias(match[1]);
     return clientAlias ? { kind: "status", clientAlias } : null;
+  }
+  match = value.match(/^(?:เชื่อม|อนุญาต)\s+TikTok(?:\s+API)?\s+(\S+)$/iu);
+  if (match) {
+    const clientAlias = commandClientAlias(match[1]);
+    return clientAlias ? { kind: "tiktok_oauth_start", clientAlias } : null;
+  }
+  match = value.match(/^(?:ตรวจ|ตรวจสอบ)\s+TikTok(?:\s+API)?\s+(\S+)$/iu);
+  if (match) {
+    const clientAlias = commandClientAlias(match[1]);
+    return clientAlias ? { kind: "tiktok_api_preflight", clientAlias } : null;
   }
   match = value.match(/^รายงาน\s+(\S+)\s+ทุก\s+(\d{1,2})\s*ชั่วโมง$/u);
   if (match) {
@@ -1219,6 +1232,8 @@ export function controlHelpText(client) {
     `วิธีใช้ ${client.name}`,
     "• เมนู (เปิด Command Center)",
     `• สถานะ ${alias}`,
+    `• เชื่อม TikTok API ${alias}`,
+    `• ตรวจสอบ TikTok API ${alias}`,
     `• รายงาน ${alias} ทุก 2 ชั่วโมง`,
     `• หยุดรายงาน ${alias}`,
     `• ดู shortcut ${alias}`,

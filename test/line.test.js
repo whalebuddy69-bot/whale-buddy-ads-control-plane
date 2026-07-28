@@ -10,6 +10,17 @@ import {
   verifyLineSignature
 } from "../src/line.js";
 
+test("LINE client does not serialize its access token", () => {
+  const accessToken = "line-access-token-sentinel";
+  const client = new LineClient({
+    accessToken,
+    fetchImpl: async () => {
+      throw new Error("not called");
+    }
+  });
+  assert.doesNotMatch(JSON.stringify(client), new RegExp(accessToken));
+});
+
 test("verifyLineSignature validates the unparsed webhook bytes", () => {
   const raw = Buffer.from('{"events":[]}');
   const secret = "line-secret";

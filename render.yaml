@@ -33,6 +33,20 @@ services:
         value: "false"
       - key: STARTUP_VALIDATION_ENABLED
         value: "false"
+      - key: TIKTOK_API_CONTROL_ENABLED
+        value: "false"
+      - key: TIKTOK_APP_ID
+        value: "7667234745498992657"
+      - key: TIKTOK_APP_SECRET
+        sync: false
+      - key: TIKTOK_OAUTH_REDIRECT_URI
+        value: https://whale-buddy-ads-control-plane.onrender.com/oauth/tiktok/callback
+      - key: TIKTOK_OAUTH_STATE_SECRET
+        generateValue: true
+      - key: TIKTOK_TOKEN_ENCRYPTION_KEY
+        generateValue: true
+      - key: TIKTOK_OAUTH_ADMIN_LINE_USER_IDS
+        sync: false
       - key: CHROME_TELEMETRY_ENABLED
         value: "true"
       - key: CHROME_TELEMETRY_ALERTS_ENABLED

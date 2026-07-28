@@ -8,6 +8,9 @@ import { verifyLineSignature } from "./line.js";
 import { BudgetGuardService } from "./service.js";
 import { SqliteStore } from "./store.js";
 import { TikTokClient } from "./tiktok.js";
+import { TikTokOAuthClient } from "./tiktok-oauth.js";
+import { TikTokCredentialRouter } from "./tiktok-credential-router.js";
+import { TikTokApiControl } from "./tiktok-api-control.js";
 import { LineClient } from "./line.js";
 import {
   TelemetryError,
@@ -20,6 +23,21 @@ import {
 } from "./telemetry.js";
 
 const MAX_BODY_BYTES = 1_000_000;
+const TIKTOK_OAUTH_INVALID_STATE_CODES = new Set([
+  "TIKTOK_OAUTH_INVALID_STATE",
+  "TIKTOK_OAUTH_STATE_NOT_FOUND",
+  "TIKTOK_OAUTH_STATE_BINDING_MISMATCH",
+  "TIKTOK_OAUTH_STATE_EXPIRED"
+]);
+const TIKTOK_OAUTH_REPLAY_CODES = new Set([
+  "TIKTOK_OAUTH_STATE_ALREADY_CONSUMED",
+  "TIKTOK_OAUTH_STATE_REUSED",
+  "CONCURRENT_MODIFICATION"
+]);
+const TIKTOK_OAUTH_TEMPORARY_UPSTREAM_CODES = new Set([
+  "TIKTOK_OAUTH_TIMEOUT",
+  "TIKTOK_OAUTH_TRANSPORT_ERROR"
+]);
 
 function environmentFlag(environment, name, fallback = false) {
   const value = environment[name];
@@ -29,6 +47,7 @@ function environmentFlag(environment, name, fallback = false) {
 
 export function resolveRuntimeMode(environment = process.env) {
   const controlPlaneOnly = environmentFlag(environment, "CONTROL_PLANE_ONLY", false);
+  const tiktokApiControlEnabled = environmentFlag(environment, "TIKTOK_API_CONTROL_ENABLED", false);
   const chromeTelemetryEnabled = environmentFlag(environment, "CHROME_TELEMETRY_ENABLED", false);
   const telemetryAlertsEnabled = environmentFlag(environment, "CHROME_TELEMETRY_ALERTS_ENABLED", false);
   if (telemetryAlertsEnabled && !chromeTelemetryEnabled) {
@@ -39,6 +58,7 @@ export function resolveRuntimeMode(environment = process.env) {
   }
   return {
     controlPlaneOnly,
+    tiktokApiControlEnabled,
     telemetryAlertsEnabled,
     executionEnabled: controlPlaneOnly
       ? false
@@ -52,8 +72,9 @@ export function resolveRuntimeMode(environment = process.env) {
     adapters: {
       line: { enabled: true, source: "messaging-api" },
       tiktok: {
-        enabled: !controlPlaneOnly,
-        source: controlPlaneOnly ? null : "business-api"
+        enabled: !controlPlaneOnly || tiktokApiControlEnabled,
+        source: !controlPlaneOnly || tiktokApiControlEnabled ? "business-api" : null,
+        writeMode: !controlPlaneOnly ? "budget-executor" : tiktokApiControlEnabled ? "read-only" : "disabled"
       },
       chromeTelemetry: {
         enabled: chromeTelemetryEnabled,
@@ -75,7 +96,57 @@ export function resolveTelemetryOptions(environment = process.env) {
 export function requiredEnvironmentVariables(runtime) {
   const required = ["LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN", "ADMIN_API_KEY"];
   if (!runtime.controlPlaneOnly) required.push("TIKTOK_ACCESS_TOKEN");
+  if (runtime.tiktokApiControlEnabled) {
+    required.push(
+      "TIKTOK_APP_ID",
+      "TIKTOK_APP_SECRET",
+      "TIKTOK_OAUTH_REDIRECT_URI",
+      "TIKTOK_OAUTH_STATE_SECRET",
+      "TIKTOK_TOKEN_ENCRYPTION_KEY",
+      "TIKTOK_OAUTH_ADMIN_LINE_USER_IDS"
+    );
+  }
   return required;
+}
+
+export function deriveTikTokTokenEncryptionKey(value) {
+  if (typeof value !== "string" || Buffer.byteLength(value, "utf8") < 32) {
+    throw new Error("TIKTOK_TOKEN_ENCRYPTION_KEY must contain at least 32 bytes of secret input");
+  }
+  return crypto.createHash("sha256").update(value, "utf8").digest();
+}
+
+export function parseTikTokOAuthAdminLineUserIds(value) {
+  if (typeof value !== "string" || value.trim() === "") {
+    throw new Error("TIKTOK_OAUTH_ADMIN_LINE_USER_IDS is required");
+  }
+  const ids = value.split(",").map((item) => item.trim());
+  if (
+    ids.length === 0
+    || new Set(ids).size !== ids.length
+    || ids.some((id) => !/^U[0-9a-f]{32}$/i.test(id))
+  ) {
+    throw new Error(
+      "TIKTOK_OAUTH_ADMIN_LINE_USER_IDS must be unique LINE user IDs separated by commas"
+    );
+  }
+  return Object.freeze(ids);
+}
+
+export function tiktokOAuthCallbackHttpStatus(error) {
+  const code = typeof error?.code === "string" ? error.code : "";
+  if (TIKTOK_OAUTH_INVALID_STATE_CODES.has(code)) return 400;
+  if (TIKTOK_OAUTH_REPLAY_CODES.has(code)) return 409;
+  if (TIKTOK_OAUTH_TEMPORARY_UPSTREAM_CODES.has(code)) return 503;
+  if (
+    code === "TIKTOK_OAUTH_HTTP_ERROR"
+    && Number.isInteger(error?.status)
+    && error.status >= 500
+  ) {
+    return 503;
+  }
+  if (code.startsWith("TIKTOK_OAUTH_")) return 502;
+  return 500;
 }
 
 export function assertRuntimeCompatibility(config, runtime) {
@@ -95,6 +166,15 @@ export function assertRuntimeCompatibility(config, runtime) {
 function jsonResponse(response, status, body) {
   response.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   response.end(JSON.stringify(body));
+}
+
+function htmlResponse(response, status, body) {
+  response.writeHead(status, {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-store",
+    "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'"
+  });
+  response.end(body);
 }
 
 function telemetryHttpStatus(error) {
@@ -175,6 +255,7 @@ export function lineWebhookHttpStatus(results) {
 export function createHttpServer({
   service,
   store,
+  tiktokApiControl = null,
   channelSecret,
   adminApiKey,
   runtime,
@@ -222,8 +303,63 @@ export function createHttpServer({
             ).length,
             autoBoostWriteMode: "dry-run"
           },
+          tiktokApiControl: {
+            enabled: Boolean(tiktokApiControl),
+            mode: tiktokApiControl ? "read-only-preflight" : "disabled"
+          },
           adapters
         });
+      }
+
+      if (request.method === "GET" && url.pathname === "/oauth/tiktok/callback") {
+        if (!tiktokApiControl) {
+          return htmlResponse(
+            response,
+            503,
+            "<!doctype html><meta charset=\"utf-8\"><title>TikTok API unavailable</title><p>ระบบเชื่อม TikTok API ยังไม่เปิดใช้งาน</p>"
+          );
+        }
+        const authCode = url.searchParams.get("auth_code");
+        const state = url.searchParams.get("state");
+        if (!authCode || !state) {
+          return htmlResponse(
+            response,
+            400,
+            "<!doctype html><meta charset=\"utf-8\"><title>TikTok authorization failed</title><p>ข้อมูลอนุญาตจาก TikTok ไม่ครบ กรุณาเริ่มเชื่อมใหม่จาก LINE</p>"
+          );
+        }
+        try {
+          const result = await tiktokApiControl.completeAuthorization({ authCode, state });
+          return htmlResponse(
+            response,
+            200,
+            [
+              "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+              "<title>TikTok API connected</title>",
+              "<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1.25rem;color:#123}h1{color:#135c3b}</style>",
+              "<h1>เชื่อม TikTok API สำเร็จ</h1>",
+              `<p>อนุญาตแล้ว ${result.advertiserIds.length} Ad Account</p>`,
+              "<p>กลับไปที่ LINE แล้วพิมพ์ <strong>ตรวจสอบ TikTok API Ppan</strong></p>",
+              "<p>หน้านี้ไม่แสดง Access Token หรือ App Secret</p>"
+            ].join("")
+          );
+        } catch (error) {
+          const status = tiktokOAuthCallbackHttpStatus(error);
+          logger.error("tiktok oauth callback failed", {
+            path: url.pathname,
+            status,
+            code: error?.code ?? "internal_error"
+          });
+          return htmlResponse(
+            response,
+            status,
+            [
+              "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+              "<title>TikTok authorization failed</title>",
+              "<p>เชื่อม TikTok API ไม่สำเร็จ กรุณากลับไปที่ LINE แล้วเริ่มเชื่อมใหม่</p>"
+            ].join("")
+          );
+        }
       }
 
       if (request.method === "POST" && url.pathname === "/webhooks/line") {
@@ -558,6 +694,12 @@ export async function startFromEnvironment() {
   if (process.env.ADMIN_API_KEY.length < 43) {
     throw new Error("ADMIN_API_KEY must contain at least 32 random bytes (43+ base64url characters)");
   }
+  const tiktokTokenEncryptionKey = runtime.tiktokApiControlEnabled
+    ? deriveTikTokTokenEncryptionKey(process.env.TIKTOK_TOKEN_ENCRYPTION_KEY)
+    : null;
+  const tiktokOAuthAdminLineUserIds = runtime.tiktokApiControlEnabled
+    ? parseTikTokOAuthAdminLineUserIds(process.env.TIKTOK_OAUTH_ADMIN_LINE_USER_IDS)
+    : null;
 
   const config = loadConfig();
   assertRuntimeCompatibility(config, runtime);
@@ -571,22 +713,52 @@ export async function startFromEnvironment() {
   }
   const line = new LineClient({ accessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
   const tiktok = runtime.adapters.tiktok.enabled
+    && !runtime.controlPlaneOnly
     ? new TikTokClient({
         accessToken: process.env.TIKTOK_ACCESS_TOKEN,
         baseUrl: process.env.TIKTOK_API_BASE_URL
       })
     : null;
+  let tiktokApiControl = null;
+  if (runtime.tiktokApiControlEnabled) {
+    const oauthClient = new TikTokOAuthClient({
+      appId: process.env.TIKTOK_APP_ID,
+      appSecret: process.env.TIKTOK_APP_SECRET,
+      stateSecret: process.env.TIKTOK_OAUTH_STATE_SECRET,
+      redirectUri: process.env.TIKTOK_OAUTH_REDIRECT_URI,
+      apiBaseUrl: process.env.TIKTOK_API_BASE_URL
+    });
+    const credentialRouter = new TikTokCredentialRouter({
+      store,
+      encryptionKey: tiktokTokenEncryptionKey,
+      appId: process.env.TIKTOK_APP_ID,
+      credentialOwnerId: config.agencyId,
+      baseUrl: process.env.TIKTOK_API_BASE_URL
+    });
+    tiktokApiControl = new TikTokApiControl({
+      oauthClient,
+      credentialRouter,
+      store,
+      line,
+      config,
+      appId: process.env.TIKTOK_APP_ID,
+      oauthAdminLineUserIds: tiktokOAuthAdminLineUserIds,
+      encryptionKey: tiktokTokenEncryptionKey
+    });
+  }
   const service = new BudgetGuardService({
     config,
     store,
     line,
     tiktok,
+    tiktokApiControl,
     executionEnabled: runtime.executionEnabled,
     telemetryAlertsEnabled: runtime.telemetryAlertsEnabled
   });
   const server = createHttpServer({
     service,
     store,
+    tiktokApiControl,
     channelSecret: process.env.LINE_CHANNEL_SECRET,
     adminApiKey: process.env.ADMIN_API_KEY,
     runtime,

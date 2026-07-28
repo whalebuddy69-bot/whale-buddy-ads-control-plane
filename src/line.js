@@ -265,6 +265,12 @@ export function buildObservedBudgetChangeMessage({
 }
 
 export class LineClient {
+  #accessToken;
+  #fetch;
+  #apiBase;
+  #replyTimeoutMs;
+  #pushTimeoutMs;
+
   constructor({
     accessToken,
     fetchImpl = globalThis.fetch,
@@ -273,22 +279,22 @@ export class LineClient {
     pushTimeoutMs = 10_000
   }) {
     if (!accessToken) throw new Error("LINE access token is required");
-    this.accessToken = accessToken;
-    this.fetch = fetchImpl;
-    this.apiBase = apiBase;
-    this.replyTimeoutMs = replyTimeoutMs;
-    this.pushTimeoutMs = pushTimeoutMs;
+    this.#accessToken = accessToken;
+    this.#fetch = fetchImpl;
+    this.#apiBase = apiBase;
+    this.#replyTimeoutMs = replyTimeoutMs;
+    this.#pushTimeoutMs = pushTimeoutMs;
   }
 
-  async #request(path, payload, { retryKey, timeoutMs = this.pushTimeoutMs } = {}) {
+  async #request(path, payload, { retryKey, timeoutMs = this.#pushTimeoutMs } = {}) {
     const headers = {
-      authorization: `Bearer ${this.accessToken}`,
+      authorization: `Bearer ${this.#accessToken}`,
       "content-type": "application/json"
     };
     if (retryKey) headers["x-line-retry-key"] = retryKey;
     let response;
     try {
-      response = await this.fetch(`${this.apiBase}${path}`, {
+      response = await this.#fetch(`${this.#apiBase}${path}`, {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
@@ -328,7 +334,7 @@ export class LineClient {
     return this.#request(
       "/reply",
       { replyToken, messages: Array.isArray(messages) ? messages : [messages] },
-      { timeoutMs: this.replyTimeoutMs }
+      { timeoutMs: this.#replyTimeoutMs }
     );
   }
 

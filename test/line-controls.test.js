@@ -79,6 +79,17 @@ test("parses bounded Ppan menu, report, action, and coupon commands", () => {
     clientAlias: "Ppan",
     intervalHours: 2
   });
+  assert.deepEqual(parseControlCommand("เชื่อม TikTok API Ppan"), {
+    kind: "tiktok_oauth_start",
+    clientAlias: "Ppan"
+  });
+  assert.deepEqual(parseControlCommand("ตรวจสอบ TikTok API Ppan"), {
+    kind: "tiktok_api_preflight",
+    clientAlias: "Ppan"
+  });
+  assert.deepEqual(parseControlCommand("LINE ID ของฉัน"), {
+    kind: "my_line_id"
+  });
   assert.deepEqual(parseControlCommand("ตั้งงบ Ppan 2,500"), {
     kind: "action",
     action: "UPDATE_BUDGET",

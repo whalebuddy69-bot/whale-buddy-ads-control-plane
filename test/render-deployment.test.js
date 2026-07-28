@@ -42,6 +42,7 @@ test("Render Blueprint is locked to the safe single-instance control plane", () 
     "EXECUTION_ENABLED",
     "MONITOR_ENABLED",
     "STARTUP_VALIDATION_ENABLED",
+    "TIKTOK_API_CONTROL_ENABLED",
     "CHROME_TELEMETRY_ENABLED",
     "CHROME_TELEMETRY_ALERTS_ENABLED"
   ]) {
@@ -59,6 +60,11 @@ test("Render Blueprint is locked to the safe single-instance control plane", () 
   assert.match(blueprint, /- key: ADMIN_API_KEY\n\s+generateValue: true/);
   assert.match(blueprint, /- key: LINE_CHANNEL_SECRET\n\s+sync: false/);
   assert.match(blueprint, /- key: LINE_CHANNEL_ACCESS_TOKEN\n\s+sync: false/);
+  assert.match(blueprint, /- key: TIKTOK_APP_ID\n\s+value: ["']7667234745498992657["']/);
+  assert.match(blueprint, /- key: TIKTOK_APP_SECRET\n\s+sync: false/);
+  assert.match(blueprint, /- key: TIKTOK_OAUTH_STATE_SECRET\n\s+generateValue: true/);
+  assert.match(blueprint, /- key: TIKTOK_TOKEN_ENCRYPTION_KEY\n\s+generateValue: true/);
+  assert.match(blueprint, /- key: TIKTOK_OAUTH_ADMIN_LINE_USER_IDS\n\s+sync: false/);
   assert.doesNotMatch(blueprint, /TIKTOK_ACCESS_TOKEN/);
 });
 

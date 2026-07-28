@@ -153,6 +153,42 @@ function jsonArray(value, field) {
   return parseJson(json(value, field));
 }
 
+function uniqueStringArray(value, field) {
+  if (!Array.isArray(value) || value.length === 0) {
+    throw new DomainError('INVALID_REQUEST', `${field} must be a non-empty array`, { field });
+  }
+  const normalized = value.map((item, index) => {
+    const exact = requiredString(item, `${field}[${index}]`);
+    if (item !== exact) {
+      throw new DomainError(
+        'INVALID_REQUEST',
+        `${field}[${index}] must not contain surrounding whitespace`,
+        { field: `${field}[${index}]` },
+      );
+    }
+    return exact;
+  });
+  if (new Set(normalized).size !== normalized.length) {
+    throw new DomainError('INVALID_REQUEST', `${field} must not contain duplicates`, { field });
+  }
+  return Object.freeze(normalized);
+}
+
+function opaqueEncryptedBlob(value, field = 'encryptedBlob') {
+  if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
+    throw new DomainError(
+      'INVALID_REQUEST',
+      `${field} must be an opaque encrypted byte buffer`,
+      { field },
+    );
+  }
+  const copy = Buffer.from(value);
+  if (copy.length === 0) {
+    throw new DomainError('INVALID_REQUEST', `${field} must not be empty`, { field });
+  }
+  return copy;
+}
+
 /**
  * Synchronous SQLite repository. A BEGIN IMMEDIATE transaction plus a
  * state/version compare-and-set makes approval single-use, including when more
@@ -245,6 +281,51 @@ export class SqliteStore {
           OR (consumed_at >= created_at AND consumed_at < expires_at)
         ),
         CHECK(invalidated_at IS NULL OR invalidated_at >= created_at)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS tiktok_oauth_states (
+        id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        line_user_id TEXT NOT NULL,
+        nonce_hash TEXT NOT NULL UNIQUE
+          CHECK(length(nonce_hash) = 64 AND nonce_hash NOT GLOB '*[^0-9a-f]*'),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT,
+        CHECK(expires_at > created_at),
+        CHECK(
+          consumed_at IS NULL
+          OR (consumed_at >= created_at AND consumed_at < expires_at)
+        )
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS tiktok_credentials (
+        credential_ref TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        app_id TEXT NOT NULL,
+        advertiser_ids_json TEXT NOT NULL,
+        encrypted_blob BLOB NOT NULL
+          CHECK(typeof(encrypted_blob) = 'blob' AND length(encrypted_blob) > 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        revoked_at TEXT,
+        replaced_by_credential_ref TEXT,
+        FOREIGN KEY(replaced_by_credential_ref)
+          REFERENCES tiktok_credentials(credential_ref),
+        CHECK(updated_at >= created_at),
+        CHECK(revoked_at IS NULL OR revoked_at >= created_at),
+        CHECK(
+          (revoked_at IS NULL AND replaced_by_credential_ref IS NULL)
+          OR revoked_at IS NOT NULL
+        )
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS tiktok_advertiser_credentials (
+        advertiser_id TEXT PRIMARY KEY,
+        credential_ref TEXT NOT NULL,
+        mapped_at TEXT NOT NULL,
+        FOREIGN KEY(credential_ref)
+          REFERENCES tiktok_credentials(credential_ref)
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS telemetry_enrollments (
@@ -515,6 +596,12 @@ export class SqliteStore {
         WHERE consumed_at IS NULL AND invalidated_at IS NULL;
       CREATE INDEX IF NOT EXISTS line_pairing_tokens_lookup_idx
         ON line_pairing_tokens(client_id, code_hash);
+      CREATE INDEX IF NOT EXISTS tiktok_oauth_states_binding_idx
+        ON tiktok_oauth_states(client_id, line_user_id, expires_at);
+      CREATE INDEX IF NOT EXISTS tiktok_credentials_client_idx
+        ON tiktok_credentials(client_id, revoked_at, updated_at);
+      CREATE INDEX IF NOT EXISTS tiktok_advertiser_credentials_ref_idx
+        ON tiktok_advertiser_credentials(credential_ref);
       CREATE UNIQUE INDEX IF NOT EXISTS telemetry_enrollments_one_open_idx
         ON telemetry_enrollments(client_id)
         WHERE consumed_at IS NULL AND invalidated_at IS NULL;
@@ -552,6 +639,43 @@ export class SqliteStore {
         );
       CREATE INDEX IF NOT EXISTS audit_events_request_idx
         ON audit_events(request_id, sequence);
+
+      CREATE TRIGGER IF NOT EXISTS tiktok_advertiser_credentials_active_insert
+      BEFORE INSERT ON tiktok_advertiser_credentials
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM tiktok_credentials credential
+        WHERE credential.credential_ref = NEW.credential_ref
+          AND credential.revoked_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'TIKTOK_CREDENTIAL_NOT_ACTIVE');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS tiktok_advertiser_credentials_active_update
+      BEFORE UPDATE OF credential_ref ON tiktok_advertiser_credentials
+      WHEN NOT EXISTS (
+        SELECT 1
+        FROM tiktok_credentials credential
+        WHERE credential.credential_ref = NEW.credential_ref
+          AND credential.revoked_at IS NULL
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'TIKTOK_CREDENTIAL_NOT_ACTIVE');
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS tiktok_credentials_no_mapped_revoke
+      BEFORE UPDATE OF revoked_at ON tiktok_credentials
+      WHEN OLD.revoked_at IS NULL
+        AND NEW.revoked_at IS NOT NULL
+        AND EXISTS (
+          SELECT 1
+          FROM tiktok_advertiser_credentials mapping
+          WHERE mapping.credential_ref = OLD.credential_ref
+        )
+      BEGIN
+        SELECT RAISE(ABORT, 'TIKTOK_CREDENTIAL_STILL_MAPPED');
+      END;
     `);
   }
 
@@ -1110,6 +1234,464 @@ export class SqliteStore {
         consumedAt: at,
         approver: this.#getLineApprover(normalizedClientId, normalizedLineUserId),
       });
+    });
+  }
+
+  /**
+   * Persists a short-lived OAuth state without ever storing the raw nonce.
+   * The state is bound to both the configured client and the LINE user who
+   * initiated authorization.
+   */
+  createTikTokOAuthState({
+    clientId,
+    lineUserId,
+    nonceHash,
+    createdAt,
+    expiresAt,
+  } = {}) {
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedLineUserId = requiredString(lineUserId, 'lineUserId');
+    const normalizedHash = sha256Hash(nonceHash, 'nonceHash');
+    const created = requiredIsoTime(createdAt, 'createdAt');
+    const expires = requiredIsoTime(expiresAt, 'expiresAt');
+    if (Date.parse(expires) <= Date.parse(created)) {
+      throw new DomainError('INVALID_REQUEST', 'expiresAt must be later than createdAt', {
+        field: 'expiresAt',
+      });
+    }
+
+    return this.#transaction(() => {
+      const stateId = `tos_${randomUUID()}`;
+      try {
+        this.db.prepare(`
+          INSERT INTO tiktok_oauth_states
+            (id, client_id, line_user_id, nonce_hash, created_at, expires_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `).run(
+          stateId,
+          normalizedClientId,
+          normalizedLineUserId,
+          normalizedHash,
+          created,
+          expires,
+        );
+      } catch (error) {
+        if (String(error.message).includes('tiktok_oauth_states.nonce_hash')) {
+          throw new DomainError(
+            'TIKTOK_OAUTH_STATE_REUSED',
+            'OAuth state nonce has already been registered',
+          );
+        }
+        throw error;
+      }
+      this.#insertAudit({
+        eventType: 'TIKTOK_OAUTH_STATE_CREATED',
+        actorType: 'LINE_USER',
+        actorId: normalizedLineUserId,
+        occurredAt: created,
+        details: {
+          stateId,
+          clientId: normalizedClientId,
+          expiresAt: expires,
+        },
+      });
+      return Object.freeze({
+        stateId,
+        clientId: normalizedClientId,
+        lineUserId: normalizedLineUserId,
+        createdAt: created,
+        expiresAt: expires,
+      });
+    });
+  }
+
+  getTikTokOAuthStateByNonceHash(input = {}) {
+    const nonceHash = typeof input === 'string' ? input : input?.nonceHash;
+    const normalizedHash = sha256Hash(nonceHash, 'nonceHash');
+    const row = this.db.prepare(`
+      SELECT id, client_id, line_user_id, created_at, expires_at, consumed_at
+      FROM tiktok_oauth_states
+      WHERE nonce_hash = ?
+    `).get(normalizedHash);
+    return row
+      ? Object.freeze({
+          stateId: row.id,
+          clientId: row.client_id,
+          lineUserId: row.line_user_id,
+          createdAt: row.created_at,
+          expiresAt: row.expires_at,
+          consumedAt: row.consumed_at,
+        })
+      : null;
+  }
+
+  /**
+   * Atomically consumes one matching OAuth state. The update predicate repeats
+   * every binding and time check so a second process cannot replay the state.
+   * A callback may omit clientId/lineUserId and receive the durable binding;
+   * when either is supplied, both are required and must match exactly.
+   */
+  consumeTikTokOAuthState({
+    clientId,
+    lineUserId,
+    nonceHash,
+    consumedAt,
+  } = {}) {
+    const hasBinding = clientId !== undefined || lineUserId !== undefined;
+    if (hasBinding && (clientId === undefined || lineUserId === undefined)) {
+      throw new DomainError(
+        'INVALID_REQUEST',
+        'clientId and lineUserId must be supplied together when validating an OAuth binding',
+      );
+    }
+    const normalizedClientId = hasBinding ? requiredString(clientId, 'clientId') : null;
+    const normalizedLineUserId = hasBinding ? requiredString(lineUserId, 'lineUserId') : null;
+    const normalizedHash = sha256Hash(nonceHash, 'nonceHash');
+    const at = requiredIsoTime(consumedAt, 'consumedAt');
+
+    return this.#transaction(() => {
+      const state = this.db.prepare(`
+        SELECT id, client_id, line_user_id, created_at, expires_at, consumed_at
+        FROM tiktok_oauth_states
+        WHERE nonce_hash = ?
+      `).get(normalizedHash);
+      if (!state) {
+        throw new DomainError('TIKTOK_OAUTH_STATE_NOT_FOUND', 'OAuth state is not valid');
+      }
+      if (hasBinding && (
+        state.client_id !== normalizedClientId
+        || state.line_user_id !== normalizedLineUserId
+      )) {
+        throw new DomainError(
+          'TIKTOK_OAUTH_STATE_BINDING_MISMATCH',
+          'OAuth state does not belong to this client and LINE user',
+          { clientId: normalizedClientId },
+        );
+      }
+      if (state.consumed_at !== null) {
+        throw new DomainError(
+          'TIKTOK_OAUTH_STATE_ALREADY_CONSUMED',
+          'OAuth state has already been used',
+          { stateId: state.id },
+        );
+      }
+      if (Date.parse(at) < Date.parse(state.created_at)) {
+        throw new DomainError('INVALID_REQUEST', 'consumedAt cannot be earlier than createdAt', {
+          field: 'consumedAt',
+        });
+      }
+      if (Date.parse(at) >= Date.parse(state.expires_at)) {
+        throw new DomainError(
+          'TIKTOK_OAUTH_STATE_EXPIRED',
+          'OAuth state has expired',
+          { stateId: state.id, expiresAt: state.expires_at },
+        );
+      }
+
+      const consumed = this.db.prepare(`
+        UPDATE tiktok_oauth_states
+        SET consumed_at = ?
+        WHERE id = ? AND client_id = ? AND line_user_id = ?
+          AND consumed_at IS NULL AND created_at <= ? AND expires_at > ?
+      `).run(
+        at,
+        state.id,
+        state.client_id,
+        state.line_user_id,
+        at,
+        at,
+      );
+      if (consumed.changes !== 1) {
+        throw new DomainError(
+          'CONCURRENT_MODIFICATION',
+          'OAuth state changed while it was being consumed',
+          { stateId: state.id },
+        );
+      }
+      this.#insertAudit({
+        eventType: 'TIKTOK_OAUTH_STATE_CONSUMED',
+        actorType: 'LINE_USER',
+        actorId: state.line_user_id,
+        occurredAt: at,
+        details: {
+          stateId: state.id,
+          clientId: state.client_id,
+        },
+      });
+      return Object.freeze({
+        consumed: true,
+        stateId: state.id,
+        clientId: state.client_id,
+        lineUserId: state.line_user_id,
+        consumedAt: at,
+      });
+    });
+  }
+
+  #mapTikTokCredential(row) {
+    const advertiserIds = uniqueStringArray(
+      parseJson(row.advertiser_ids_json),
+      'advertiserIds',
+    );
+    return Object.freeze({
+      credentialRef: row.credential_ref,
+      clientId: row.client_id,
+      appId: row.app_id,
+      advertiserIds,
+      encryptedBlob: Buffer.from(row.encrypted_blob),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      revokedAt: row.revoked_at,
+      replacedByCredentialRef: row.replaced_by_credential_ref,
+    });
+  }
+
+  getTikTokCredential(input = {}) {
+    const credentialRef = typeof input === 'string' ? input : input?.credentialRef;
+    const row = this.db.prepare(`
+      SELECT credential_ref, client_id, app_id, advertiser_ids_json,
+             encrypted_blob, created_at, updated_at, revoked_at,
+             replaced_by_credential_ref
+      FROM tiktok_credentials
+      WHERE credential_ref = ?
+    `).get(requiredString(credentialRef, 'credentialRef'));
+    return row ? this.#mapTikTokCredential(row) : null;
+  }
+
+  getTikTokCredentialByAdvertiserId(input = {}) {
+    const advertiserId = typeof input === 'string' ? input : input?.advertiserId;
+    const normalizedAdvertiserId = requiredString(advertiserId, 'advertiserId');
+    const row = this.db.prepare(`
+      SELECT credential.credential_ref, credential.client_id, credential.app_id,
+             credential.advertiser_ids_json, credential.encrypted_blob,
+             credential.created_at, credential.updated_at, credential.revoked_at,
+             credential.replaced_by_credential_ref
+      FROM tiktok_advertiser_credentials mapping
+      JOIN tiktok_credentials credential
+        ON credential.credential_ref = mapping.credential_ref
+      WHERE mapping.advertiser_id = ?
+    `).get(normalizedAdvertiserId);
+    if (!row) return null;
+    if (row.revoked_at !== null) {
+      throw new DomainError(
+        'TIKTOK_CREDENTIAL_MAPPING_INVALID',
+        'Advertiser is mapped to a revoked TikTok credential',
+        { advertiserId: normalizedAdvertiserId },
+      );
+    }
+    const credential = this.#mapTikTokCredential(row);
+    if (!credential.advertiserIds.includes(normalizedAdvertiserId)) {
+      throw new DomainError(
+        'TIKTOK_CREDENTIAL_MAPPING_INVALID',
+        'Advertiser mapping is outside the credential grant',
+        { advertiserId: normalizedAdvertiserId },
+      );
+    }
+    return credential;
+  }
+
+  /**
+   * Activates one already-encrypted credential and atomically routes its exact
+   * advertiser grant. A mapping owned by another client is never stolen.
+   * Replaced credentials are revoked only after their last mapping is moved.
+   */
+  saveTikTokCredential({
+    credentialRef,
+    clientId,
+    appId,
+    advertiserIds,
+    encryptedBlob,
+    createdAt,
+    updatedAt,
+  } = {}) {
+    const normalizedCredentialRef = requiredString(credentialRef, 'credentialRef');
+    const normalizedClientId = requiredString(clientId, 'clientId');
+    const normalizedAppId = requiredString(appId, 'appId');
+    const normalizedAdvertiserIds = uniqueStringArray(advertiserIds, 'advertiserIds');
+    const opaqueBlob = opaqueEncryptedBlob(encryptedBlob);
+    const created = requiredIsoTime(createdAt, 'createdAt');
+    const updated = requiredIsoTime(updatedAt, 'updatedAt');
+    if (Date.parse(updated) < Date.parse(created)) {
+      throw new DomainError('INVALID_REQUEST', 'updatedAt cannot be earlier than createdAt', {
+        field: 'updatedAt',
+      });
+    }
+
+    return this.#transaction(() => {
+      if (this.getTikTokCredential({ credentialRef: normalizedCredentialRef })) {
+        throw new DomainError(
+          'TIKTOK_CREDENTIAL_EXISTS',
+          'TikTok credential reference already exists',
+          { credentialRef: normalizedCredentialRef },
+        );
+      }
+
+      const existingMappings = [];
+      const lookupMapping = this.db.prepare(`
+        SELECT mapping.advertiser_id, mapping.credential_ref,
+               credential.client_id, credential.updated_at, credential.revoked_at
+        FROM tiktok_advertiser_credentials mapping
+        JOIN tiktok_credentials credential
+          ON credential.credential_ref = mapping.credential_ref
+        WHERE mapping.advertiser_id = ?
+      `);
+      for (const advertiserId of normalizedAdvertiserIds) {
+        const mapping = lookupMapping.get(advertiserId);
+        if (!mapping) continue;
+        if (mapping.revoked_at !== null) {
+          throw new DomainError(
+            'TIKTOK_CREDENTIAL_MAPPING_INVALID',
+            'Advertiser is mapped to a revoked TikTok credential',
+            { advertiserId },
+          );
+        }
+        if (mapping.client_id !== normalizedClientId) {
+          throw new DomainError(
+            'TIKTOK_ADVERTISER_OWNERSHIP_CONFLICT',
+            'Advertiser is already mapped to another client',
+            { advertiserId, clientId: normalizedClientId },
+          );
+        }
+        if (Date.parse(mapping.updated_at) >= Date.parse(updated)) {
+          throw new DomainError(
+            'TIKTOK_CREDENTIAL_STALE',
+            'An equally new or newer TikTok credential mapping already exists',
+            { advertiserId },
+          );
+        }
+        existingMappings.push(mapping);
+      }
+
+      this.db.prepare(`
+        INSERT INTO tiktok_credentials
+          (credential_ref, client_id, app_id, advertiser_ids_json,
+           encrypted_blob, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        normalizedCredentialRef,
+        normalizedClientId,
+        normalizedAppId,
+        json(normalizedAdvertiserIds, 'advertiserIds'),
+        opaqueBlob,
+        created,
+        updated,
+      );
+
+      const upsertMapping = this.db.prepare(`
+        INSERT INTO tiktok_advertiser_credentials
+          (advertiser_id, credential_ref, mapped_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(advertiser_id) DO UPDATE SET
+          credential_ref = excluded.credential_ref,
+          mapped_at = excluded.mapped_at
+      `);
+      for (const advertiserId of normalizedAdvertiserIds) {
+        upsertMapping.run(advertiserId, normalizedCredentialRef, updated);
+      }
+
+      const previousCredentialRefs = [
+        ...new Set(existingMappings.map((mapping) => mapping.credential_ref)),
+      ];
+      const revokedCredentialRefs = [];
+      for (const previousRef of previousCredentialRefs) {
+        const remaining = this.db.prepare(`
+          SELECT COUNT(*) AS count
+          FROM tiktok_advertiser_credentials
+          WHERE credential_ref = ?
+        `).get(previousRef);
+        if (Number(remaining.count) !== 0) continue;
+        const revoked = this.db.prepare(`
+          UPDATE tiktok_credentials
+          SET updated_at = ?, revoked_at = ?, replaced_by_credential_ref = ?
+          WHERE credential_ref = ? AND revoked_at IS NULL AND updated_at <= ?
+        `).run(
+          updated,
+          updated,
+          normalizedCredentialRef,
+          previousRef,
+          updated,
+        );
+        if (revoked.changes !== 1) {
+          throw new DomainError(
+            'CONCURRENT_MODIFICATION',
+            'Replaced TikTok credential changed while it was being revoked',
+            { credentialRef: previousRef },
+          );
+        }
+        revokedCredentialRefs.push(previousRef);
+      }
+
+      this.#insertAudit({
+        eventType: 'TIKTOK_CREDENTIAL_SAVED',
+        actorType: 'SYSTEM',
+        occurredAt: updated,
+        details: {
+          credentialRef: normalizedCredentialRef,
+          clientId: normalizedClientId,
+          advertiserIds: normalizedAdvertiserIds,
+          remappedFromCredentialRefs: previousCredentialRefs,
+          revokedCredentialRefs,
+        },
+      });
+      return this.getTikTokCredential({ credentialRef: normalizedCredentialRef });
+    });
+  }
+
+  revokeTikTokCredential({ credentialRef, revokedAt } = {}) {
+    const normalizedCredentialRef = requiredString(credentialRef, 'credentialRef');
+    const at = requiredIsoTime(revokedAt, 'revokedAt');
+
+    return this.#transaction(() => {
+      const current = this.getTikTokCredential({ credentialRef: normalizedCredentialRef });
+      if (!current) {
+        throw new DomainError(
+          'TIKTOK_CREDENTIAL_NOT_FOUND',
+          'TikTok credential was not found',
+          { credentialRef: normalizedCredentialRef },
+        );
+      }
+      if (current.revokedAt !== null) return current;
+      if (Date.parse(at) < Date.parse(current.updatedAt)) {
+        throw new DomainError(
+          'INVALID_REQUEST',
+          'revokedAt cannot be earlier than updatedAt',
+          { field: 'revokedAt' },
+        );
+      }
+
+      const mappings = this.db.prepare(`
+        SELECT advertiser_id
+        FROM tiktok_advertiser_credentials
+        WHERE credential_ref = ?
+        ORDER BY advertiser_id ASC
+      `).all(normalizedCredentialRef);
+      this.db.prepare(`
+        DELETE FROM tiktok_advertiser_credentials
+        WHERE credential_ref = ?
+      `).run(normalizedCredentialRef);
+      const revoked = this.db.prepare(`
+        UPDATE tiktok_credentials
+        SET updated_at = ?, revoked_at = ?
+        WHERE credential_ref = ? AND revoked_at IS NULL
+      `).run(at, at, normalizedCredentialRef);
+      if (revoked.changes !== 1) {
+        throw new DomainError(
+          'CONCURRENT_MODIFICATION',
+          'TikTok credential changed while it was being revoked',
+          { credentialRef: normalizedCredentialRef },
+        );
+      }
+      this.#insertAudit({
+        eventType: 'TIKTOK_CREDENTIAL_REVOKED',
+        actorType: 'SYSTEM',
+        occurredAt: at,
+        details: {
+          credentialRef: normalizedCredentialRef,
+          clientId: current.clientId,
+          unmappedAdvertiserIds: mappings.map((mapping) => mapping.advertiser_id),
+        },
+      });
+      return this.getTikTokCredential({ credentialRef: normalizedCredentialRef });
     });
   }
 

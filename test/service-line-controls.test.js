@@ -192,6 +192,162 @@ test("Ppan shortcut launch is authorized, versioned, and always dry-run before a
   assert.match(line.replies.at(-1).message.text, /ไม่มีการเปลี่ยนแปลงบน TikTok/);
 });
 
+test("private LINE commands start TikTok OAuth and run read-only preflight", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const calls = [];
+  const tiktokApiControl = {
+    createAuthorizationRequest({ lineUserId }) {
+      calls.push(["start", lineUserId]);
+      return {
+        url: "https://business-api.tiktok.com/portal/auth?app_id=123&state=signed",
+        expiresAt: "2026-07-20T10:05:00.000Z"
+      };
+    },
+    async preflightClient(client) {
+      calls.push(["preflight", client.id]);
+      return {
+        decision: "BLOCKED",
+        reason: "NO_EXCLUSIVELY_AUTHORIZED_STORE",
+        advertiserId: client.advertiserId,
+        expectedIdentityId: client.campaignSelector.expectedTikTokAccountId
+      };
+    }
+  };
+  const service = new BudgetGuardService({
+    config: controlConfig(),
+    store,
+    line,
+    tiktok: null,
+    tiktokApiControl,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  await service.handleLineEvents([lineEvent({
+    id: "tiktok-oauth",
+    text: "เชื่อม TikTok API Ppan"
+  })]);
+  assert.deepEqual(calls[0], ["start", "U1"]);
+  assert.match(JSON.stringify(line.replies.at(-1).message), /อนุญาตผ่าน TikTok/);
+
+  await service.handleLineEvents([lineEvent({
+    id: "tiktok-preflight",
+    text: "ตรวจสอบ TikTok API Ppan"
+  })]);
+  assert.deepEqual(calls[1], ["preflight", "punpan_020"]);
+  assert.match(line.replies.at(-1).message.text, /read|ไม่แก้ไข TikTok/u);
+});
+
+test("private LINE command returns only the requesting user's OAuth admin ID", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const service = new BudgetGuardService({
+    config: controlConfig(),
+    store,
+    line,
+    tiktok: null,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  await service.handleLineEvents([lineEvent({
+    id: "my-line-id",
+    text: "LINE ID ของฉัน",
+    userId: "U-requesting-owner"
+  })]);
+  assert.match(line.replies.at(-1).message.text, /U-requesting-owner/);
+  assert.doesNotMatch(line.replies.at(-1).message.text, /U1/);
+});
+
+test("failed TikTok LINE replies recover without reusing OAuth links and rerun read-only preflight", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const calls = [];
+  const tiktokApiControl = {
+    createAuthorizationRequest() {
+      calls.push("oauth");
+      return {
+        url: "https://business-api.tiktok.com/portal/auth?state=signed",
+        expiresAt: "2026-07-20T10:05:00.000Z"
+      };
+    },
+    async preflightClient(client) {
+      calls.push(`preflight:${client.id}`);
+      return {
+        decision: "BLOCKED",
+        reason: "NO_EXCLUSIVELY_AUTHORIZED_STORE",
+        advertiserId: client.advertiserId,
+        expectedIdentityId: client.campaignSelector.expectedTikTokAccountId
+      };
+    }
+  };
+  const service = new BudgetGuardService({
+    config: controlConfig(),
+    store,
+    line,
+    tiktok: null,
+    tiktokApiControl,
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  line.failNextReply = true;
+  const oauth = await service.handleLineEvents([lineEvent({
+    id: "tiktok-oauth-recovery",
+    text: "เชื่อม TikTok API Ppan"
+  })]);
+  assert.equal(oauth[0].status, "FAILED");
+  await service.recoverLineWebhookEvents({ maxEvents: 1 });
+  assert.deepEqual(calls, ["oauth"]);
+  assert.match(line.pushes.at(-1).message.text, /กรุณาส่ง.*เชื่อม TikTok API Ppan/u);
+
+  line.failNextReply = true;
+  const preflight = await service.handleLineEvents([lineEvent({
+    id: "tiktok-preflight-recovery",
+    text: "ตรวจสอบ TikTok API Ppan"
+  })]);
+  assert.equal(preflight[0].status, "FAILED");
+  await service.recoverLineWebhookEvents({ maxEvents: 1 });
+  assert.equal(calls.filter((item) => item === "preflight:punpan_020").length, 2);
+  assert.match(line.pushes.at(-1).message.text, /read-only|ไม่แก้ไข TikTok/u);
+});
+
+test("expired TikTok credentials tell the operator to reconnect", async (t) => {
+  const store = new SqliteStore();
+  const line = new FakeLine();
+  const service = new BudgetGuardService({
+    config: controlConfig(),
+    store,
+    line,
+    tiktok: null,
+    tiktokApiControl: {
+      async preflightClient() {
+        const error = new Error("credential expired");
+        error.code = "TIKTOK_CREDENTIAL_EXPIRED";
+        throw error;
+      }
+    },
+    executionEnabled: false,
+    now: () => new Date("2026-07-20T10:00:00.000Z"),
+    logger: { error() {} }
+  });
+  t.after(() => store.close());
+
+  await service.handleLineEvents([lineEvent({
+    id: "tiktok-expired",
+    text: "ตรวจสอบ TikTok API Ppan"
+  })]);
+  assert.match(line.replies.at(-1).message.text, /เชื่อม TikTok API Ppan/u);
+  assert.doesNotMatch(line.replies.at(-1).message.text, /credential expired/i);
+});
+
 test("scheduled LINE report is durable and sends a stale/no-data warning once per occurrence", async (t) => {
   const store = new SqliteStore();
   const line = new FakeLine();

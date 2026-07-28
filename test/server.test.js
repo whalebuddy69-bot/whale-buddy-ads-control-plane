@@ -5,11 +5,14 @@ import {
   adminAuthorized,
   assertRuntimeCompatibility,
   createHttpServer,
+  deriveTikTokTokenEncryptionKey,
   lineWebhookHttpStatus,
+  parseTikTokOAuthAdminLineUserIds,
   requiredEnvironmentVariables,
   resolveRuntimeMode,
   resolveTelemetryOptions,
-  runNotificationCycle
+  runNotificationCycle,
+  tiktokOAuthCallbackHttpStatus
 } from "../src/server.js";
 
 const adminKey = "x".repeat(43);
@@ -32,7 +35,15 @@ async function invoke(server, { method = "GET", url = "/", headers = {}, body = 
         result.headers = responseHeaders;
       },
       end(value) {
-        result.body = value == null || value === "" ? null : JSON.parse(String(value));
+        if (value == null || value === "") {
+          result.body = null;
+        } else {
+          try {
+            result.body = JSON.parse(String(value));
+          } catch {
+            result.body = String(value);
+          }
+        }
         resolve(result);
       }
     };
@@ -52,6 +63,37 @@ test("LINE failures and active leases return 500 so LINE redelivers", () => {
   assert.equal(lineWebhookHttpStatus([{ status: "IN_PROGRESS" }]), 500);
   assert.equal(lineWebhookHttpStatus([{ status: "PROCESSED" }, { status: "DUPLICATE" }]), 200);
   assert.equal(lineWebhookHttpStatus([]), 200);
+});
+
+test("TikTok token encryption key requires 32 input bytes before one stable derivation", () => {
+  assert.throws(
+    () => deriveTikTokTokenEncryptionKey("x".repeat(31)),
+    /at least 32 bytes/
+  );
+  assert.throws(
+    () => deriveTikTokTokenEncryptionKey(null),
+    /at least 32 bytes/
+  );
+
+  const source = "0123456789abcdef".repeat(2);
+  const key = deriveTikTokTokenEncryptionKey(source);
+  assert.equal(Buffer.isBuffer(key), true);
+  assert.equal(key.byteLength, 32);
+  assert.deepEqual(
+    key,
+    crypto.createHash("sha256").update(source, "utf8").digest()
+  );
+});
+
+test("TikTok OAuth admins require explicit unique LINE user IDs", () => {
+  const first = `U${"a".repeat(32)}`;
+  const second = `U${"b".repeat(32)}`;
+  assert.deepEqual(
+    parseTikTokOAuthAdminLineUserIds(`${first}, ${second}`),
+    [first, second]
+  );
+  assert.throws(() => parseTikTokOAuthAdminLineUserIds("U-owner"), /LINE user IDs/);
+  assert.throws(() => parseTikTokOAuthAdminLineUserIds(`${first},${first}`), /unique/);
 });
 
 test("control-plane mode overrides mutation flags and does not require TikTok credentials", () => {
@@ -82,6 +124,28 @@ test("control-plane mode overrides mutation flags and does not require TikTok cr
 
   const fullRuntime = resolveRuntimeMode({});
   assert.equal(requiredEnvironmentVariables(fullRuntime).includes("TIKTOK_ACCESS_TOKEN"), true);
+
+  const apiControlRuntime = resolveRuntimeMode({
+    CONTROL_PLANE_ONLY: "true",
+    TIKTOK_API_CONTROL_ENABLED: "true"
+  });
+  assert.equal(apiControlRuntime.executionEnabled, false);
+  assert.deepEqual(apiControlRuntime.adapters.tiktok, {
+    enabled: true,
+    source: "business-api",
+    writeMode: "read-only"
+  });
+  assert.deepEqual(
+    requiredEnvironmentVariables(apiControlRuntime).slice(-6),
+    [
+      "TIKTOK_APP_ID",
+      "TIKTOK_APP_SECRET",
+      "TIKTOK_OAUTH_REDIRECT_URI",
+      "TIKTOK_OAUTH_STATE_SECRET",
+      "TIKTOK_TOKEN_ENCRYPTION_KEY",
+      "TIKTOK_OAUTH_ADMIN_LINE_USER_IDS"
+    ]
+  );
 
   const telemetryRuntime = resolveRuntimeMode({
     CONTROL_PLANE_ONLY: "true",
@@ -216,6 +280,85 @@ test("control-plane HTTP keeps health, LINE webhook, and pairing available", asy
   assert.equal(pairingResponse.status, 201);
   assert.equal(pairingResponse.body.command, "จับคู่ pilot one-time-code");
   assert.equal(calls.pairing, 1);
+});
+
+test("TikTok OAuth callback stores authorization without exposing credentials", async () => {
+  const calls = [];
+  const tiktokApiControl = {
+    async completeAuthorization(input) {
+      calls.push(input);
+      return {
+        credentialRef: "ttcred_internal",
+        advertiserIds: ["7666005333864644624"],
+        notificationSent: true
+      };
+    }
+  };
+  const server = createHttpServer({
+    service: { executionEnabled: false },
+    store: {},
+    tiktokApiControl,
+    channelSecret: "line-secret",
+    adminApiKey: adminKey,
+    runtime: resolveRuntimeMode({
+      CONTROL_PLANE_ONLY: "true",
+      TIKTOK_API_CONTROL_ENABLED: "true"
+    }),
+    logger: { error() {} }
+  });
+  const response = await invoke(server, {
+    url: "/oauth/tiktok/callback?auth_code=one-time-code&state=signed-state"
+  });
+  assert.equal(response.status, 200);
+  assert.match(response.body, /เชื่อม TikTok API สำเร็จ/);
+  assert.doesNotMatch(response.body, /ttcred_internal|one-time-code|signed-state/);
+  assert.deepEqual(calls, [{ authCode: "one-time-code", state: "signed-state" }]);
+});
+
+test("TikTok OAuth callback maps every failure to a non-2xx safe status", async () => {
+  const cases = [
+    ["TIKTOK_OAUTH_INVALID_STATE", undefined, 400],
+    ["TIKTOK_OAUTH_STATE_EXPIRED", undefined, 400],
+    ["TIKTOK_OAUTH_STATE_ALREADY_CONSUMED", undefined, 409],
+    ["TIKTOK_OAUTH_TIMEOUT", undefined, 503],
+    ["TIKTOK_OAUTH_TRANSPORT_ERROR", undefined, 503],
+    ["TIKTOK_OAUTH_HTTP_ERROR", 503, 503],
+    ["TIKTOK_OAUTH_HTTP_ERROR", 401, 502],
+    ["TIKTOK_OAUTH_API_ERROR", 200, 502],
+    ["GENERIC_CALLBACK_FAILURE", 200, 500]
+  ];
+
+  for (const [code, upstreamStatus, expectedStatus] of cases) {
+    const error = Object.assign(new Error(`secret-sentinel-${code}`), {
+      code,
+      status: upstreamStatus
+    });
+    assert.equal(tiktokOAuthCallbackHttpStatus(error), expectedStatus);
+
+    const server = createHttpServer({
+      service: { executionEnabled: false },
+      store: {},
+      tiktokApiControl: {
+        async completeAuthorization() {
+          throw error;
+        }
+      },
+      channelSecret: "line-secret",
+      adminApiKey: adminKey,
+      runtime: resolveRuntimeMode({
+        CONTROL_PLANE_ONLY: "true",
+        TIKTOK_API_CONTROL_ENABLED: "true"
+      }),
+      logger: { error() {} }
+    });
+    const response = await invoke(server, {
+      url: "/oauth/tiktok/callback?auth_code=one-time-code&state=signed-state"
+    });
+    assert.equal(response.status, expectedStatus, code);
+    assert.equal(response.status >= 200 && response.status < 300, false, code);
+    assert.match(response.headers["content-type"], /^text\/html/);
+    assert.doesNotMatch(response.body, /secret-sentinel|one-time-code|signed-state/);
+  }
 });
 
 test("control-plane HTTP refuses poll and manual requests before touching adapters", async () => {

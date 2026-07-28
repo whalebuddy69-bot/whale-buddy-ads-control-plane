@@ -28,6 +28,13 @@ function stringifyQueryValue(value) {
 
 const GMV_MAX_CAMPAIGN_PAGE_SIZE = 100;
 const GMV_MAX_CAMPAIGN_MAX_PAGES = 10_000;
+const GMV_MAX_CAMPAIGN_MAX_RESULTS = 1_000;
+const ADVERTISER_INFO_FIELDS = Object.freeze([
+  "advertiser_id",
+  "currency",
+  "timezone",
+  "status"
+]);
 
 function paginationInteger(value, { min, max }) {
   if (typeof value === "string" && !/^(0|[1-9]\d*)$/.test(value)) return null;
@@ -44,7 +51,40 @@ function malformedCampaignList(message, payload) {
   });
 }
 
+function malformedReadResponse(code, message, payload) {
+  return new TikTokApiError(message, {
+    code,
+    requestId: payload?.request_id,
+    outcomeKnown: true
+  });
+}
+
+function isRecord(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
+function responseId(value, field, { code, label, payload }) {
+  if (typeof value === "string" && value !== "" && value.trim() === value) return value;
+  if (Number.isSafeInteger(value) && value > 0) return String(value);
+  throw malformedReadResponse(code, `TikTok ${label} returned an invalid ${field}`, payload);
+}
+
+function requestIdValue(value, field) {
+  if (typeof value === "string" && value !== "" && value.trim() === value) return value;
+  if (Number.isSafeInteger(value) && value > 0) return String(value);
+  throw new Error(`${field} is required`);
+}
+
+function optionalResponseId(value, field, context) {
+  return value == null ? null : responseId(value, field, context);
+}
+
 export class TikTokClient {
+  #accessToken;
+  #fetch;
+  #baseUrl;
+  #timeoutMs;
+
   constructor({
     accessToken,
     fetchImpl = globalThis.fetch,
@@ -53,14 +93,14 @@ export class TikTokClient {
   }) {
     if (!accessToken) throw new Error("TikTok access token is required");
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1_000) throw new Error("TikTok timeoutMs must be at least 1000");
-    this.accessToken = accessToken;
-    this.fetch = fetchImpl;
-    this.baseUrl = baseUrl.replace(/\/$/, "");
-    this.timeoutMs = timeoutMs;
+    this.#accessToken = accessToken;
+    this.#fetch = fetchImpl;
+    this.#baseUrl = baseUrl.replace(/\/$/, "");
+    this.#timeoutMs = timeoutMs;
   }
 
   async #request(path, { method = "GET", query, body } = {}) {
-    const url = new URL(`${this.baseUrl}${path}`);
+    const url = new URL(`${this.#baseUrl}${path}`);
     if (query) {
       for (const [key, value] of Object.entries(query)) {
         if (value != null) url.searchParams.set(key, stringifyQueryValue(value));
@@ -68,14 +108,14 @@ export class TikTokClient {
     }
     let response;
     try {
-      response = await this.fetch(url, {
+      response = await this.#fetch(url, {
         method,
         headers: {
-          "Access-Token": this.accessToken,
+          "Access-Token": this.#accessToken,
           "Content-Type": "application/json"
         },
         body: body == null ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(this.timeoutMs)
+        signal: AbortSignal.timeout(this.#timeoutMs)
       });
     } catch (error) {
       throw new TikTokApiError(`TikTok transport failed: ${error?.message ?? "network error"}`, {
@@ -166,7 +206,356 @@ export class TikTokClient {
     return { data: payload.data ?? {}, requestId: payload.request_id };
   }
 
-  async getLiveCampaigns({ advertiserId, storeId, campaignIds } = {}) {
+  /**
+   * Reads the immutable account context needed to interpret money and dates.
+   * The official v1.3 endpoint accepts advertiser_ids and fields as JSON arrays
+   * in the query string and returns matching accounts in data.list.
+   */
+  async getAdvertiserInfo({ advertiserId } = {}) {
+    const requestedAdvertiserId = requestIdValue(advertiserId, "advertiserId");
+    const payload = await this.#request("/advertiser/info/", {
+      query: {
+        advertiser_ids: [requestedAdvertiserId],
+        fields: ADVERTISER_INFO_FIELDS
+      }
+    });
+    const code = "TIKTOK_MALFORMED_ADVERTISER_INFO";
+
+    if (!isRecord(payload.data) || !Array.isArray(payload.data.list)) {
+      throw malformedReadResponse(code, "TikTok advertiser info omitted data.list", payload);
+    }
+    if (payload.data.list.length !== 1 || !isRecord(payload.data.list[0])) {
+      throw malformedReadResponse(
+        code,
+        "TikTok advertiser info did not return exactly one account",
+        payload
+      );
+    }
+
+    const account = payload.data.list[0];
+    if (
+      typeof account.advertiser_id !== "string"
+      || account.advertiser_id === ""
+      || account.advertiser_id.trim() !== account.advertiser_id
+    ) {
+      throw malformedReadResponse(code, "TikTok advertiser info returned an invalid advertiser_id", payload);
+    }
+    if (account.advertiser_id !== requestedAdvertiserId) {
+      throw malformedReadResponse(code, "TikTok advertiser info returned a different advertiser_id", payload);
+    }
+    if (typeof account.currency !== "string" || !/^[A-Z]{3}$/.test(account.currency)) {
+      throw malformedReadResponse(code, "TikTok advertiser info returned an invalid currency", payload);
+    }
+    if (
+      typeof account.timezone !== "string"
+      || !/^[A-Za-z0-9_+./:-]{1,100}$/.test(account.timezone)
+    ) {
+      throw malformedReadResponse(code, "TikTok advertiser info returned an invalid timezone", payload);
+    }
+    if (
+      typeof account.status !== "string"
+      || !/^STATUS_[A-Z0-9_]+$/.test(account.status)
+    ) {
+      throw malformedReadResponse(code, "TikTok advertiser info returned an invalid account status", payload);
+    }
+
+    return {
+      advertiserId: account.advertiser_id,
+      currency: account.currency,
+      timezone: account.timezone,
+      accountStatus: account.status,
+      requestId: payload.request_id
+    };
+  }
+
+  async getGmvMaxStores({ advertiserId } = {}) {
+    const payload = await this.#request("/gmv_max/store/list/", {
+      query: { advertiser_id: requestIdValue(advertiserId, "advertiserId") }
+    });
+    const context = {
+      code: "TIKTOK_MALFORMED_STORE_LIST",
+      label: "GMV Max store list",
+      payload
+    };
+    if (!isRecord(payload.data) || !Array.isArray(payload.data.store_list)) {
+      throw malformedReadResponse(
+        context.code,
+        "TikTok GMV Max store list omitted data.store_list",
+        payload
+      );
+    }
+
+    const seen = new Set();
+    const stores = payload.data.store_list.map((store) => {
+      if (!isRecord(store)) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max store list returned an invalid store", payload);
+      }
+      const storeId = responseId(store.store_id, "store_id", context);
+      const storeAuthorizedBcId = responseId(store.store_authorized_bc_id, "store_authorized_bc_id", context);
+      if (typeof store.is_gmv_max_available !== "boolean" || typeof store.is_owner_bc !== "boolean") {
+        throw malformedReadResponse(
+          context.code,
+          "TikTok GMV Max store list omitted availability or ownership",
+          payload
+        );
+      }
+      const key = `${storeId}:${storeAuthorizedBcId}`;
+      if (seen.has(key)) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max store list returned a duplicate store binding", payload);
+      }
+      seen.add(key);
+
+      let storeAuthorizedBcInfo = null;
+      if (store.store_authorized_bc_info != null) {
+        if (!isRecord(store.store_authorized_bc_info)) {
+          throw malformedReadResponse(context.code, "TikTok GMV Max store list returned invalid Business Center info", payload);
+        }
+        const bcId = responseId(store.store_authorized_bc_info.bc_id, "store_authorized_bc_info.bc_id", context);
+        if (bcId !== storeAuthorizedBcId) {
+          throw malformedReadResponse(context.code, "TikTok GMV Max store list returned mismatched Business Center IDs", payload);
+        }
+        storeAuthorizedBcInfo = {
+          bcId,
+          bcName: store.store_authorized_bc_info.bc_name ?? null,
+          userRole: store.store_authorized_bc_info.user_role ?? null,
+          raw: store.store_authorized_bc_info
+        };
+      }
+
+      let exclusiveAuthorizedAdvertiserInfo = null;
+      if (store.exclusive_authorized_advertiser_info != null) {
+        const info = store.exclusive_authorized_advertiser_info;
+        if (!isRecord(info)) {
+          throw malformedReadResponse(context.code, "TikTok GMV Max store list returned invalid exclusive authorization", payload);
+        }
+        if (typeof info.authorization_status !== "string" || info.authorization_status === "") {
+          throw malformedReadResponse(
+            context.code,
+            "TikTok GMV Max store list omitted exclusive authorization status",
+            payload
+          );
+        }
+        const exclusiveStoreId = responseId(info.store_id, "exclusive_authorized_advertiser_info.store_id", context);
+        if (exclusiveStoreId !== storeId) {
+          throw malformedReadResponse(context.code, "TikTok GMV Max store list returned mismatched exclusive authorization", payload);
+        }
+        const exclusiveAdvertiserId = optionalResponseId(
+          info.advertiser_id,
+          "exclusive_authorized_advertiser_info.advertiser_id",
+          context
+        );
+        if (info.authorization_status === "EFFECTIVE" && exclusiveAdvertiserId == null) {
+          throw malformedReadResponse(
+            context.code,
+            "TikTok GMV Max effective exclusive authorization omitted advertiser_id",
+            payload
+          );
+        }
+        exclusiveAuthorizedAdvertiserInfo = {
+          advertiserId: exclusiveAdvertiserId,
+          storeId: exclusiveStoreId,
+          identityId: optionalResponseId(
+            info.identity_id,
+            "exclusive_authorized_advertiser_info.identity_id",
+            context
+          ),
+          advertiserName: info.advertiser_name ?? null,
+          advertiserStatus: info.advertiser_status ?? null,
+          authorizationStatus: info.authorization_status,
+          raw: info
+        };
+      }
+
+      return {
+        storeId,
+        storeAuthorizedBcId,
+        isGmvMaxAvailable: store.is_gmv_max_available,
+        isOwnerBc: store.is_owner_bc,
+        storeName: store.store_name ?? null,
+        storeCode: store.store_code ?? null,
+        storeStatus: store.store_status ?? null,
+        storeAuthorizedBcInfo,
+        exclusiveAuthorizedAdvertiserInfo,
+        raw: store
+      };
+    });
+
+    return { stores, requestId: payload.request_id };
+  }
+
+  async getGmvMaxIdentities({ advertiserId, storeId, storeAuthorizedBcId } = {}) {
+    const requestedStoreId = requestIdValue(storeId, "storeId");
+    const payload = await this.#request("/gmv_max/identity/get/", {
+      query: {
+        advertiser_id: requestIdValue(advertiserId, "advertiserId"),
+        store_id: requestedStoreId,
+        store_authorized_bc_id: requestIdValue(storeAuthorizedBcId, "storeAuthorizedBcId")
+      }
+    });
+    const context = {
+      code: "TIKTOK_MALFORMED_IDENTITY_LIST",
+      label: "GMV Max identity list",
+      payload
+    };
+    if (!isRecord(payload.data) || !Array.isArray(payload.data.identity_list)) {
+      throw malformedReadResponse(
+        context.code,
+        "TikTok GMV Max identity list omitted data.identity_list",
+        payload
+      );
+    }
+
+    const supportedIdentityTypes = new Set(["TT_USER", "BC_AUTH_TT", "TTS_TT"]);
+    const seen = new Set();
+    const identities = payload.data.identity_list.map((identity) => {
+      if (!isRecord(identity)) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max identity list returned an invalid identity", payload);
+      }
+      const identityId = responseId(identity.identity_id, "identity_id", context);
+      if (typeof identity.identity_type !== "string" || !supportedIdentityTypes.has(identity.identity_type)) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max identity list returned an invalid identity_type", payload);
+      }
+      if (typeof identity.live_gmv_max_available !== "boolean") {
+        throw malformedReadResponse(context.code, "TikTok GMV Max identity list omitted live_gmv_max_available", payload);
+      }
+      if (
+        identity.product_gmv_max_available != null
+        && typeof identity.product_gmv_max_available !== "boolean"
+      ) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max identity list returned invalid product availability", payload);
+      }
+      if (
+        identity.is_running_custom_shop_ads != null
+        && typeof identity.is_running_custom_shop_ads !== "boolean"
+      ) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max identity list returned invalid Shopping Ads occupancy", payload);
+      }
+
+      const identityAuthorizedBcId = optionalResponseId(
+        identity.identity_authorized_bc_id,
+        "identity_authorized_bc_id",
+        context
+      );
+      const identityAuthorizedShopId = optionalResponseId(
+        identity.identity_authorized_shop_id,
+        "identity_authorized_shop_id",
+        context
+      );
+      const identityStoreId = optionalResponseId(identity.store_id, "store_id", context);
+      if (identity.identity_type === "BC_AUTH_TT" && identityAuthorizedBcId == null) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max BC identity omitted identity_authorized_bc_id", payload);
+      }
+      if (identity.identity_type === "TTS_TT" && identityStoreId == null) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max Shop identity omitted store_id", payload);
+      }
+      if (identityStoreId != null && identityStoreId !== requestedStoreId) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max identity list returned an identity for another store", payload);
+      }
+      if (!identity.live_gmv_max_available) {
+        if (typeof identity.unavailable_reason !== "string" || identity.unavailable_reason === "") {
+          throw malformedReadResponse(context.code, "TikTok GMV Max unavailable identity omitted unavailable_reason", payload);
+        }
+      } else if (identity.unavailable_reason != null) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max available identity returned unavailable_reason", payload);
+      }
+
+      const key = [
+        identity.identity_type,
+        identityId,
+        identityAuthorizedBcId ?? "",
+        identityAuthorizedShopId ?? "",
+        identityStoreId ?? ""
+      ].join(":");
+      if (seen.has(key)) {
+        throw malformedReadResponse(context.code, "TikTok GMV Max identity list returned a duplicate identity", payload);
+      }
+      seen.add(key);
+
+      return {
+        identityId,
+        identityType: identity.identity_type,
+        identityAuthorizedBcId,
+        identityAuthorizedShopId,
+        storeId: identityStoreId,
+        liveGmvMaxAvailable: identity.live_gmv_max_available,
+        productGmvMaxAvailable: identity.product_gmv_max_available ?? null,
+        isRunningCustomShopAds: identity.is_running_custom_shop_ads ?? null,
+        availableStatus: identity.available_status ?? null,
+        unavailableReason: identity.unavailable_reason ?? null,
+        displayName: identity.display_name ?? null,
+        userName: identity.user_name ?? null,
+        raw: identity
+      };
+    });
+
+    return { identities, requestId: payload.request_id };
+  }
+
+  async getGmvMaxBidRecommendation({
+    advertiserId,
+    storeId,
+    identityId,
+    shoppingAdsType = "LIVE",
+    optimizationGoal = "VALUE",
+    itemGroupIds
+  } = {}) {
+    if (shoppingAdsType !== "LIVE" && shoppingAdsType !== "PRODUCT") {
+      throw new Error("shoppingAdsType must be LIVE or PRODUCT");
+    }
+    if (optimizationGoal !== "VALUE") throw new Error("optimizationGoal must be VALUE");
+    if (shoppingAdsType === "LIVE" && !identityId) {
+      throw new Error("identityId is required for a LIVE GMV Max recommendation");
+    }
+    if (shoppingAdsType === "LIVE" && itemGroupIds?.length) {
+      throw new Error("itemGroupIds are not valid for a LIVE GMV Max recommendation");
+    }
+    if (itemGroupIds != null && (!Array.isArray(itemGroupIds) || itemGroupIds.length > 50)) {
+      throw new Error("itemGroupIds must contain at most 50 IDs");
+    }
+
+    const payload = await this.#request("/gmv_max/bid/recommend/", {
+      query: {
+        advertiser_id: requestIdValue(advertiserId, "advertiserId"),
+        store_id: requestIdValue(storeId, "storeId"),
+        shopping_ads_type: shoppingAdsType,
+        optimization_goal: optimizationGoal,
+        identity_id: identityId == null ? undefined : requestIdValue(identityId, "identityId"),
+        item_group_ids: itemGroupIds?.map((itemGroupId) => requestIdValue(itemGroupId, "itemGroupId"))
+      }
+    });
+    const context = {
+      code: "TIKTOK_MALFORMED_BID_RECOMMENDATION",
+      label: "GMV Max bid recommendation",
+      payload
+    };
+    if (!isRecord(payload.data)) {
+      throw malformedReadResponse(context.code, "TikTok GMV Max bid recommendation omitted data", payload);
+    }
+    const roasBid = Number(payload.data.roas_bid);
+    const budget = Number(payload.data.budget);
+    if (!Number.isFinite(roasBid) || roasBid <= 0 || !Number.isFinite(budget) || budget <= 0) {
+      throw malformedReadResponse(
+        context.code,
+        "TikTok GMV Max bid recommendation returned an invalid ROI target or budget",
+        payload
+      );
+    }
+    return { roasBid, budget, requestId: payload.request_id, raw: payload.data };
+  }
+
+  async getLiveCampaigns({
+    advertiserId,
+    storeId,
+    campaignIds,
+    maxResults = GMV_MAX_CAMPAIGN_MAX_RESULTS
+  } = {}) {
+    if (
+      !Number.isSafeInteger(maxResults)
+      || maxResults < 1
+      || maxResults > GMV_MAX_CAMPAIGN_MAX_RESULTS
+    ) {
+      throw new Error(`maxResults must be an integer between 1 and ${GMV_MAX_CAMPAIGN_MAX_RESULTS}`);
+    }
     const filtering = { gmv_max_promotion_types: ["LIVE_GMV_MAX"] };
     if (storeId) filtering.store_ids = [String(storeId)];
     if (campaignIds?.length) filtering.campaign_ids = campaignIds.map(String);
@@ -182,7 +571,7 @@ export class TikTokClient {
           advertiser_id: advertiserId,
           filtering,
           page,
-          page_size: GMV_MAX_CAMPAIGN_PAGE_SIZE
+          page_size: Math.min(GMV_MAX_CAMPAIGN_PAGE_SIZE, maxResults)
         }
       });
       const pageRows = payload.data?.list;
@@ -200,6 +589,16 @@ export class TikTokClient {
       const totalNumber = paginationInteger(pageInfo.total_number, { min: 0, max: Number.MAX_SAFE_INTEGER });
       if (responsePage == null || pageSize == null || totalPages == null || totalNumber == null) {
         throw malformedCampaignList("TikTok GMV Max campaign list returned invalid pagination", payload);
+      }
+      if (totalNumber > maxResults) {
+        throw new TikTokApiError(
+          `TikTok GMV Max campaign candidates exceeded the read-only limit of ${maxResults}`,
+          {
+            code: "TIKTOK_CAMPAIGN_CANDIDATE_LIMIT",
+            requestId: payload.request_id,
+            outcomeKnown: true
+          }
+        );
       }
       if (responsePage !== page) {
         throw malformedCampaignList("TikTok GMV Max campaign pagination did not advance", payload);

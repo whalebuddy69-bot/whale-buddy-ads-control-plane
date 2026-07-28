@@ -31,6 +31,7 @@ import {
   parseControlCommand,
   parseControlPostbackData
 } from "./line-controls.js";
+import { buildTikTokPreflightMessage } from "./tiktok-api-control.js";
 import {
   bangkokLocalDate,
   buildBangkokDailyIntervals,
@@ -308,6 +309,7 @@ export class BudgetGuardService {
     config,
     store,
     tiktok,
+    tiktokApiControl = null,
     line,
     executionEnabled = false,
     telemetryAlertsEnabled = false,
@@ -317,6 +319,7 @@ export class BudgetGuardService {
     this.config = config;
     this.store = store;
     this.tiktok = tiktok;
+    this.tiktokApiControl = tiktokApiControl;
     this.line = line;
     this.executionEnabled = executionEnabled;
     this.telemetryAlertsEnabled = telemetryAlertsEnabled;
@@ -398,8 +401,20 @@ export class BudgetGuardService {
   }
 
   #agencyCommandMessage(command, userId) {
-    if (!new Set(["agency_menu", "agency_report", "agency_section", "invalid_template"]).has(command?.kind)) {
+    if (!new Set([
+      "agency_menu",
+      "agency_report",
+      "agency_section",
+      "invalid_template",
+      "my_line_id"
+    ]).has(command?.kind)) {
       return null;
+    }
+    if (command.kind === "my_line_id") {
+      return {
+        type: "text",
+        text: `LINE User ID ของคุณ:\n${userId}\n\nใช้ค่านี้เฉพาะใน Render secret TIKTOK_OAUTH_ADMIN_LINE_USER_IDS`
+      };
     }
     const clients = this.#authorizedLineControlClients(userId);
     if (clients.length === 0) return this.#lineControlPairingRequiredMessage();
@@ -1970,6 +1985,50 @@ export class BudgetGuardService {
         }));
         return true;
       }
+      if (command.kind === "tiktok_oauth_start") {
+        if (!this.tiktokApiControl) {
+          throw new DomainError(
+            "TIKTOK_OAUTH_DISABLED",
+            "ระบบเชื่อม TikTok API ยังไม่ได้เปิดบนเซิร์ฟเวอร์"
+          );
+        }
+        const authorization = this.tiktokApiControl.createAuthorizationRequest({
+          lineUserId: userId
+        });
+        await this.#replyControlDurably(event.replyToken, {
+          type: "template",
+          altText: `อนุญาต TikTok API สำหรับ ${client.name}`,
+          template: {
+            type: "buttons",
+            title: "เชื่อม TikTok API",
+            text: `กดเพื่ออนุญาต Agency account จาก TikTok\nลิงก์หมดอายุ ${new Date(authorization.expiresAt).toLocaleTimeString("th-TH", {
+              timeZone: client.timezone,
+              hour: "2-digit",
+              minute: "2-digit"
+            })}`,
+            actions: [{
+              type: "uri",
+              label: "อนุญาตผ่าน TikTok",
+              uri: authorization.url
+            }]
+          }
+        });
+        return true;
+      }
+      if (command.kind === "tiktok_api_preflight") {
+        if (!this.tiktokApiControl) {
+          throw new DomainError(
+            "TIKTOK_API_DISABLED",
+            "ระบบ TikTok API ยังไม่ได้เปิดบนเซิร์ฟเวอร์"
+          );
+        }
+        const result = await this.tiktokApiControl.preflightClient(client);
+        await this.#replyControlDurably(
+          event.replyToken,
+          buildTikTokPreflightMessage({ client, result })
+        );
+        return true;
+      }
       if (command.kind === "auto_boost_status") {
         this.#autoBoostPolicy(client);
         const profile = this.store.getAutoBoostProfile({ clientId: client.id });
@@ -2186,9 +2245,15 @@ export class BudgetGuardService {
         return true;
       }
       const safe = safeError(error);
+      const reconnectRequired = new Set([
+        "TIKTOK_CREDENTIAL_EXPIRED",
+        "TIKTOK_CREDENTIAL_NOT_FOUND"
+      ]).has(safe.code);
       await this.#replyControlDurably(event.replyToken, {
         type: "text",
-        text: `${command.kind.startsWith("auto_boost_") ? "🧪 DRY-RUN — " : ""}คำสั่งยังทำไม่ได้: ${safe.message}`
+        text: reconnectRequired
+          ? `สิทธิ์ TikTok API ไม่มีหรือหมดอายุ กรุณาส่ง “เชื่อม TikTok API ${command.clientAlias}” ใหม่`
+          : `${command.kind.startsWith("auto_boost_") ? "🧪 DRY-RUN — " : ""}คำสั่งยังทำไม่ได้: ${safe.message}`
       });
       return true;
     }
@@ -2479,7 +2544,13 @@ export class BudgetGuardService {
 
   #controlCommandAlreadyApplied(command, eventId) {
     const control = command.command;
-    if (new Set(["agency_menu", "agency_report", "agency_section", "invalid_template"]).has(control.kind)) {
+    if (new Set([
+      "agency_menu",
+      "agency_report",
+      "agency_section",
+      "invalid_template",
+      "my_line_id"
+    ]).has(control.kind)) {
       return true;
     }
     let client;
@@ -2627,6 +2698,24 @@ export class BudgetGuardService {
         } else if (control.kind === "status") {
           const { snapshot, stale } = this.#latestControlSnapshot(client);
           message = buildPerformanceReportMessage({ client, snapshot, stale, now: this.now() });
+        } else if (control.kind === "tiktok_oauth_start") {
+          message = {
+            type: "text",
+            text: [
+              "ลิงก์เชื่อม TikTok เดิมส่งไม่สำเร็จและไม่สามารถนำกลับมาใช้ซ้ำได้",
+              `กรุณาส่ง “เชื่อม TikTok API ${client.lineControl.aliases[0]}” อีกครั้งเพื่อรับลิงก์ใหม่`
+            ].join("\n")
+          };
+        } else if (control.kind === "tiktok_api_preflight") {
+          if (!this.tiktokApiControl) {
+            message = {
+              type: "text",
+              text: "ระบบ TikTok API ยังไม่ได้เปิดบนเซิร์ฟเวอร์"
+            };
+          } else {
+            const result = await this.tiktokApiControl.preflightClient(client);
+            message = buildTikTokPreflightMessage({ client, result });
+          }
         } else if (new Set([
           "auto_boost_status",
           "auto_boost_upsert",
