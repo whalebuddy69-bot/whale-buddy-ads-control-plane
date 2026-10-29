@@ -8,6 +8,7 @@ import { verifyLineSignature } from "./line.js";
 import { BudgetGuardService } from "./service.js";
 import { SqliteStore } from "./store.js";
 import { TikTokClient } from "./tiktok.js";
+import { CALLBACK_PATH as SHOP_CALLBACK_PATH, createShopCallbackHandler } from "./tiktok-shop-callback.js";
 import { LineClient } from "./line.js";
 import {
   TelemetryError,
@@ -197,8 +198,12 @@ export function createHttpServer({
       chromeTelemetry: { enabled: false, source: null, status: "disabled" }
     }
   };
+  const shopCallback = createShopCallbackHandler();
   return http.createServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
+    if (url.pathname === SHOP_CALLBACK_PATH) {
+      return shopCallback(request, response);
+    }
     try {
       if (request.method === "GET" && url.pathname === "/health") {
         const adapters = {
