@@ -11,7 +11,7 @@
       "name": "punpan_020",
       "lineApproverUserIds": [],
       "linePairingEnabled": true,
-      "advertiserId": "7646832328389263378",
+      "advertiserId": "7666005333864644624",
       "shopBinding": {
         "mode": "observe-and-pin"
       },
@@ -42,9 +42,9 @@
         "allowManualTarget": true
       },
       "budgetPolicy": {
-        "maxDailyBudget": 6000,
-        "effectiveFrom": "2026-07-19",
-        "revision": 1
+        "maxDailyBudget": 10000,
+        "effectiveFrom": "2026-11-06",
+        "revision": 2
       },
       "lineControl": {
         "enabled": true,

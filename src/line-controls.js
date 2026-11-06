@@ -756,7 +756,67 @@ export function buildCampaignAdjustmentMessage({ client, snapshot, stale = false
   };
 }
 
+function creatorReportLines({ client, snapshot, stale, now }) {
+  if (snapshot.unavailable) return [
+    `⚠️ Creator API — ${client.name}`,
+    "ยังดึงข้อมูล Creator API ไม่สำเร็จ กรุณาลองใหม่หลังระบบอัปเดต",
+    "ระบบไม่ใช้ข้อมูล Chrome เก่ามาแทน และยังไม่ปรับงบ"
+  ];
+  const ageMinutes = Math.max(0, Math.floor((new Date(now).getTime() - Date.parse(snapshot.observedAt)) / 60_000));
+  const lines = [
+    `${stale ? "⚠️ ข้อมูลเก่า/เชื่อมต่อล่าสุดไม่สำเร็จ" : "📊 Creator API"} — ${client.name}`,
+    `Ad account: ${snapshot.advertiserId}`,
+    `TikTok account: ${snapshot.tiktokAccountId}`
+  ];
+  if (snapshot.noActiveCampaign) {
+    lines.push("ไม่พบแคมเปญ LIVE GMV Max ที่เปิดอยู่");
+  } else {
+    const usage = Number.isSafeInteger(snapshot.costMinor) && snapshot.dailyBudgetMinor > 0
+      ? ` (${((snapshot.costMinor / snapshot.dailyBudgetMinor) * 100).toFixed(1)}%)` : "";
+    lines.push(
+      `Campaign: ${snapshot.campaignName}`,
+      `Campaign ID: ${snapshot.campaignId}`,
+      `งบที่ตั้งไว้: ${formatMinor(snapshot.dailyBudgetMinor, snapshot.currency)}`,
+      `Spend วันนี้ (ประมาณ): ${formatMinor(snapshot.costMinor, snapshot.currency)}${usage}`,
+      `ROI Target ที่ตั้งไว้: ${snapshot.targetRoi ?? "ยังไม่พร้อม"}`,
+      "GMV / ROI จริง / LIVE Views: ยังยืนยันข้อมูลไม่ครบ"
+    );
+  }
+  lines.push(
+    `วันที่รายงาน: ${snapshot.reportingDate}`,
+    `อ่าน API เวลา ${bangkokTime(snapshot.observedAt)} (${ageMinutes} นาทีที่แล้ว)`,
+    "Spend เป็นค่าประมาณจาก API; ยังไม่ยืนยันระยะหน่วงของผลรายงาน",
+    `Native Auto Budget: ${snapshot.nativeAutoBudgetState ?? "UNKNOWN"}`,
+    "อ่านอย่างเดียว — ยังไม่เปิด Auto Top-up หรือคำสั่งเขียน TikTok"
+  );
+  if (snapshot.creatorPolicy) lines.push(
+    `เพดานต่อแคมเปญ/รวม Ppan ต่อวัน: ${formatMinor(snapshot.creatorPolicy.capMinor, "THB")}`,
+    `แก้เพดานผ่าน LINE: ตั้งเพดาน Ppan 10000 (ต้องกดยืนยัน) · revision ${snapshot.creatorPolicy.revision}`
+  );
+  if (stale) lines.push("ไม่ใช้ข้อมูลชุดนี้ตัดสินใจเปลี่ยนแปลงแคมเปญ");
+  return lines;
+}
+
 function performanceBubble({ client, snapshot, stale }, now, pageLabel) {
+  if (snapshot?.source === "tiktok-creator-api") {
+    const lines = creatorReportLines({ client, snapshot, stale, now });
+    return {
+      type: "bubble",
+      header: {
+        type: "box", layout: "vertical", backgroundColor: stale ? "#FFF4E5" : "#EAF7F0",
+        contents: [lineText(lines[0], { weight: "bold", size: "md" })]
+      },
+      body: {
+        type: "box", layout: "vertical", spacing: "sm",
+        contents: [...lines.slice(1).map((value) => lineText(value, { size: "xs" })),
+          lineText(pageLabel, { size: "xs", color: "#777777", margin: "md" })]
+      },
+      footer: {
+        type: "box", layout: "vertical",
+        contents: [{ type: "button", action: messageAction("เมนูหลัก", "เมนู") }]
+      }
+    };
+  }
   if (!snapshot) {
     return {
       type: "bubble",
@@ -1066,6 +1126,9 @@ export function buildAutoBoostOccurrenceMessage(input) {
 }
 
 export function buildPerformanceReportMessage({ client, snapshot, now = new Date(), stale = false }) {
+  if (snapshot?.source === "tiktok-creator-api") {
+    return { type: "text", text: creatorReportLines({ client, snapshot, stale, now }).join("\n") };
+  }
   if (!snapshot) {
     return { type: "text", text: `⚠️ ${client.name}: ยังไม่มีข้อมูลจาก Chrome reader จึงยังรายงานไม่ได้` };
   }

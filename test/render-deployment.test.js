@@ -16,7 +16,10 @@ test("checked-in Render pilot config is valid and contains no credential fields"
   assert.equal(config.clients.length, 1);
   assert.equal(config.clients[0].id, "punpan_020");
   assert.equal(config.clients[0].linePairingEnabled, true);
-  assert.equal(config.clients[0].budgetPolicy.maxDailyBudget, 6000);
+  assert.equal(config.clients[0].budgetPolicy.maxDailyBudget, 10000);
+  assert.equal(config.clients[0].budgetPolicy.revision, 2);
+  assert.equal(config.clients[0].budgetPolicy.effectiveFrom, "2026-11-06");
+  assert.equal(config.clients[0].advertiserId, "7666005333864644624");
   assert.doesNotMatch(source, /access[_-]?token|channel[_-]?secret|api[_-]?key|password/i);
 });
 

@@ -10,6 +10,13 @@ import {
   submitBudgetAmount as submitDomainAmount,
   succeedBudgetRequest as succeedDomainRequest,
 } from './domain.js';
+import {
+  assertCreatorCapMinor,
+  assertCreatorPolicyClient,
+  CREATOR_CAP_TTL_MS,
+  CREATOR_POLICY_DEFAULTS,
+  creatorCapChangeNonce,
+} from './creator-policy.js';
 
 const WEBHOOK_STATUSES = new Set(['RECEIVED', 'PROCESSING', 'PROCESSED', 'FAILED']);
 const AUTO_BOOST_TERMINAL_STATUSES = new Set([
@@ -460,6 +467,35 @@ export class SqliteStore {
           (status = 'PROCESSING' AND lease_token IS NOT NULL AND lease_expires_at IS NOT NULL)
           OR (status <> 'PROCESSING' AND lease_token IS NULL AND lease_expires_at IS NULL)
         )
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS creator_auto_policies (
+        client_id TEXT PRIMARY KEY,
+        revision INTEGER NOT NULL CHECK(revision > 0),
+        campaign_cap_minor INTEGER NOT NULL CHECK(campaign_cap_minor > 0),
+        client_day_cap_minor INTEGER NOT NULL CHECK(client_day_cap_minor > 0),
+        threshold_bps INTEGER NOT NULL CHECK(threshold_bps = 8000),
+        increase_bps INTEGER NOT NULL CHECK(increase_bps = 2000),
+        timezone TEXT NOT NULL CHECK(timezone = 'Asia/Bangkok'),
+        mode TEXT NOT NULL CHECK(mode IN ('AUTO_PENDING_TEST', 'PAUSED', 'AUTO')),
+        execution_enabled INTEGER NOT NULL CHECK(execution_enabled IN (0, 1)),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS creator_cap_changes (
+        nonce TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        owner_line_user_id TEXT NOT NULL,
+        source_event_id TEXT NOT NULL UNIQUE,
+        base_revision INTEGER NOT NULL CHECK(base_revision > 0),
+        cap_minor INTEGER NOT NULL CHECK(cap_minor > 0),
+        status TEXT NOT NULL CHECK(status IN ('PENDING', 'CONFIRMED', 'CANCELLED')),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        resolved_at TEXT,
+        applied_revision INTEGER,
+        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
       ) STRICT;
 
       CREATE TABLE IF NOT EXISTS audit_events (
@@ -4373,6 +4409,171 @@ export class SqliteStore {
         id ASC
       LIMIT ?
     `).all(...parameters, limit).map((row) => this.#mapAutoBoostOccurrence(row));
+  }
+
+  #mapCreatorPolicy(row) {
+    if (!row) return null;
+    return Object.freeze({
+      clientId: row.client_id,
+      revision: row.revision,
+      capMinor: row.campaign_cap_minor,
+      campaignCapMinor: row.campaign_cap_minor,
+      clientDailyCapMinor: row.client_day_cap_minor,
+      thresholdBps: row.threshold_bps,
+      increaseBps: row.increase_bps,
+      timezone: row.timezone,
+      mode: row.mode,
+      executionEnabled: row.execution_enabled === 1,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    });
+  }
+
+  getCreatorPolicy({ clientId = CREATOR_POLICY_DEFAULTS.clientId } = {}) {
+    assertCreatorPolicyClient(clientId);
+    return this.#mapCreatorPolicy(this.db.prepare(`
+      SELECT * FROM creator_auto_policies WHERE client_id = ?
+    `).get(clientId));
+  }
+
+  ensureCreatorPolicy({ clientId = CREATOR_POLICY_DEFAULTS.clientId, now = new Date() } = {}) {
+    assertCreatorPolicyClient(clientId);
+    const at = requiredIsoTime(now, 'now');
+    this.#transaction(() => {
+      const result = this.db.prepare(`
+        INSERT INTO creator_auto_policies
+          (client_id, revision, campaign_cap_minor, client_day_cap_minor,
+           threshold_bps, increase_bps, timezone, mode, execution_enabled, created_at, updated_at)
+        VALUES (?, 1, ?, ?, 8000, 2000, 'Asia/Bangkok', 'AUTO_PENDING_TEST', 0, ?, ?)
+        ON CONFLICT(client_id) DO NOTHING
+      `).run(clientId, CREATOR_POLICY_DEFAULTS.capMinor, CREATOR_POLICY_DEFAULTS.capMinor, at, at);
+      if (result.changes === 1) this.#insertAudit({
+        eventType: 'CREATOR_POLICY_INITIALIZED', actorType: 'SYSTEM', occurredAt: at,
+        details: { clientId, capMinor: CREATOR_POLICY_DEFAULTS.capMinor, executionEnabled: false },
+      });
+    });
+    return this.getCreatorPolicy({ clientId });
+  }
+
+  #mapCreatorCapChange(row) {
+    if (!row) return null;
+    return Object.freeze({
+      nonce: row.nonce, clientId: row.client_id, ownerLineUserId: row.owner_line_user_id,
+      sourceEventId: row.source_event_id, baseRevision: row.base_revision, capMinor: row.cap_minor,
+      status: row.status, createdAt: row.created_at, expiresAt: row.expires_at,
+      resolvedAt: row.resolved_at, appliedRevision: row.applied_revision,
+    });
+  }
+
+  getCreatorCapChange(nonce) {
+    if (typeof nonce !== 'string' || !/^cc_[a-f0-9]{32}$/.test(nonce)) {
+      throw new DomainError('CREATOR_CAP_NONCE_INVALID', 'คำขอยืนยันเพดานไม่ถูกต้อง');
+    }
+    return this.#mapCreatorCapChange(this.db.prepare(`
+      SELECT * FROM creator_cap_changes WHERE nonce = ?
+    `).get(nonce));
+  }
+
+  #requireCreatorPolicyOwner(clientId, ownerLineUserId) {
+    assertCreatorPolicyClient(clientId);
+    const owner = requiredString(ownerLineUserId, 'ownerLineUserId');
+    if (owner.length > 256 || !this.isLineApprover({ clientId, lineUserId: owner })) {
+      throw new DomainError('LINE_NOT_AUTHORIZED', 'LINE นี้ไม่มีสิทธิ์ตั้งเพดาน Creator Ppan');
+    }
+    return owner;
+  }
+
+  proposeCreatorCapChange({ clientId, ownerLineUserId, capMinor, sourceEventId, now } = {}) {
+    assertCreatorPolicyClient(clientId);
+    assertCreatorCapMinor(capMinor);
+    this.#requireCreatorPolicyOwner(clientId, ownerLineUserId);
+    const eventId = requiredString(sourceEventId, 'sourceEventId');
+    if (eventId.length > 256) throw new DomainError('INVALID_REQUEST', 'sourceEventId is too long');
+    const at = requiredIsoTime(now, 'now');
+    this.ensureCreatorPolicy({ clientId, now: at });
+    return this.#transaction(() => {
+      const owner = this.#requireCreatorPolicyOwner(clientId, ownerLineUserId);
+      const existing = this.#mapCreatorCapChange(this.db.prepare(`
+        SELECT * FROM creator_cap_changes WHERE source_event_id = ?
+      `).get(eventId));
+      if (existing) {
+        if (existing.clientId !== clientId || existing.ownerLineUserId !== owner || existing.capMinor !== capMinor) {
+          throw new DomainError('CREATOR_CAP_EVENT_CONFLICT', 'คำสั่งเพดานซ้ำมีรายละเอียดไม่ตรงกัน');
+        }
+        return { status: `ALREADY_${existing.status}`, policy: this.getCreatorPolicy({ clientId }), change: existing };
+      }
+      const policy = this.getCreatorPolicy({ clientId });
+      const nonce = creatorCapChangeNonce({ clientId, ownerLineUserId: owner, sourceEventId: eventId });
+      const expiresAt = new Date(Date.parse(at) + CREATOR_CAP_TTL_MS).toISOString();
+      this.db.prepare(`
+        UPDATE creator_cap_changes SET status = 'CANCELLED', resolved_at = ?
+        WHERE client_id = ? AND owner_line_user_id = ? AND status = 'PENDING'
+      `).run(at, clientId, owner);
+      this.db.prepare(`
+        INSERT INTO creator_cap_changes
+          (nonce, client_id, owner_line_user_id, source_event_id, base_revision, cap_minor,
+           status, created_at, expires_at, resolved_at, applied_revision)
+        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?, NULL, NULL)
+      `).run(nonce, clientId, owner, eventId, policy.revision, capMinor, at, expiresAt);
+      this.#insertAudit({
+        eventType: 'CREATOR_CAP_PROPOSED', actorType: 'LINE_USER', actorId: owner, occurredAt: at,
+        details: { clientId, baseRevision: policy.revision, capMinor, expiresAt },
+      });
+      return { status: 'PENDING', policy, change: this.getCreatorCapChange(nonce) };
+    });
+  }
+
+  confirmCreatorCapChange({ nonce, ownerLineUserId, now } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const change = this.getCreatorCapChange(nonce);
+      if (!change) throw new DomainError('CREATOR_CAP_NOT_FOUND', 'ไม่พบคำขอยืนยันเพดาน');
+      const owner = this.#requireCreatorPolicyOwner(change.clientId, ownerLineUserId);
+      if (change.ownerLineUserId !== owner) throw new DomainError('LINE_NOT_AUTHORIZED', 'คำขอเพดานนี้เป็นของ LINE อื่น');
+      const policy = this.getCreatorPolicy({ clientId: change.clientId });
+      if (change.status === 'CONFIRMED') return { status: 'ALREADY_CONFIRMED', policy, change };
+      if (change.status === 'CANCELLED') throw new DomainError('CREATOR_CAP_CANCELLED', 'คำขอเพดานถูกยกเลิกหรือแทนที่แล้ว');
+      if (Date.parse(at) >= Date.parse(change.expiresAt)) throw new DomainError('CREATOR_CAP_EXPIRED', 'คำขอยืนยันเพดานหมดอายุ กรุณาส่งคำสั่งใหม่');
+      if (Date.parse(at) < Date.parse(change.createdAt)) throw new DomainError('CREATOR_CAP_TIME_INVALID', 'เวลายืนยันเพดานไม่ถูกต้อง');
+      if (policy.revision !== change.baseRevision) throw new DomainError('CREATOR_POLICY_CHANGED', 'เพดานถูกเปลี่ยนแล้ว กรุณาส่งคำสั่งใหม่');
+      const result = this.db.prepare(`
+        UPDATE creator_auto_policies
+        SET revision = revision + 1, campaign_cap_minor = ?, client_day_cap_minor = ?, updated_at = ?
+        WHERE client_id = ? AND revision = ?
+      `).run(change.capMinor, change.capMinor, at, change.clientId, change.baseRevision);
+      if (result.changes !== 1) throw new DomainError('CREATOR_POLICY_CHANGED', 'เพดานถูกเปลี่ยนระหว่างยืนยัน กรุณาส่งคำสั่งใหม่');
+      this.db.prepare(`
+        UPDATE creator_cap_changes
+        SET status = 'CONFIRMED', resolved_at = ?, applied_revision = ?
+        WHERE nonce = ? AND status = 'PENDING'
+      `).run(at, change.baseRevision + 1, nonce);
+      this.#insertAudit({
+        eventType: 'CREATOR_CAP_CONFIRMED', actorType: 'LINE_USER', actorId: owner, occurredAt: at,
+        details: { clientId: change.clientId, previousCapMinor: policy.capMinor, capMinor: change.capMinor, revision: change.baseRevision + 1, executionEnabled: policy.executionEnabled },
+      });
+      return { status: 'CONFIRMED', policy: this.getCreatorPolicy({ clientId: change.clientId }), change: this.getCreatorCapChange(nonce) };
+    });
+  }
+
+  cancelCreatorCapChange({ nonce, ownerLineUserId, now } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const change = this.getCreatorCapChange(nonce);
+      if (!change) throw new DomainError('CREATOR_CAP_NOT_FOUND', 'ไม่พบคำขอยืนยันเพดาน');
+      const owner = this.#requireCreatorPolicyOwner(change.clientId, ownerLineUserId);
+      if (change.ownerLineUserId !== owner) throw new DomainError('LINE_NOT_AUTHORIZED', 'คำขอเพดานนี้เป็นของ LINE อื่น');
+      const policy = this.getCreatorPolicy({ clientId: change.clientId });
+      if (change.status === 'CONFIRMED') return { status: 'ALREADY_CONFIRMED', policy, change };
+      if (change.status === 'CANCELLED') return { status: 'ALREADY_CANCELLED', policy, change };
+      this.db.prepare(`
+        UPDATE creator_cap_changes SET status = 'CANCELLED', resolved_at = ? WHERE nonce = ? AND status = 'PENDING'
+      `).run(at, nonce);
+      this.#insertAudit({
+        eventType: 'CREATOR_CAP_CANCELLED', actorType: 'LINE_USER', actorId: owner, occurredAt: at,
+        details: { clientId: change.clientId, capMinor: change.capMinor, baseRevision: change.baseRevision },
+      });
+      return { status: 'CANCELLED', policy, change: this.getCreatorCapChange(nonce) };
+    });
   }
 
   appendAuditEvent(input) {

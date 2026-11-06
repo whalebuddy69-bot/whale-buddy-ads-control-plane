@@ -12,6 +12,10 @@ import {
 } from "./line.js";
 import { fromMinor, toMinor } from "./money.js";
 import {
+  buildCreatorCapProposalMessage, buildCreatorCapResultMessage, buildCreatorPolicyStatusMessage,
+  creatorCapChangeNonce, parseCreatorPolicyPostback, parseCreatorPolicyText
+} from "./creator-policy.js";
+import {
   buildAgencyClientPickerMessage,
   buildAgencyControlMenuMessage,
   buildAgencyPerformanceReportMessage,
@@ -46,6 +50,7 @@ import {
 } from "./telemetry.js";
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const parseLineControlCommand = (text) => parseCreatorPolicyText(text) ?? parseControlCommand(text);
 
 function safeError(error) {
   return {
@@ -99,7 +104,7 @@ function allowsManualTarget(request) {
 function normalizedLineCommand(event) {
   const userId = event.source?.userId;
   if (!userId) return null;
-  if (event.type === "postback" && parseControlPostbackData(event.postback?.data)) {
+  if (event.type === "postback" && (parseCreatorPolicyPostback(event.postback?.data) || parseControlPostbackData(event.postback?.data))) {
     return {
       kind: "control_postback",
       userId,
@@ -124,7 +129,7 @@ function normalizedLineCommand(event) {
     if (parseBudgetText(event.message.text)) {
       return { kind: "budget_text", userId, text: event.message.text };
     }
-    const control = parseControlCommand(event.message.text);
+    const control = parseLineControlCommand(event.message.text);
     if (control) {
       return {
         kind: "control_command",
@@ -311,6 +316,7 @@ export class BudgetGuardService {
     line,
     executionEnabled = false,
     telemetryAlertsEnabled = false,
+    creatorRead = null,
     logger = console,
     now = () => new Date()
   }) {
@@ -320,6 +326,7 @@ export class BudgetGuardService {
     this.line = line;
     this.executionEnabled = executionEnabled;
     this.telemetryAlertsEnabled = telemetryAlertsEnabled;
+    this.creatorRead = creatorRead;
     this.logger = logger;
     this.now = now;
   }
@@ -390,9 +397,11 @@ export class BudgetGuardService {
     };
   }
 
-  #agencySnapshotEntries(clients) {
+  #agencySnapshotEntries(clients, reportsOnly = false) {
     return clients.map((client) => {
-      const { snapshot, stale } = this.#latestControlSnapshot(client);
+      const { snapshot, stale } = reportsOnly
+        ? this.#latestReportSnapshot(client)
+        : this.#latestControlSnapshot(client);
       return { client, snapshot, stale };
     });
   }
@@ -411,7 +420,7 @@ export class BudgetGuardService {
     }
     if (command.kind === "agency_report") {
       return buildAgencyPerformanceReportMessage({
-        entries: this.#agencySnapshotEntries(clients),
+        entries: this.#agencySnapshotEntries(clients, true),
         now: this.now(),
         page: command.page ?? 1
       });
@@ -505,6 +514,30 @@ export class BudgetGuardService {
         || age < -60_000
         || age > client.telemetry.maxSnapshotAgeSeconds * 1000
     };
+  }
+
+  // API read cache is deliberately separate from control/execution telemetry.
+  // A report can show current Creator data without granting write authority.
+  #latestReportSnapshot(client) {
+    if (this.creatorRead?.supports(client.id)) {
+      const entry = this.creatorRead.getReadSnapshot(client.id);
+      const policy = this.store.getCreatorPolicy?.({ clientId: client.id });
+      return policy ? { ...entry, snapshot: { ...entry.snapshot, creatorPolicy: {
+        capMinor: policy.capMinor, revision: policy.revision, executionEnabled: false
+      } } } : entry;
+    }
+    return this.#latestControlSnapshot(client);
+  }
+
+  creatorReadHealth() {
+    return this.creatorRead?.health() ?? {
+      enabled: false, source: null, readOnly: true, status: "disabled",
+      budgetWriteEnabled: false, autoOptimizationEnabled: false
+    };
+  }
+
+  async refreshCreatorRead() {
+    return this.creatorRead?.refresh() ?? { ok: false, code: "CREATOR_READ_DISABLED" };
   }
 
   #validateControlBudget(client, amount) {
@@ -1931,7 +1964,7 @@ export class BudgetGuardService {
   }
 
   async #handleControlCommand(event, userId, parsedCommand = null, eventId = null) {
-    const command = parsedCommand ?? parseControlCommand(event.message?.text);
+    const command = parsedCommand ?? parseLineControlCommand(event.message?.text);
     if (event.source?.type && event.source.type !== "user") {
       await this.#replyControlDurably(event.replyToken, this.#privateChatOnlyMessage());
       return true;
@@ -1947,6 +1980,29 @@ export class BudgetGuardService {
         return true;
       }
       const client = this.#lineControlClient(command.clientAlias, userId);
+      if (new Set(["creator_cap_view", "creator_cap_propose"]).has(command.kind)) {
+        if (event.source?.type !== "user") {
+          await this.#replyControlDurably(event.replyToken, this.#privateChatOnlyMessage());
+          return true;
+        }
+        if (!this.store.isLineApprover({ clientId: client.id, lineUserId: userId })) {
+          await this.#replyControlDurably(event.replyToken, this.#lineControlPairingRequiredMessage());
+          return true;
+        }
+        const policy = this.store.ensureCreatorPolicy({ clientId: client.id, now: this.now() });
+        if (command.kind === "creator_cap_view") {
+          await this.#replyControlDurably(event.replyToken, buildCreatorPolicyStatusMessage(policy));
+        } else {
+          const result = this.store.proposeCreatorCapChange({
+            clientId: client.id, ownerLineUserId: userId, capMinor: command.capMinor,
+            sourceEventId: eventId ?? webhookEventId(event), now: this.now()
+          });
+          await this.#replyControlDurably(event.replyToken, result.change.status === "PENDING"
+            ? buildCreatorCapProposalMessage(result.change)
+            : buildCreatorCapResultMessage(result));
+        }
+        return true;
+      }
       const selectedPageMessage = this.#selectedControlPageMessage(command, client);
       if (selectedPageMessage) {
         await this.#replyControlDurably(event.replyToken, selectedPageMessage);
@@ -1961,7 +2017,7 @@ export class BudgetGuardService {
         return true;
       }
       if (command.kind === "status") {
-        const { snapshot, stale } = this.#latestControlSnapshot(client);
+        const { snapshot, stale } = this.#latestReportSnapshot(client);
         await this.#replyControlDurably(event.replyToken, buildPerformanceReportMessage({
           client,
           snapshot,
@@ -2057,7 +2113,7 @@ export class BudgetGuardService {
           enabled: true,
           now: this.now()
         });
-        const { snapshot, stale } = this.#latestControlSnapshot(client);
+        const { snapshot, stale } = this.#latestReportSnapshot(client);
         await this.#replyControlDurably(event.replyToken, [
           {
             type: "text",
@@ -2195,6 +2251,32 @@ export class BudgetGuardService {
   }
 
   async #handleControlPostback(event, userId) {
+    const creatorPolicy = parseCreatorPolicyPostback(event.postback?.data);
+    if (creatorPolicy) {
+      if (event.source?.type !== "user") {
+        await this.#replyControlDurably(event.replyToken, this.#privateChatOnlyMessage());
+        return true;
+      }
+      const change = this.store.getCreatorCapChange(creatorPolicy.nonce);
+      const client = change ? this.#clientById(change.clientId) : null;
+      if (!client || change.ownerLineUserId !== userId || !this.#isCurrentApprover(client, userId)
+        || !this.store.isLineApprover({ clientId: client.id, lineUserId: userId })) {
+        await this.#replyControlDurably(event.replyToken, this.#lineControlPairingRequiredMessage());
+        return true;
+      }
+      try {
+        const options = { nonce: creatorPolicy.nonce, ownerLineUserId: userId, now: this.now() };
+        const result = creatorPolicy.kind === "creator_cap_confirm"
+          ? this.store.confirmCreatorCapChange(options) : this.store.cancelCreatorCapChange(options);
+        await this.#replyControlDurably(event.replyToken, buildCreatorCapResultMessage(result));
+      } catch (error) {
+        if (error?.code === "LINE_CONTROL_REPLY_FAILED") throw error;
+        await this.#replyControlDurably(event.replyToken, {
+          type: "text", text: `คำขอเพดานยังใช้ไม่ได้: ${safeError(error).message}`
+        });
+      }
+      return true;
+    }
     const parsed = parseControlPostbackData(event.postback?.data);
     if (!parsed) return false;
     if (event.source?.type && event.source.type !== "user") {
@@ -2509,6 +2591,11 @@ export class BudgetGuardService {
     if (new Set(["action", "coupon_schedule"]).has(control.kind)) {
       return Boolean(this.store.getCampaignControlRequest(controlRequestIdForEvent(eventId)));
     }
+    if (control.kind === "creator_cap_view") return true;
+    if (control.kind === "creator_cap_propose") {
+      const nonce = creatorCapChangeNonce({ clientId: client.id, ownerLineUserId: command.userId, sourceEventId: eventId });
+      return Boolean(this.store.getCreatorCapChange(nonce));
+    }
     if (control.kind === "report_subscribe") {
       const subscription = this.store.getReportSubscription({
         clientId: client.id,
@@ -2559,7 +2646,18 @@ export class BudgetGuardService {
     let message = null;
     let requestId = null;
     let controlRequestId = null;
-    if (command.kind === "control_postback") {
+    const recoveredPolicy = command.kind === "control_postback" ? parseCreatorPolicyPostback(command.data) : null;
+    if (recoveredPolicy) {
+      if (command.sourceType !== "user") return null;
+      const change = this.store.getCreatorCapChange(recoveredPolicy.nonce);
+      const client = change ? this.#clientById(change.clientId) : null;
+      if (!client || change.ownerLineUserId !== command.userId || !this.#isCurrentApprover(client, command.userId)
+        || !this.store.isLineApprover({ clientId: client.id, lineUserId: command.userId })) return null;
+      const policy = this.store.getCreatorPolicy({ clientId: client.id });
+      message = change.status === "PENDING"
+        ? { type: "text", text: "คำขอเพดานยังไม่ได้ยืนยันหรือหมดอายุ กรุณาส่งคำสั่งใหม่ ไม่มีการปรับงบ TikTok" }
+        : buildCreatorCapResultMessage({ policy, status: change.status === "CONFIRMED" ? "ALREADY_CONFIRMED" : "ALREADY_CANCELLED" });
+    } else if (command.kind === "control_postback") {
       if (command.sourceType && command.sourceType !== "user") return null;
       const parsed = parseControlPostbackData(command.data);
       controlRequestId = parsed?.requestId ?? null;
@@ -2615,7 +2713,23 @@ export class BudgetGuardService {
         const selectedPageMessage = client
           ? this.#selectedControlPageMessage(control, client)
           : null;
-        if (selectedPageMessage) {
+        if (new Set(["creator_cap_view", "creator_cap_propose"]).has(control.kind) && client) {
+          if (command.sourceType !== "user" || !this.store.isLineApprover({ clientId: client.id, lineUserId: command.userId })) return null;
+          const policy = this.store.getCreatorPolicy({ clientId: client.id });
+          if (!policy) return null;
+          if (control.kind === "creator_cap_view") message = buildCreatorPolicyStatusMessage(policy);
+          else {
+            const nonce = creatorCapChangeNonce({ clientId: client.id, ownerLineUserId: command.userId, sourceEventId: eventId });
+            const change = this.store.getCreatorCapChange(nonce);
+            message = change?.status === "PENDING" && Date.parse(change.expiresAt) > this.now().getTime()
+              ? buildCreatorCapProposalMessage(change)
+              : change?.status === "PENDING"
+                ? { type: "text", text: "คำขอเพดานหมดอายุ กรุณาส่งคำสั่งใหม่ เพดานเดิมยังคงอยู่และไม่มีการปรับงบ TikTok" }
+              : change
+                ? buildCreatorCapResultMessage({ policy, status: change.status === "CONFIRMED" ? "ALREADY_CONFIRMED" : "ALREADY_CANCELLED" })
+                : { type: "text", text: "ยังไม่ได้บันทึกคำขอเพดาน กรุณาส่งคำสั่งใหม่ ไม่มีการปรับงบ TikTok" };
+          }
+        } else if (selectedPageMessage) {
           message = selectedPageMessage;
         } else if (message) {
           // Authorization and unknown-alias recovery responses are intentionally
@@ -2625,7 +2739,7 @@ export class BudgetGuardService {
         } else if (control.kind === "help") {
           message = { type: "text", text: controlHelpText(client) };
         } else if (control.kind === "status") {
-          const { snapshot, stale } = this.#latestControlSnapshot(client);
+          const { snapshot, stale } = this.#latestReportSnapshot(client);
           message = buildPerformanceReportMessage({ client, snapshot, stale, now: this.now() });
         } else if (new Set([
           "auto_boost_status",
@@ -2753,6 +2867,14 @@ export class BudgetGuardService {
         const replyOnlyRecovery = claim.priorStatus === "FAILED"
           && claim.priorErrorCode === "LINE_CONTROL_REPLY_FAILED";
         if (command?.kind === "control_postback") {
+          const creatorPolicy = parseCreatorPolicyPostback(command.data);
+          const creatorChange = creatorPolicy ? this.store.getCreatorCapChange(creatorPolicy.nonce) : null;
+          if (!replyOnlyRecovery && creatorChange?.status === "PENDING") {
+            await this.#handleControlPostback({
+              type: "postback", source: { userId: command.userId, type: command.sourceType },
+              postback: { data: command.data }
+            }, command.userId);
+          }
           const parsed = parseControlPostbackData(command.data);
           const controlRequest = parsed?.requestId
             ? this.store.getCampaignControlRequest(parsed.requestId)
@@ -3179,7 +3301,7 @@ export class BudgetGuardService {
         });
         continue;
       }
-      const { snapshot, stale } = this.#latestControlSnapshot(client);
+      const { snapshot, stale } = this.#latestReportSnapshot(client);
       const retryKey = stableRetryKey(
         "scheduled-report",
         client.id,

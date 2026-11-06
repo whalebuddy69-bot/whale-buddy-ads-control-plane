@@ -10,6 +10,7 @@ import { SqliteStore } from "./store.js";
 import { TikTokClient } from "./tiktok.js";
 import { CALLBACK_PATH as SHOP_CALLBACK_PATH, createShopCallbackHandler } from "./tiktok-shop-callback.js";
 import { LineClient } from "./line.js";
+import { creatorReadFromEnvironment } from "./creator-read.js";
 import {
   TelemetryError,
   telemetryCredentialIdFromHeaders,
@@ -29,9 +30,12 @@ function environmentFlag(environment, name, fallback = false) {
 }
 
 export function resolveRuntimeMode(environment = process.env) {
-  const controlPlaneOnly = environmentFlag(environment, "CONTROL_PLANE_ONLY", false);
+  // This bridge is observation only, even if an old mutation flag is present.
+  const creatorReadEnabled = environmentFlag(environment, "CREATOR_READ_ENABLED", false);
+  const controlPlaneOnly = creatorReadEnabled || environmentFlag(environment, "CONTROL_PLANE_ONLY", false);
   const chromeTelemetryEnabled = environmentFlag(environment, "CHROME_TELEMETRY_ENABLED", false);
-  const telemetryAlertsEnabled = environmentFlag(environment, "CHROME_TELEMETRY_ALERTS_ENABLED", false);
+  const telemetryAlertsEnabled = !creatorReadEnabled
+    && environmentFlag(environment, "CHROME_TELEMETRY_ALERTS_ENABLED", false);
   if (telemetryAlertsEnabled && !chromeTelemetryEnabled) {
     throw new Error("CHROME_TELEMETRY_ALERTS_ENABLED requires CHROME_TELEMETRY_ENABLED=true");
   }
@@ -52,6 +56,11 @@ export function resolveRuntimeMode(environment = process.env) {
       : environmentFlag(environment, "STARTUP_VALIDATION_ENABLED", true),
     adapters: {
       line: { enabled: true, source: "messaging-api" },
+      ...(creatorReadEnabled ? { creatorApiRead: {
+        enabled: true, source: "tiktok-creator-api",
+        readOnly: true, status: "waiting-for-snapshot",
+        budgetWriteEnabled: false, autoOptimizationEnabled: false
+      } } : {}),
       tiktok: {
         enabled: !controlPlaneOnly,
         source: controlPlaneOnly ? null : "business-api"
@@ -76,6 +85,7 @@ export function resolveTelemetryOptions(environment = process.env) {
 export function requiredEnvironmentVariables(runtime) {
   const required = ["LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN", "ADMIN_API_KEY"];
   if (!runtime.controlPlaneOnly) required.push("TIKTOK_ACCESS_TOKEN");
+  if (runtime.adapters.creatorApiRead?.enabled) required.push("CREATOR_READ_URL", "CREATOR_READ_BRIDGE_KEY");
   return required;
 }
 
@@ -208,7 +218,12 @@ export function createHttpServer({
       if (request.method === "GET" && url.pathname === "/health") {
         const adapters = {
           ...runtimeStatus.adapters,
-          chromeTelemetry: telemetryHealth({ runtimeStatus, config, store, now: clock() })
+          chromeTelemetry: telemetryHealth({ runtimeStatus, config, store, now: clock() }),
+          ...(runtimeStatus.adapters.creatorApiRead?.enabled ? {
+            creatorApiRead: typeof service.creatorReadHealth === "function"
+              ? service.creatorReadHealth()
+              : runtimeStatus.adapters.creatorApiRead
+          } : {})
         };
         return jsonResponse(response, 200, {
           ok: true,
@@ -349,6 +364,20 @@ export function createHttpServer({
         if (!adminAuthorized(request, adminApiKey)) {
           return jsonResponse(response, 401, { ok: false, error: "unauthorized" });
         }
+      }
+
+      if (request.method === "GET" && url.pathname === "/admin/creator-read") {
+        return jsonResponse(response, 200, {
+          ok: true,
+          adapter: typeof service.creatorReadHealth === "function" ? service.creatorReadHealth() : null,
+          observation: service.creatorRead?.getReadSnapshot("punpan_020") ?? null
+        });
+      }
+
+      if (request.method === "POST" && url.pathname === "/admin/creator-read/refresh") {
+        const result = typeof service.refreshCreatorRead === "function"
+          ? await service.refreshCreatorRead() : { ok: false, code: "CREATOR_READ_DISABLED" };
+        return jsonResponse(response, result.ok ? 200 : 503, result);
       }
 
       if (request.method === "POST" && url.pathname === "/admin/poll") {
@@ -575,6 +604,8 @@ export async function startFromEnvironment() {
     if (fs.existsSync(sqliteSidecar)) fs.chmodSync(sqliteSidecar, 0o600);
   }
   const line = new LineClient({ accessToken: process.env.LINE_CHANNEL_ACCESS_TOKEN });
+  const creatorRead = creatorReadFromEnvironment(process.env);
+  if (creatorRead) store.ensureCreatorPolicy({ clientId: "punpan_020", now: new Date() });
   const tiktok = runtime.adapters.tiktok.enabled
     ? new TikTokClient({
         accessToken: process.env.TIKTOK_ACCESS_TOKEN,
@@ -587,7 +618,8 @@ export async function startFromEnvironment() {
     line,
     tiktok,
     executionEnabled: runtime.executionEnabled,
-    telemetryAlertsEnabled: runtime.telemetryAlertsEnabled
+    telemetryAlertsEnabled: runtime.telemetryAlertsEnabled,
+    creatorRead
   });
   const server = createHttpServer({
     service,
@@ -654,6 +686,15 @@ export async function startFromEnvironment() {
   };
   const notificationWorkerTimer = setInterval(runNotificationWorker, 10_000);
   notificationWorkerTimer.unref();
+  const runCreatorRead = async () => {
+    const result = await service.refreshCreatorRead();
+    if (!result.ok) console.warn(JSON.stringify({ event: "creator_read_unavailable", code: result.code }));
+  };
+  let creatorReadTimer;
+  if (creatorRead) {
+    creatorReadTimer = setInterval(runCreatorRead, 60_000);
+    creatorReadTimer.unref();
+  }
   let monitorBusy = false;
   let monitorTimer;
   if (runtime.monitorEnabled) {
@@ -688,12 +729,14 @@ export async function startFromEnvironment() {
     adapters: runtime.adapters
   }));
   if (!runtime.controlPlaneOnly) setImmediate(runExecutionWorker);
+  if (creatorRead) setImmediate(runCreatorRead);
   setImmediate(runNotificationWorker);
 
   const shutdown = () => {
     if (monitorTimer) clearInterval(monitorTimer);
     if (executionWorkerTimer) clearInterval(executionWorkerTimer);
     if (reconciliationTimer) clearInterval(reconciliationTimer);
+    if (creatorReadTimer) clearInterval(creatorReadTimer);
     clearInterval(notificationWorkerTimer);
     server.close(() => {
       store.close();
