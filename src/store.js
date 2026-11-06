@@ -498,6 +498,37 @@ export class SqliteStore {
         FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
       ) STRICT;
 
+      -- This is a separate, one-shot test ledger, not an Auto optimization job.
+      -- An uncertain dispatch keeps the cap lock across restarts indefinitely.
+      CREATE TABLE IF NOT EXISTS creator_budget_tests (
+        permit_id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        permit_digest TEXT NOT NULL,
+        owner_line_user_id TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('WAITING', 'SENDING', 'UNKNOWN', 'TERMINAL')),
+        lock_held INTEGER NOT NULL CHECK(lock_held IN (0, 1)),
+        api_status TEXT,
+        response_json TEXT,
+        dispatch_count INTEGER NOT NULL DEFAULT 0 CHECK(dispatch_count >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        dispatched_at TEXT,
+        UNIQUE(client_id, local_date),
+        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
+      ) STRICT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS creator_budget_test_client_lock
+        ON creator_budget_tests(client_id) WHERE lock_held = 1;
+
+      CREATE TABLE IF NOT EXISTS creator_budget_test_notifications (
+        permit_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        PRIMARY KEY(permit_id, status),
+        FOREIGN KEY(permit_id) REFERENCES creator_budget_tests(permit_id)
+      ) STRICT;
+
       CREATE TABLE IF NOT EXISTS audit_events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         request_id TEXT,
@@ -4536,6 +4567,9 @@ export class SqliteStore {
       if (Date.parse(at) >= Date.parse(change.expiresAt)) throw new DomainError('CREATOR_CAP_EXPIRED', 'คำขอยืนยันเพดานหมดอายุ กรุณาส่งคำสั่งใหม่');
       if (Date.parse(at) < Date.parse(change.createdAt)) throw new DomainError('CREATOR_CAP_TIME_INVALID', 'เวลายืนยันเพดานไม่ถูกต้อง');
       if (policy.revision !== change.baseRevision) throw new DomainError('CREATOR_POLICY_CHANGED', 'เพดานถูกเปลี่ยนแล้ว กรุณาส่งคำสั่งใหม่');
+      if (this.getCreatorBudgetTestLock({ clientId: change.clientId })) {
+        throw new DomainError('CREATOR_BUDGET_TEST_IN_FLIGHT', 'กำลังตรวจผลการปรับงบ Ppan กรุณารอผลยืนยันก่อนเปลี่ยนเพดาน เพื่อป้องกันงบเกิน');
+      }
       const result = this.db.prepare(`
         UPDATE creator_auto_policies
         SET revision = revision + 1, campaign_cap_minor = ?, client_day_cap_minor = ?, updated_at = ?
@@ -4573,6 +4607,121 @@ export class SqliteStore {
         details: { clientId: change.clientId, capMinor: change.capMinor, baseRevision: change.baseRevision },
       });
       return { status: 'CANCELLED', policy, change: this.getCreatorCapChange(nonce) };
+    });
+  }
+
+  #mapCreatorBudgetTest(row) {
+    if (!row) return null;
+    return Object.freeze({
+      permitId: row.permit_id, clientId: row.client_id, localDate: row.local_date,
+      permitDigest: row.permit_digest, ownerLineUserId: row.owner_line_user_id,
+      state: row.state, lockHeld: row.lock_held === 1, apiStatus: row.api_status,
+      response: parseJson(row.response_json), dispatchCount: row.dispatch_count,
+      createdAt: row.created_at, updatedAt: row.updated_at, dispatchedAt: row.dispatched_at,
+    });
+  }
+
+  getCreatorBudgetTest(permitId) {
+    const id = requiredString(permitId, 'permitId');
+    return this.#mapCreatorBudgetTest(this.db.prepare('SELECT * FROM creator_budget_tests WHERE permit_id = ?').get(id));
+  }
+
+  getCreatorBudgetTestLock({ clientId = CREATOR_POLICY_DEFAULTS.clientId } = {}) {
+    assertCreatorPolicyClient(clientId);
+    return this.#mapCreatorBudgetTest(this.db.prepare('SELECT * FROM creator_budget_tests WHERE client_id = ? AND lock_held = 1').get(clientId));
+  }
+
+  #checkCreatorBudgetTestIdentity(permit, permitDigest) {
+    assertCreatorPolicyClient(permit?.clientId);
+    const id = requiredString(permit.permitId, 'permitId');
+    if (!/^[A-Za-z0-9_-]{8,100}$/.test(id)) throw new DomainError('CREATOR_BUDGET_TEST_PERMIT_INVALID', 'รหัสอนุญาตทดสอบไม่ถูกต้อง');
+    sha256Hash(permitDigest, 'permitDigest');
+    const existing = this.getCreatorBudgetTest(id);
+    if (existing && existing.permitDigest !== permitDigest) throw new DomainError('CREATOR_BUDGET_TEST_PERMIT_CONFLICT', 'รายละเอียดการอนุญาตทดสอบเปลี่ยน ต้องตรวจยืนยันใหม่');
+    const day = this.db.prepare('SELECT permit_id FROM creator_budget_tests WHERE client_id = ? AND local_date = ?').get(permit.clientId, permit.localDate);
+    if (day && day.permit_id !== id) throw new DomainError('CREATOR_BUDGET_TEST_DAY_CONFLICT', 'Ppan มีรายการทดสอบของวันนี้แล้ว ต้องตรวจผลเดิมก่อน');
+    return existing;
+  }
+
+  beginCreatorBudgetTest({ permit, permitDigest, now } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const existing = this.#checkCreatorBudgetTestIdentity(permit, permitDigest);
+      if (existing && existing.state !== 'WAITING') return { dispatch: false, record: existing };
+      const policy = this.getCreatorPolicy({ clientId: permit.clientId });
+      if (!policy || policy.revision !== permit.policyRevision || policy.mode !== 'AUTO_PENDING_TEST'
+        || policy.executionEnabled !== false || policy.timezone !== 'Asia/Bangkok'
+        || policy.thresholdBps !== 8000 || policy.increaseBps !== 2000
+        || policy.campaignCapMinor !== permit.capMinor || policy.clientDailyCapMinor !== permit.capMinor) {
+        throw new DomainError('CREATOR_BUDGET_TEST_POLICY_CHANGED', 'การตั้งค่า Ppan เปลี่ยนแล้ว ต้องยืนยันรอบทดสอบใหม่ก่อน');
+      }
+      if (permit.campaignId !== '1881130110195874' || permit.expectedBudgetMinor !== 300000
+        || permit.targetBudgetMinor !== 360000 || permit.capMinor !== 1000000
+        || permit.nativeAutoBudgetVerifiedOff !== true || permit.exclusiveWriterConfirmed !== true) {
+        throw new DomainError('CREATOR_BUDGET_TEST_PERMIT_INVALID', 'ขอบเขตการทดสอบ Ppan ไม่ตรงกับที่อนุญาต');
+      }
+      const currentDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(at));
+      if (currentDate !== permit.localDate || !(Date.parse(at) >= Date.parse(permit.notBefore) && Date.parse(at) < Date.parse(permit.expiresAt))) {
+        throw new DomainError('CREATOR_BUDGET_TEST_OUTSIDE_WINDOW', 'อยู่นอกช่วงเวลาทดสอบที่ยืนยันไว้');
+      }
+      const owners = this.listLineApprovers({ clientId: permit.clientId }).filter(owner => owner.active);
+      if (owners.length !== 1 || (existing && owners[0].lineUserId !== existing.ownerLineUserId)) {
+        throw new DomainError('CREATOR_BUDGET_TEST_OWNER_UNVERIFIED', 'ต้องมีผู้อนุมัติ LINE ของ Ppan เพียงคนเดียวที่ตรวจยืนยันแล้ว');
+      }
+      if (this.getCreatorBudgetTestLock({ clientId: permit.clientId })) throw new DomainError('CREATOR_BUDGET_TEST_IN_FLIGHT', 'Ppan ยังมีรายการปรับงบที่รอยืนยันผล');
+      if (!existing) this.db.prepare(`
+        INSERT INTO creator_budget_tests
+          (permit_id, client_id, local_date, permit_digest, owner_line_user_id, state, lock_held, dispatch_count, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, 'WAITING', 0, 0, ?, ?)
+      `).run(permit.permitId, permit.clientId, permit.localDate, permitDigest, owners[0].lineUserId, at, at);
+      this.db.prepare(`
+        UPDATE creator_budget_tests SET state = 'SENDING', lock_held = 1, api_status = NULL,
+          response_json = NULL, dispatch_count = dispatch_count + 1, dispatched_at = ?, updated_at = ?
+        WHERE permit_id = ? AND state = 'WAITING' AND lock_held = 0
+      `).run(at, at, permit.permitId);
+      this.#insertAudit({ eventType: 'CREATOR_BUDGET_TEST_DISPATCH_CLAIMED', actorType: 'SYSTEM', occurredAt: at,
+        details: { clientId: permit.clientId, permitId: permit.permitId, policyRevision: permit.policyRevision } });
+      return { dispatch: true, record: this.getCreatorBudgetTest(permit.permitId) };
+    });
+  }
+
+  recordCreatorBudgetTestResponse({ permitId, response, now } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const existing = this.getCreatorBudgetTest(permitId);
+      if (!existing) throw new DomainError('CREATOR_BUDGET_TEST_NOT_FOUND', 'ไม่พบรายการทดสอบงบ');
+      if (existing.state === 'TERMINAL') return existing;
+      let state = 'UNKNOWN';
+      let lockHeld = 1;
+      if (response?.lockSafeToRelease === true) {
+        const noWrite = response.postCount === 0 && response.writeAttempted === false;
+        if (response.status === 'WAIT' && noWrite) { state = 'WAITING'; lockHeld = 0; }
+        if (response.status === 'REJECTED' && noWrite) { state = 'TERMINAL'; lockHeld = 0; }
+        if (response.status === 'SUCCEEDED' && response.postCount === 1 && response.providerAccepted === true
+          && response.writeAttempted === true && response.observedBudgetMinor === 360000) { state = 'TERMINAL'; lockHeld = 0; }
+        if (response.status === 'FAILED_REJECTED' && response.postCount === 1 && response.providerAccepted === false
+          && response.writeAttempted === true) { state = 'TERMINAL'; lockHeld = 0; }
+        if (response.status === 'FAILED_NOT_SENT' && response.postCount === 1 && response.providerAccepted === false
+          && response.writeAttempted === false) { state = 'TERMINAL'; lockHeld = 0; }
+      }
+      this.db.prepare(`
+        UPDATE creator_budget_tests SET state = ?, lock_held = ?, api_status = ?, response_json = ?, updated_at = ? WHERE permit_id = ?
+      `).run(state, lockHeld, response?.status ?? 'OUTCOME_UNKNOWN', json(response, 'response'), at, permitId);
+      this.#insertAudit({ eventType: 'CREATOR_BUDGET_TEST_RESULT_RECORDED', actorType: 'SYSTEM', occurredAt: at,
+        details: { clientId: existing.clientId, permitId, status: response?.status ?? 'OUTCOME_UNKNOWN', lockHeld: lockHeld === 1 } });
+      return this.getCreatorBudgetTest(permitId);
+    });
+  }
+
+  claimCreatorBudgetTestNotification({ permitId, status, now } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const record = this.getCreatorBudgetTest(permitId);
+      if (!record || !this.isLineApprover({ clientId: record.clientId, lineUserId: record.ownerLineUserId })) return null;
+      const normalizedStatus = requiredString(status, 'status');
+      // Claim before delivery: a crash/uncertain send never produces a duplicate owner alert.
+      const result = this.db.prepare('INSERT INTO creator_budget_test_notifications (permit_id, status, claimed_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING').run(permitId, normalizedStatus, at);
+      return result.changes === 1 ? { clientId: record.clientId, ownerLineUserId: record.ownerLineUserId } : null;
     });
   }
 

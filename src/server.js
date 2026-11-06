@@ -11,6 +11,7 @@ import { TikTokClient } from "./tiktok.js";
 import { CALLBACK_PATH as SHOP_CALLBACK_PATH, createShopCallbackHandler } from "./tiktok-shop-callback.js";
 import { LineClient } from "./line.js";
 import { creatorReadFromEnvironment } from "./creator-read.js";
+import { creatorBudgetTestFromEnvironment } from "./creator-budget-test.js";
 import {
   TelemetryError,
   telemetryCredentialIdFromHeaders,
@@ -225,6 +226,9 @@ export function createHttpServer({
               : runtimeStatus.adapters.creatorApiRead
           } : {})
         };
+        if (typeof service.creatorBudgetTestHealth === "function") {
+          adapters.creatorBudgetTest = service.creatorBudgetTestHealth();
+        }
         return jsonResponse(response, 200, {
           ok: true,
           service: "live-gmv-max-guard",
@@ -621,6 +625,30 @@ export async function startFromEnvironment() {
     telemetryAlertsEnabled: runtime.telemetryAlertsEnabled,
     creatorRead
   });
+  // This isolated worker never changes the legacy execution/Auto flags.
+  // Invalid/missing permission must leave LINE and the read bridge available.
+  try {
+    if (process.env.CREATOR_BUDGET_TEST_ENABLED === "true" && !creatorRead) {
+      throw new Error("CREATOR_READ_REQUIRED");
+    }
+    if (process.env.CREATOR_BUDGET_TEST_ENABLED === "true") {
+      const policy = store.getCreatorPolicy({ clientId: "punpan_020" });
+      const owners = store.listLineApprovers({ clientId: "punpan_020" }).filter((owner) => owner.active);
+      if (owners.length !== 1 || !policy || policy.revision !== 1 || policy.capMinor !== 1_000_000
+        || policy.mode !== "AUTO_PENDING_TEST" || policy.executionEnabled !== false
+        || policy.thresholdBps !== 8000 || policy.increaseBps !== 2000) {
+        throw new Error("CREATOR_POLICY_OR_OWNER_UNVERIFIED");
+      }
+    }
+    service.creatorBudgetTest = creatorBudgetTestFromEnvironment(process.env, {
+      store,
+      snapshot: (clientId) => creatorRead.getReadSnapshot(clientId),
+      notify: (result) => service.notifyCreatorBudgetTestResult(result)
+    });
+  } catch {
+    service.creatorBudgetTest = { health: () => ({ enabled: false, status: "blocked", reason: "CONFIGURATION_UNVERIFIED" }) };
+    console.warn(JSON.stringify({ event: "creator_budget_test_blocked", code: "CONFIGURATION_UNVERIFIED" }));
+  }
   const server = createHttpServer({
     service,
     store,
@@ -695,6 +723,16 @@ export async function startFromEnvironment() {
     creatorReadTimer = setInterval(runCreatorRead, 60_000);
     creatorReadTimer.unref();
   }
+  const runCreatorBudgetTest = async () => {
+    if (typeof service.creatorBudgetTest?.tick !== "function") return;
+    try { await service.creatorBudgetTest.tick(); }
+    catch { console.warn(JSON.stringify({ event: "creator_budget_test_blocked", code: "WORKER_UNAVAILABLE" })); }
+  };
+  let creatorBudgetTestTimer;
+  if (typeof service.creatorBudgetTest?.tick === "function") {
+    creatorBudgetTestTimer = setInterval(runCreatorBudgetTest, 60_000);
+    creatorBudgetTestTimer.unref();
+  }
   let monitorBusy = false;
   let monitorTimer;
   if (runtime.monitorEnabled) {
@@ -730,6 +768,7 @@ export async function startFromEnvironment() {
   }));
   if (!runtime.controlPlaneOnly) setImmediate(runExecutionWorker);
   if (creatorRead) setImmediate(runCreatorRead);
+  if (creatorBudgetTestTimer) setImmediate(runCreatorBudgetTest);
   setImmediate(runNotificationWorker);
 
   const shutdown = () => {
@@ -737,6 +776,7 @@ export async function startFromEnvironment() {
     if (executionWorkerTimer) clearInterval(executionWorkerTimer);
     if (reconciliationTimer) clearInterval(reconciliationTimer);
     if (creatorReadTimer) clearInterval(creatorReadTimer);
+    if (creatorBudgetTestTimer) clearInterval(creatorBudgetTestTimer);
     clearInterval(notificationWorkerTimer);
     server.close(() => {
       store.close();

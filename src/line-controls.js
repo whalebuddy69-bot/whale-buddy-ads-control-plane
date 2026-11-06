@@ -787,8 +787,24 @@ function creatorReportLines({ client, snapshot, stale, now }) {
     `อ่าน API เวลา ${bangkokTime(snapshot.observedAt)} (${ageMinutes} นาทีที่แล้ว)`,
     "Spend เป็นค่าประมาณจาก API; ยังไม่ยืนยันระยะหน่วงของผลรายงาน",
     `Native Auto Budget: ${snapshot.nativeAutoBudgetState ?? "UNKNOWN"}`,
-    "อ่านอย่างเดียว — ยังไม่เปิด Auto Top-up หรือคำสั่งเขียน TikTok"
+    snapshot.creatorBudgetTest?.enabled === true
+      ? "Auto ต่อเนื่องยังปิด — อนุญาตเฉพาะการทดสอบเพิ่มงบครั้งเดียว"
+      : "อ่านอย่างเดียว — ยังไม่เปิด Auto Top-up หรือคำสั่งเขียน TikTok"
   );
+  if (snapshot.creatorBudgetTest?.enabled === true) {
+    const test = snapshot.creatorBudgetTest;
+    const labels = {
+      "armed-one-shot": "พร้อมรอเวลาทดสอบ", "waiting-for-window": "รอช่วงเวลาที่อนุมัติ",
+      "waiting-for-threshold": "รอใช้เงินถึง 80%", "waiting-for-data": "รอข้อมูลสด",
+      "waiting-for-api-preflight": "รอตรวจข้อมูลต้นทาง", "outcome-unknown": "รอตรวจผล — ไม่ส่งเพิ่มซ้ำ",
+      completed: "จบการทดสอบครั้งเดียว", expired: "หมดเวลาทดสอบแล้ว", blocked: "หยุดรอตรวจสอบ"
+    };
+    lines.push(`ทดสอบครั้งเดียว: ${labels[test.status] ?? "รอตรวจสถานะ"}`);
+    if (test.notBefore && test.expiresAt) {
+      lines.push(`วันที่ ${test.localDate} เวลา ${bangkokTime(test.notBefore)}–${bangkokTime(test.expiresAt)} (ไทย)`);
+    }
+    lines.push("เงื่อนไขทดสอบ: Spend 2,400 บาท → งบ 3,000 เป็น 3,600 บาท (+20%) ครั้งเดียว");
+  }
   if (snapshot.creatorPolicy) lines.push(
     `เพดานต่อแคมเปญ/รวม Ppan ต่อวัน: ${formatMinor(snapshot.creatorPolicy.capMinor, "THB")}`,
     `แก้เพดานผ่าน LINE: ตั้งเพดาน Ppan 10000 (ต้องกดยืนยัน) · revision ${snapshot.creatorPolicy.revision}`

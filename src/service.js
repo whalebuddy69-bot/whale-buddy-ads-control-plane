@@ -317,6 +317,7 @@ export class BudgetGuardService {
     executionEnabled = false,
     telemetryAlertsEnabled = false,
     creatorRead = null,
+    creatorBudgetTest = null,
     logger = console,
     now = () => new Date()
   }) {
@@ -327,6 +328,7 @@ export class BudgetGuardService {
     this.executionEnabled = executionEnabled;
     this.telemetryAlertsEnabled = telemetryAlertsEnabled;
     this.creatorRead = creatorRead;
+    this.creatorBudgetTest = creatorBudgetTest;
     this.logger = logger;
     this.now = now;
   }
@@ -524,7 +526,7 @@ export class BudgetGuardService {
       const policy = this.store.getCreatorPolicy?.({ clientId: client.id });
       return policy ? { ...entry, snapshot: { ...entry.snapshot, creatorPolicy: {
         capMinor: policy.capMinor, revision: policy.revision, executionEnabled: false
-      } } } : entry;
+      }, creatorBudgetTest: this.creatorBudgetTest?.health() ?? null } } : entry;
     }
     return this.#latestControlSnapshot(client);
   }
@@ -538,6 +540,47 @@ export class BudgetGuardService {
 
   async refreshCreatorRead() {
     return this.creatorRead?.refresh() ?? { ok: false, code: "CREATOR_READ_DISABLED" };
+  }
+
+  creatorBudgetTestHealth() {
+    const health = this.creatorBudgetTest?.health();
+    // The public health route must not expose campaign IDs, budgets, or permits.
+    return {
+      enabled: health?.enabled === true,
+      oneShot: true,
+      status: health?.status ?? "disabled",
+      reason: health?.reason ?? null,
+      state: health?.state ?? null,
+      outcome: health?.outcome ?? null,
+      policyLocked: health?.policyLocked === true,
+      generalAutoOptimizationEnabled: false
+    };
+  }
+
+  async notifyCreatorBudgetTestResult({ clientId, ownerLineUserId, permitId, status, observedBudgetMinor, message }) {
+    const paired = this.store.listLineApprovers({ clientId: "punpan_020" });
+    const client = this.#clientById("punpan_020");
+    if (clientId !== "punpan_020" || !client || paired.length !== 1
+      || paired[0].lineUserId !== ownerLineUserId || !this.#isCurrentApprover(client, ownerLineUserId)
+      || !/^[A-Za-z0-9_-]{8,100}$/.test(permitId ?? "")
+      || !/^[A-Z][A-Z0-9_]{0,95}$/.test(status ?? "")
+      || typeof message !== "string" || message.length > 1000) {
+      throw new DomainError("CREATOR_BUDGET_TEST_NOTIFICATION_BLOCKED", "Current paired owner required");
+    }
+    const retryKey = stableRetryKey("creator-budget-test", permitId, status, ownerLineUserId);
+    try {
+      await this.line.push(ownerLineUserId, { type: "text", text: message }, retryKey);
+      this.store.appendAuditEvent({
+        eventType: "CREATOR_BUDGET_TEST_LINE_RESULT_SENT", actorType: "SYSTEM", occurredAt: this.now(),
+        details: { clientId, permitId, status, observedBudgetMinor, retryKey }
+      });
+    } catch {
+      this.store.appendAuditEvent({
+        eventType: "CREATOR_BUDGET_TEST_LINE_RESULT_UNCONFIRMED", actorType: "SYSTEM", occurredAt: this.now(),
+        details: { clientId, permitId, status, retryKey, automaticRetry: false }
+      });
+      throw new DomainError("CREATOR_BUDGET_TEST_NOTIFICATION_UNCONFIRMED", "Delivery unconfirmed; no automatic resend");
+    }
   }
 
   #validateControlBudget(client, amount) {
