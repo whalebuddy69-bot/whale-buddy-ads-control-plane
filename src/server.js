@@ -229,6 +229,9 @@ export function createHttpServer({
         if (typeof service.creatorBudgetTestHealth === "function") {
           adapters.creatorBudgetTest = service.creatorBudgetTestHealth();
         }
+        if (typeof service.creatorBudgetPreviewHealth === "function") {
+          adapters.creatorBudgetPreview = service.creatorBudgetPreviewHealth();
+        }
         return jsonResponse(response, 200, {
           ok: true,
           service: "live-gmv-max-guard",
@@ -714,9 +717,19 @@ export async function startFromEnvironment() {
   };
   const notificationWorkerTimer = setInterval(runNotificationWorker, 10_000);
   notificationWorkerTimer.unref();
+  let creatorReadBusy = false;
   const runCreatorRead = async () => {
-    const result = await service.refreshCreatorRead();
-    if (!result.ok) console.warn(JSON.stringify({ event: "creator_read_unavailable", code: result.code }));
+    if (creatorReadBusy) return;
+    creatorReadBusy = true;
+    try {
+      const result = await service.refreshCreatorRead();
+      if (!result.ok) console.warn(JSON.stringify({ event: "creator_read_unavailable", code: result.code }));
+      else await service.processCreatorBudgetPreview();
+    } catch {
+      console.warn(JSON.stringify({ event: "creator_budget_preview", status: "WORKER_UNAVAILABLE", mode: "dry-run" }));
+    } finally {
+      creatorReadBusy = false;
+    }
   };
   let creatorReadTimer;
   if (creatorRead) {

@@ -5,6 +5,7 @@ import {
   buildObservedBudgetChangeMessage,
   buildBudgetConfirmationMessage,
   buildResultMessage,
+  formatMoney,
   parseBudgetText,
   parsePairingText,
   parsePostbackData,
@@ -15,6 +16,8 @@ import {
   buildCreatorCapProposalMessage, buildCreatorCapResultMessage, buildCreatorPolicyStatusMessage,
   creatorCapChangeNonce, parseCreatorPolicyPostback, parseCreatorPolicyText
 } from "./creator-policy.js";
+import { evaluateCreatorBudgetPreview } from "./creator-budget-preview.js";
+import { CREATOR_BINDING } from "./creator-read.js";
 import {
   buildAgencyClientPickerMessage,
   buildAgencyControlMenuMessage,
@@ -51,6 +54,8 @@ import {
 
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const parseLineControlCommand = (text) => parseCreatorPolicyText(text) ?? parseControlCommand(text);
+const CREATOR_PREVIEW_CLIENT = "punpan_020";
+const CREATOR_PREVIEW_COOLDOWN_MS = 15 * 60_000;
 
 function safeError(error) {
   return {
@@ -540,6 +545,70 @@ export class BudgetGuardService {
 
   async refreshCreatorRead() {
     return this.creatorRead?.refresh() ?? { ok: false, code: "CREATOR_READ_DISABLED" };
+  }
+
+  #creatorBudgetPreviewClient() {
+    const client = this.#clientById(CREATOR_PREVIEW_CLIENT);
+    return this.creatorRead?.supports(CREATOR_PREVIEW_CLIENT) && this.executionEnabled === false
+      && client?.lineControl?.enabled === true && client.lineControl.creatorBudgetPreviewEnabled === true
+      && client.advertiserId === CREATOR_BINDING.advertiserId
+      && client.campaignSelector?.expectedTikTokAccountId === CREATOR_BINDING.tiktokAccountId
+      ? client : null;
+  }
+
+  creatorBudgetPreviewHealth() {
+    return { enabled: this.#creatorBudgetPreviewClient() !== null, mode: "dry-run", budgetWriteEnabled: false };
+  }
+
+  // This lane only reads the Creator snapshot and pushes an informational LINE message.
+  // It never creates an approval/request, changes the cap, or invokes a TikTok writer.
+  async processCreatorBudgetPreview() {
+    const client = this.#creatorBudgetPreviewClient();
+    if (!client) return { status: "DISABLED" };
+    const entry = this.creatorRead.getReadSnapshot(client.id);
+    if (entry?.stale !== false) return { status: "SNAPSHOT_NOT_FRESH" };
+    const now = this.now();
+    const policy = this.store.getCreatorPolicy({ clientId: client.id });
+    const proposal = evaluateCreatorBudgetPreview({
+      snapshot: entry.snapshot, policy, now,
+      identity: { clientId: client.id, advertiserId: client.advertiserId, tiktokAccountId: client.campaignSelector.expectedTikTokAccountId }
+    });
+    if (!proposal.eligible) return { status: proposal.reason };
+
+    const owners = this.store.listLineApprovers({ clientId: client.id });
+    if (owners.length !== 1 || owners[0].active !== true || !this.#isCurrentApprover(client, owners[0].lineUserId)) {
+      return { status: "PAIRED_OWNER_UNVERIFIED" };
+    }
+    const ownerId = owners[0].lineUserId;
+    if (!this.store.reserveCreatorBudgetPreview({
+      clientId: client.id, key: proposal.key, policyRevision: proposal.policyRevision,
+      now, cooldownMs: CREATOR_PREVIEW_COOLDOWN_MS
+    })) return { status: "DUPLICATE_COOLDOWN_OR_POLICY_CHANGED" };
+
+    const thb = (minor) => formatMoney(fromMinor(minor, "THB"), "THB");
+    const percent = new Intl.NumberFormat("th-TH", { maximumFractionDigits: 2 }).format(proposal.spendMinor / proposal.currentBudgetMinor * 100);
+    const observedTime = new Intl.DateTimeFormat("th-TH", {
+      timeZone: "Asia/Bangkok", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+    }).format(new Date(proposal.observedAt));
+    const message = { type: "text", text: [
+      "🧪 Ppan — จำลองการเพิ่มงบ (ไม่ได้เปลี่ยนงบจริง)",
+      `แคมเปญ: ${proposal.campaignName || `••••${proposal.campaignId.slice(-4)}`}`,
+      `ใช้ไปประมาณ ${thb(proposal.spendMinor)} (${percent}%) ถึงเกณฑ์ ${proposal.thresholdBps / 100}%`,
+      `ข้อเสนอ +${proposal.increaseBps / 100}%: ${thb(proposal.currentBudgetMinor)} → ${thb(proposal.proposedBudgetMinor)}`,
+      `งบใหม่รวมยอดใช้แคมเปญอื่น: ${thb(proposal.projectedClientSpendMinor)} / เพดานรวม ${thb(proposal.clientDailyCapMinor)}`,
+      `ข้อมูล TikTok ${proposal.reportingDate} ${observedTime} น. (เวลาไทย)`,
+      "Auto ปรับงบจริงยังปิดอยู่ — ไม่ต้องกดอนุมัติ"
+    ].join("\n") };
+    const retryKey = stableRetryKey("creator-budget-preview", proposal.key, ownerId);
+    try {
+      await this.line.push(ownerId, message, retryKey);
+    } catch {
+      // The request may have reached LINE. Later cycles must not start another push.
+      this.logger.warn?.(JSON.stringify({ event: "creator_budget_preview", status: "LINE_UNCONFIRMED", mode: "dry-run" }));
+      return { status: "LINE_UNCONFIRMED" };
+    }
+    this.logger.info?.(JSON.stringify({ event: "creator_budget_preview", status: "LINE_ACCEPTED", mode: "dry-run" }));
+    return { status: "LINE_ACCEPTED" };
   }
 
   creatorBudgetTestHealth() {

@@ -237,6 +237,7 @@ function normalizeLineControl(value, label) {
   }
   return {
     enabled: booleanValue(value.enabled ?? true, `${label}.enabled`),
+    creatorBudgetPreviewEnabled: booleanValue(value.creatorBudgetPreviewEnabled ?? false, `${label}.creatorBudgetPreviewEnabled`),
     aliases,
     minDailyBudget,
     minTargetRoi,

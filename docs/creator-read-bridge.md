@@ -18,9 +18,10 @@ Do not put a TikTok token, encryption key, or report database password in this
 service. Do not reuse the general report internal key for this bridge.
 
 The Creator read flag forces control-plane-only mode, disables the legacy
-Chrome budget-alert worker and all execution/monitor workers, regardless of
+Chrome budget-alert worker and legacy execution/monitor workers, regardless of
 legacy mutation environment flags. Existing legacy command templates remain
-DRY-RUN. Existing Shop callback behavior is preserved.
+DRY-RUN. The separate dated one-shot test cannot be reused after expiry.
+Existing Shop callback behavior is preserved.
 
 ## Read paths
 
@@ -48,7 +49,7 @@ or identifiers. Existing admin authentication protects:
 
 These endpoints cannot activate any advertising writer.
 
-## Confirmed policy settings, still pending execution test
+## Confirmed policy settings, not enabled for automatic writes
 
 The Ppan policy is initialized once in SQLite with the current user-confirmed
 80% threshold, 20% increase from the current budget, and THB 10,000 for both the
@@ -75,3 +76,27 @@ The checked-in legacy Ppan binding now uses the verified Creator advertiser
 2026-11-06. New Creator reports display the current persisted policy ceiling,
 not a stale hardcoded ceiling. Old Chrome observations for a different
 advertiser must not be accepted as the new Creator account's data.
+
+## Ppan dry-run budget proposals
+
+The Ppan control-plane config opts in via `lineControl.creatorBudgetPreviewEnabled`.
+After each successful Creator API poll (roughly every 60 seconds), the service
+can notify the **sole active paired LINE owner**. It does not need Chrome.
+There are no approval buttons, live budget requests, or TikTok writes in this
+path. The public health check exposes the dry-run flag but no proposal details.
+
+The service requires a fresh, same-day Bangkok observation for the verified
+Creator identity, one eligible active campaign, complete account-wide spend,
+and the current stored LINE cap policy. At 80% spend it proposes +20% of the
+current budget. It skips rather than clamps if the target exceeds the campaign
+cap, or if the target plus other campaigns' observed spend exceeds the client
+daily cap. Unknown native Auto Budget is acceptable for simulation only; known
+enabled or conflicting states block the proposal.
+
+An attempt is reserved before contacting LINE so repeated polls or a restart
+do not resend for the same campaign, Bangkok date and baseline budget. A
+15-minute client-wide cooldown also prevents closely spaced proposals when
+the baseline changes. A different qualifying budget can be evaluated again
+after the cooldown. No later cycle resends an unconfirmed attempt. LINE's own
+request retry key is stable for that delivery. Neither cap edits nor a
+simulation can enable real Auto.

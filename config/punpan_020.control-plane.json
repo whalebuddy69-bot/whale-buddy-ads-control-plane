@@ -48,6 +48,7 @@
       },
       "lineControl": {
         "enabled": true,
+        "creatorBudgetPreviewEnabled": true,
         "aliases": ["Ppan"],
         "minDailyBudget": 100,
         "minTargetRoi": 0.1,

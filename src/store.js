@@ -27,6 +27,12 @@ const AUTO_BOOST_TERMINAL_STATUSES = new Set([
 ]);
 const DEFAULT_WEBHOOK_LEASE_MS = 120_000;
 const MAX_WEBHOOK_LEASE_MS = 15 * 60_000;
+const CREATOR_PREVIEW_KEY = /^cbp_[a-f0-9]{64}$/;
+const CREATOR_PREVIEW_RETENTION_MS = 7 * 24 * 60 * 60_000;
+const CREATOR_PREVIEW_BANGKOK_DATE = new Intl.DateTimeFormat('en-CA', {
+  timeZone: CREATOR_POLICY_DEFAULTS.timezone,
+  year: 'numeric', month: '2-digit', day: '2-digit',
+});
 
 function requiredString(value, field) {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -497,6 +503,19 @@ export class SqliteStore {
         applied_revision INTEGER,
         FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
       ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS creator_budget_preview_notifications (
+        client_id TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        preview_key TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
+        claimed_at TEXT NOT NULL,
+        PRIMARY KEY(client_id, local_date, preview_key),
+        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS creator_budget_preview_client_claimed_at
+        ON creator_budget_preview_notifications(client_id, claimed_at);
 
       -- This is a separate, one-shot test ledger, not an Auto optimization job.
       -- An uncertain dispatch keeps the cap lock across restarts indefinitely.
@@ -4484,6 +4503,45 @@ export class SqliteStore {
       });
     });
     return this.getCreatorPolicy({ clientId });
+  }
+
+  /** Persist one attempt before pushing the preview. An ambiguous delivery is not retried. */
+  reserveCreatorBudgetPreview({ clientId, key, policyRevision, now, cooldownMs } = {}) {
+    assertCreatorPolicyClient(clientId);
+    if (typeof key !== 'string' || !CREATOR_PREVIEW_KEY.test(key)) {
+      throw new DomainError('INVALID_REQUEST', 'key must be a valid Creator budget preview key');
+    }
+    positiveInteger(policyRevision, 'policyRevision');
+    if (!Number.isSafeInteger(cooldownMs) || cooldownMs < 1_000 || cooldownMs > 24 * 60 * 60_000) {
+      throw new DomainError('INVALID_REQUEST', 'cooldownMs must be between one second and one day');
+    }
+    const at = requiredIsoTime(now, 'now');
+    const atMs = Date.parse(at);
+    const today = CREATOR_PREVIEW_BANGKOK_DATE.format(new Date(atMs));
+    const retainFrom = CREATOR_PREVIEW_BANGKOK_DATE.format(new Date(atMs - CREATOR_PREVIEW_RETENTION_MS));
+    const cooldownSince = new Date(atMs - cooldownMs).toISOString();
+
+    return this.#transaction(() => {
+      const policy = this.getCreatorPolicy({ clientId });
+      if (!policy || policy.revision !== policyRevision || policy.mode !== CREATOR_POLICY_DEFAULTS.mode
+        || policy.executionEnabled || at < policy.updatedAt) return false;
+
+      this.db.prepare(`
+        DELETE FROM creator_budget_preview_notifications WHERE client_id = ? AND local_date < ?
+      `).run(clientId, retainFrom);
+      const recent = this.db.prepare(`
+        SELECT 1 FROM creator_budget_preview_notifications
+        WHERE client_id = ? AND claimed_at > ? LIMIT 1
+      `).get(clientId, cooldownSince);
+      if (recent) return false;
+
+      const result = this.db.prepare(`
+        INSERT INTO creator_budget_preview_notifications
+          (client_id, local_date, preview_key, policy_revision, claimed_at)
+        VALUES (?, ?, ?, ?, ?) ON CONFLICT(client_id, local_date, preview_key) DO NOTHING
+      `).run(clientId, today, key, policyRevision, at);
+      return result.changes === 1;
+    });
   }
 
   #mapCreatorCapChange(row) {

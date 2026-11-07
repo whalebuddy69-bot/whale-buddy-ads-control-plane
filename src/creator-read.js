@@ -28,6 +28,9 @@ export function validateCreatorReadSnapshot(input, now = new Date()) {
   if (!quality || quality.spendEstimated !== true || quality.spendSource !== "TT_SHOP"
     || quality.reportLagSeconds !== null || quality.gmvAvailable !== false
     || quality.roiAvailable !== false || quality.liveViewsAvailable !== false) fail();
+  // Older snapshots can still serve status, but never qualify for a preview
+  // without a verified complete same-day account spend total.
+  const aggregateSpendComplete = quality.aggregateSpendComplete === true && money(quality.aggregateSpendMinor);
   let campaign = null;
   if (input.campaign !== null) {
     const value = input.campaign;
@@ -49,6 +52,7 @@ export function validateCreatorReadSnapshot(input, now = new Date()) {
     schemaVersion: 1, clientId: CLIENT_ID, source: "tiktok-creator-api", readOnly: true,
     observedAt: new Date(observed).toISOString(), reportingDate: input.reportingDate,
     timezone: "Asia/Bangkok", binding: CREATOR_BINDING,
+    aggregateSpendComplete, aggregateSpendMinor: aggregateSpendComplete ? quality.aggregateSpendMinor : null,
     campaign, nativeAutoBudgetState: ["ENABLED", "DISABLED", "UNKNOWN", "CONFLICT"].includes(input.nativeAutoBudgetState)
       ? input.nativeAutoBudgetState : "UNKNOWN"
   });
@@ -128,10 +132,13 @@ export class CreatorReadProvider {
         clientId: CLIENT_ID, advertiserId: CREATOR_BINDING.advertiserId,
         tiktokAccountId: CREATOR_BINDING.tiktokAccountId,
         observedAt: wire?.observedAt ?? null, reportingDate: wire?.reportingDate ?? null,
+        timezone: "Asia/Bangkok",
         campaignId: campaign?.campaignId ?? null, campaignName: campaign?.campaignName ?? null,
-        campaignStatus: campaign?.status ?? null, currency: "THB",
+        campaignStatus: campaign?.status ?? null, campaignOperationStatus: campaign?.operationStatus ?? null, currency: "THB",
         dailyBudgetMinor: campaign?.dailyBudgetMinor ?? null,
         costMinor: campaign?.spendMinor ?? null, targetRoi: campaign?.targetRoi ?? null,
+        aggregateSpendComplete: wire?.aggregateSpendComplete ?? false,
+        aggregateSpendMinor: wire?.aggregateSpendMinor ?? null,
         grossRevenueMinor: null, grossRoiMilli: null, netRevenueMinor: null,
         netRoiMilli: null, gmvMinor: null, liveViews: null,
         nativeAutoBudgetState: wire?.nativeAutoBudgetState ?? "UNKNOWN"
