@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { CREATOR_POLICY_DEFAULTS, SRIHIW_CREATOR_POLICY_CLIENT } from "./creator-policy.js";
+import { parseCreatorWebAutoBudget, validCreatorLineRecipient } from "./creator-web-auto-line.js";
 
 const CLIENT_ID = CREATOR_POLICY_DEFAULTS.clientId;
 const ROOT = "/internal/automation/ppan/policy";
@@ -17,7 +18,7 @@ const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 const OUTCOMES = new Set(["NOT_SENT", "PROVIDER_REJECTED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN"]);
 const CONFLICTS = new Set([
   "CREATOR_WEB_POLICY_CHANGED", "CREATOR_WEB_POLICY_LOCKED", "CREATOR_WEB_LEASE_EXPIRED",
-  "CREATOR_WEB_LEASE_CONFLICT", "CREATOR_WEB_LEASE_NOT_FOUND", "POLICY_CHANGED", "POLICY_LOCKED"
+  "CREATOR_WEB_LEASE_CONFLICT", "CREATOR_WEB_LEASE_NOT_FOUND", "CREATOR_WEB_AUTO_LINE_NOT_READY", "POLICY_CHANGED", "POLICY_LOCKED"
 ]);
 const MAX_BODY_BYTES = 512;
 const digest = (value) => createHash("sha256").update(value).digest();
@@ -95,8 +96,14 @@ function payloadOf(result, now, clientId = CLIENT_ID) {
 
 /** Only the Railway peer may read, edit the cap, or hold this policy. No path calls TikTok. */
 export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false, srihiwLeaseEnabled = false,
-  capWriteEnabled = false, clock = () => new Date() } = {}) {
+  capWriteEnabled = false, resolveAutoLineRecipient = () => null, clock = () => new Date() } = {}) {
   const expected = validKey(key) ? digest(key) : null;
+  function autoRecipient(clientId) {
+    try {
+      const result = resolveAutoLineRecipient(clientId);
+      return validCreatorLineRecipient(result) ? result : null;
+    } catch { return null; }
+  }
   return async (request, response, pathname) => {
     if (!expected) return fail(response, 404, "NOT_FOUND");
     if (request.url !== pathname || !PATHS.has(pathname)) return fail(response, 400, "INVALID_REQUEST");
@@ -123,11 +130,12 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
         const state = store.getCreatorWebPolicyState({ clientId });
         const now = new Date(clock());
         const capability = capWriteEnabled === true;
+        const autoLineReady = (srihiw ? srihiwLeaseEnabled : leaseEnabled) === true && !!autoRecipient(clientId);
         if (srihiw && state === null) return write(response, 200, { schemaVersion: 1, clientId,
-          configured: false, readAt: now.toISOString(), locked: false, capWriteEnabled: capability });
+          configured: false, readAt: now.toISOString(), locked: false, capWriteEnabled: capability, autoLineReady: false });
         const result = payloadOf(state, now, clientId);
         return result ? write(response, 200, { ...result, ...(srihiw ? { configured: true } : {}),
-          capWriteEnabled: capability }) : fail(response, 503, "POLICY_UNAVAILABLE");
+          capWriteEnabled: capability, autoLineReady }) : fail(response, 503, "POLICY_UNAVAILABLE");
       }
 
       const parsed = await body(request);
@@ -143,20 +151,31 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
         const result = payloadOf(store.updateCreatorWebCap({ clientId,
           revision: input.revision, capMinor: input.capMinor, actorUserId: input.actorUserId, now }), now, clientId);
         return result ? write(response, 200, { ...result, ...(srihiw ? { configured: true } : {}),
-          capWriteEnabled: true }) : fail(response, 503, "POLICY_UNAVAILABLE");
+          capWriteEnabled: true, autoLineReady: (srihiw ? srihiwLeaseEnabled : leaseEnabled) === true && !!autoRecipient(clientId) })
+          : fail(response, 503, "POLICY_UNAVAILABLE");
       }
-      if (Object.keys(input).length !== 2 || !Object.hasOwn(input, "operationId") || typeof input.operationId !== "string"
+      if (!Object.hasOwn(input, "operationId") || typeof input.operationId !== "string"
         || input.operationId.length !== 36 || !OPERATION_ID.test(input.operationId)) return fail(response, 400, "INVALID_REQUEST");
       if (pathname === LEASE || pathname === SRIHIW_LEASE) {
-        if (!Object.hasOwn(input, "revision") || !validPositive(input.revision)) return fail(response, 400, "INVALID_REQUEST");
-        const result = store.acquireCreatorWebPolicyLease({ clientId, operationId: input.operationId, revision: input.revision, now });
+        const isAuto = Object.hasOwn(input, "autoBudget");
+        if (Object.keys(input).length !== (isAuto ? 3 : 2) || !Object.hasOwn(input, "revision") || !validPositive(input.revision)) {
+          return fail(response, 400, "INVALID_REQUEST");
+        }
+        const autoBudget = isAuto ? parseCreatorWebAutoBudget(input.autoBudget) : undefined;
+        if (isAuto && !autoBudget) return fail(response, 400, "INVALID_REQUEST");
+        const lineRecipientUserId = isAuto ? autoRecipient(clientId) : undefined;
+        if (isAuto && !lineRecipientUserId) return fail(response, 409, "CREATOR_WEB_AUTO_LINE_NOT_READY");
+        const result = store.acquireCreatorWebPolicyLease({ clientId, operationId: input.operationId, revision: input.revision, now,
+          ...(isAuto ? { autoBudget, lineRecipientUserId } : {}) });
         const policy = payloadOf(result, now, clientId);
         if (!policy) return fail(response, 503, "POLICY_UNAVAILABLE");
         return write(response, 200, { ...policy, ...(srihiw ? { configured: true } : {}),
           operationId: result.operationId, expiresAt: result.expiresAt });
       }
 
-      if (!Object.hasOwn(input, "outcome") || !OUTCOMES.has(input.outcome)) return fail(response, 400, "INVALID_REQUEST");
+      if (Object.keys(input).length !== 2 || !Object.hasOwn(input, "outcome") || !OUTCOMES.has(input.outcome)) {
+        return fail(response, 400, "INVALID_REQUEST");
+      }
       const result = store.finishCreatorWebPolicyLease({ clientId, operationId: input.operationId, outcome: input.outcome, now });
       return write(response, 200, { schemaVersion: 1, ...result });
     } catch (error) {

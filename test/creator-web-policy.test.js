@@ -31,9 +31,9 @@ function policyStore(t) {
 }
 
 async function localHttp(t, { leaseEnabled = true, srihiwLeaseEnabled = false,
-  capWriteEnabled = false, key = KEY, store = policyStore(t) } = {}) {
+  capWriteEnabled = false, key = KEY, store = policyStore(t), service = {} } = {}) {
   let clock = NOW;
-  const server = createHttpServer({ service: {}, store, clock: () => clock,
+  const server = createHttpServer({ service, store, clock: () => clock,
     creatorWebPolicyOptions: { key, leaseEnabled, srihiwLeaseEnabled, capWriteEnabled } });
   await new Promise((resolve, reject) => server.listen(0, "127.0.0.1", resolve).once("error", reject));
   t.after(() => new Promise(resolve => server.close(resolve)));
@@ -76,7 +76,7 @@ test("the HTTP policy reader is authenticated, fixed-scope, non-browser, no-stor
   const h = await localHttp(t);
   pair(h.store);
   assert.deepEqual(await h.get(), { status: 200, body: { schemaVersion: 1, clientId: CLIENT, revision: 1,
-    campaignCapMinor: 1_000_000, clientDailyCapMinor: 1_000_000, readAt: NOW.toISOString(), locked: false, capWriteEnabled: false } });
+    campaignCapMinor: 1_000_000, clientDailyCapMinor: 1_000_000, readAt: NOW.toISOString(), locked: false, capWriteEnabled: false, autoLineReady: false } });
   assert.equal((await h.get(ROOT, { headers: { "x-creator-web-key": "X".repeat(43), authorization: `Bearer ${KEY}` } })).status, 401);
   for (const headers of [{ origin: "https://example.test" }, { cookie: "a=b" }, { "sec-fetch-site": "same-origin" }]) {
     assert.equal((await h.get(ROOT, { headers })).status, 403);
@@ -96,6 +96,40 @@ test("HTTP lease and finish are off by default even when read is available", asy
   assert.equal((await h.get()).body.locked, false);
   const disabled = await localHttp(t, { key: null });
   assert.equal((await disabled.get()).status, 404);
+});
+
+test("automatic lease requires a scoped LINE recipient, binds the exact increase, and emits no notice before readback", async t => {
+  const recipient = `U${"2".repeat(32)}`;
+  const service = { creatorWebAutoLineRecipient: id => id === CLIENT ? recipient : null };
+  const h = await localHttp(t, { service, capWriteEnabled: true, srihiwLeaseEnabled: true });
+  pair(h.store, recipient);
+  await h.get(`${SRIHIW_ROOT}/cap`, post({ revision: 0, capMinor: 900_000, actorUserId: 42 }));
+  assert.equal((await h.get()).body.autoLineReady, true);
+  assert.equal(JSON.stringify(await h.get()).includes(recipient), false);
+  assert.equal((await h.get(SRIHIW_ROOT)).body.autoLineReady, false);
+  const operationId = randomUUID();
+  const args = { operationId, revision: 1, autoBudget: { previousBudgetMinor: 300_000, targetBudgetMinor: 360_000 } };
+  assert.deepEqual(await h.get(`${SRIHIW_ROOT}/lease`, post(args)),
+    { status: 409, body: { error: { code: "CREATOR_WEB_AUTO_LINE_NOT_READY" } } });
+  assert.equal((await h.get(`${ROOT}/lease`, post({ ...args, autoBudget: { previousBudgetMinor: 300_000, targetBudgetMinor: 360_001 } }))).status, 400);
+  assert.equal((await h.get(`${ROOT}/lease`, post({ ...args, autoBudget: { previousBudgetMinor: 900_000, targetBudgetMinor: 1_080_000 } }))).status, 409);
+  assert.equal((await h.get(`${ROOT}/lease`, post({ ...args, recipientUserId: recipient }))).status, 400);
+  assert.equal((await h.get(`${ROOT}/lease`, post(args))).status, 200);
+  assert.equal((await h.get(`${ROOT}/lease`, post(args))).status, 200);
+  assert.equal((await h.get(`${ROOT}/lease`, post({ operationId, revision: 1 }))).status, 409);
+  assert.equal((await h.get(`${ROOT}/lease`, post({ ...args, autoBudget: { previousBudgetMinor: 400_000, targetBudgetMinor: 480_000 } }))).status, 409);
+  const claim = () => h.store.claimCreatorWebAutoLineDelivery({ clientId: CLIENT, recipientUserId: recipient, now: NOW });
+  assert.equal(claim(), null);
+  assert.equal((await h.get(`${ROOT}/finish`, post({ operationId, outcome: "OUTCOME_UNKNOWN" }))).status, 200);
+  assert.equal(claim(), null);
+  assert.equal((await h.get(`${ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 200);
+  assert.equal((await h.get(`${ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 200);
+  const delivery = claim();
+  assert.equal(delivery.operationId, operationId);
+  assert.match(delivery.messageText, /Ppan.*เพิ่มงบอัตโนมัติสำเร็จ/);
+  assert.match(delivery.messageText, /3,000.*3,600/);
+  assert.deepEqual(h.store.claimCreatorWebLineNotices({ now: NOW }), []);
+  assert.equal(claim(), null);
 });
 
 test("cap bridge has its own opt-in and never accepts browser or foreign target input", async t => {
@@ -119,7 +153,7 @@ test("cap bridge has its own opt-in and never accepts browser or foreign target 
   assert.equal((await h.get(ROOT)).body.revision, 1);
   const written = await h.get(path, post(args));
   assert.deepEqual(written, { status: 200, body: { schemaVersion: 1, clientId: CLIENT, revision: 2, campaignCapMinor: args.capMinor,
-    clientDailyCapMinor: args.capMinor, readAt: NOW.toISOString(), locked: false, capWriteEnabled: true } });
+    clientDailyCapMinor: args.capMinor, readAt: NOW.toISOString(), locked: false, capWriteEnabled: true, autoLineReady: false } });
   assert.equal(h.store.getCreatorPolicy().executionEnabled, false);
   assert.deepEqual(await h.get(path, post({ ...args, revision: 2 })), written);
   assert.deepEqual(await h.get(path, post(args)), { status: 409, body: { error: { code: "POLICY_CHANGED" } } });
@@ -132,14 +166,14 @@ test("cap bridge has its own opt-in and never accepts browser or foreign target 
 test("Srihiw cap starts unconfigured, uses revision zero once, and does not implicitly enable leases or edit Ppan", async t => {
   const h = await localHttp(t, { capWriteEnabled: true });
   assert.deepEqual(await h.get(SRIHIW_ROOT), { status: 200, body: { schemaVersion: 1, clientId: "srihiw",
-    configured: false, readAt: NOW.toISOString(), locked: false, capWriteEnabled: true } });
+    configured: false, readAt: NOW.toISOString(), locked: false, capWriteEnabled: true, autoLineReady: false } });
   assert.equal(h.store.getCreatorWebPolicyState({ clientId: "srihiw" }), null);
   const path = `${SRIHIW_ROOT}/cap`;
   const args = { revision: 0, capMinor: 1_800_000, actorUserId: 42 };
   assert.deepEqual(await h.get(path, post({ ...args, revision: 1 })), { status: 409, body: { error: { code: "POLICY_CHANGED" } } });
   const created = await h.get(path, post(args));
   assert.deepEqual(created, { status: 200, body: { schemaVersion: 1, clientId: "srihiw", configured: true, revision: 1,
-    campaignCapMinor: args.capMinor, clientDailyCapMinor: args.capMinor, readAt: NOW.toISOString(), locked: false, capWriteEnabled: true } });
+    campaignCapMinor: args.capMinor, clientDailyCapMinor: args.capMinor, readAt: NOW.toISOString(), locked: false, capWriteEnabled: true, autoLineReady: false } });
   assert.deepEqual(await h.get(SRIHIW_ROOT), created);
   assert.deepEqual(await h.get(path, post(args)), { status: 409, body: { error: { code: "POLICY_CHANGED" } } });
   assert.equal((await h.get(path, post({ ...args, revision: 1, capMinor: 1_000_000 }))).body.revision, 2);

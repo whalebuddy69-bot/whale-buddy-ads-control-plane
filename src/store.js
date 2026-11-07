@@ -19,6 +19,10 @@ import {
   creatorCapChangeNonce,
   SRIHIW_CREATOR_POLICY_CLIENT,
 } from './creator-policy.js';
+import {
+  autoLineBackoffMs, creatorAutoLineMessage, CREATOR_AUTO_LINE_CLAIM_MS, CREATOR_AUTO_LINE_RETRY_WINDOW_MS,
+  parseCreatorWebAutoBudget, validCreatorLineRecipient,
+} from './creator-web-auto-line.js';
 
 const WEBHOOK_STATUSES = new Set(['RECEIVED', 'PROCESSING', 'PROCESSED', 'FAILED']);
 const AUTO_BOOST_TERMINAL_STATUSES = new Set([
@@ -555,6 +559,32 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS creator_web_line_notices_pending
         ON creator_web_line_notices(client_id, created_at, operation_id) WHERE claimed_at IS NULL;
+
+      -- Automation notifications bind to a real policy lease and an explicitly
+      -- verified recipient before dispatch. Only a proven apply queues a push.
+      CREATE TABLE IF NOT EXISTS creator_web_auto_line_deliveries (
+        operation_id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        recipient_user_id TEXT NOT NULL,
+        previous_budget_minor INTEGER NOT NULL CHECK(previous_budget_minor > 0),
+        target_budget_minor INTEGER NOT NULL CHECK(target_budget_minor > previous_budget_minor),
+        retry_key TEXT NOT NULL UNIQUE,
+        message_text TEXT NOT NULL,
+        state TEXT NOT NULL CHECK(state IN ('RESERVED', 'PENDING', 'ACCEPTED', 'UNCONFIRMED', 'EXPIRED', 'NOT_APPLIED')),
+        verified_at TEXT,
+        next_attempt_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        claim_token TEXT,
+        claim_expires_at TEXT,
+        CHECK((claim_token IS NULL) = (claim_expires_at IS NULL)),
+        CHECK((state = 'PENDING') = (next_attempt_at IS NOT NULL)),
+        CHECK((state IN ('RESERVED', 'NOT_APPLIED')) = (verified_at IS NULL)),
+        FOREIGN KEY(operation_id) REFERENCES creator_web_policy_leases(operation_id),
+        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS creator_web_auto_line_deliveries_pending
+        ON creator_web_auto_line_deliveries(client_id, recipient_user_id, next_attempt_at) WHERE state = 'PENDING';
 
       CREATE TABLE IF NOT EXISTS creator_web_digest_claims (
         client_id TEXT NOT NULL,
@@ -4617,10 +4647,15 @@ export class SqliteStore {
     });
   }
 
-  acquireCreatorWebPolicyLease({ clientId = CREATOR_POLICY_DEFAULTS.clientId, operationId, revision, now } = {}) {
+  acquireCreatorWebPolicyLease({ clientId = CREATOR_POLICY_DEFAULTS.clientId, operationId, revision, now,
+    autoBudget, lineRecipientUserId } = {}) {
     assertCreatorWebPolicyClient(clientId);
     if (!validCreatorWebOperationId(operationId)) {
       throw new DomainError('INVALID_REQUEST', 'operationId must be a canonical UUID');
+    }
+    const auto = autoBudget === undefined ? null : parseCreatorWebAutoBudget(autoBudget);
+    if ((autoBudget !== undefined && !auto) || (!auto && lineRecipientUserId !== undefined)) {
+      throw new DomainError('INVALID_REQUEST', 'Invalid Creator automation notice proof');
     }
     positiveInteger(revision, 'revision');
     const at = requiredIsoTime(now, 'now');
@@ -4631,10 +4666,26 @@ export class SqliteStore {
         || policy.executionEnabled !== false || at < policy.updatedAt) {
         throw new DomainError('CREATOR_WEB_POLICY_CHANGED', 'Creator web policy changed or unavailable');
       }
+      if (auto) {
+        const owners = this.listLineApprovers({ clientId: CREATOR_POLICY_DEFAULTS.clientId });
+        if (!validCreatorLineRecipient(lineRecipientUserId) || owners.length !== 1 || owners[0].active !== true ||
+          owners[0].lineUserId !== lineRecipientUserId) {
+          throw new DomainError('CREATOR_WEB_AUTO_LINE_NOT_READY', 'Creator automation LINE recipient is not verified');
+        }
+        if (auto.targetBudgetMinor > policy.campaignCapMinor || auto.targetBudgetMinor > policy.clientDailyCapMinor) {
+          throw new DomainError('CREATOR_WEB_POLICY_CHANGED', 'Creator automation target exceeds the cap');
+        }
+      }
       const existing = this.db.prepare('SELECT * FROM creator_web_policy_leases WHERE operation_id = ?').get(operationId);
       if (existing) {
+        const delivery = this.db.prepare('SELECT * FROM creator_web_auto_line_deliveries WHERE operation_id = ?').get(operationId);
         if (existing.client_id !== clientId || existing.policy_revision !== revision || existing.outcome !== null || at < existing.acquired_at) {
           throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator web lease cannot be acquired again');
+        }
+        if (Boolean(delivery) !== Boolean(auto) || (auto && (delivery.client_id !== clientId || delivery.state !== 'RESERVED' ||
+          delivery.recipient_user_id !== lineRecipientUserId || delivery.previous_budget_minor !== auto.previousBudgetMinor ||
+          delivery.target_budget_minor !== auto.targetBudgetMinor))) {
+          throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator automation proof cannot be overwritten');
         }
         if (at >= existing.expires_at) throw new DomainError('CREATOR_WEB_LEASE_EXPIRED', 'Creator web lease has expired');
         return { policy, locked: true, operationId, expiresAt: existing.expires_at };
@@ -4647,8 +4698,16 @@ export class SqliteStore {
         INSERT INTO creator_web_policy_leases (operation_id, client_id, policy_revision, acquired_at, expires_at)
         VALUES (?, ?, ?, ?, ?)
       `).run(operationId, clientId, revision, at, expiresAt);
+      if (auto) {
+        this.db.prepare(`
+          INSERT INTO creator_web_auto_line_deliveries (operation_id, client_id, recipient_user_id, previous_budget_minor,
+            target_budget_minor, retry_key, message_text, state)
+          VALUES (?, ?, ?, ?, ?, ?, ?, 'RESERVED')
+        `).run(operationId, clientId, lineRecipientUserId, auto.previousBudgetMinor, auto.targetBudgetMinor,
+          randomUUID(), creatorAutoLineMessage({ clientId, ...auto }));
+      }
       this.#insertAudit({ eventType: 'CREATOR_WEB_POLICY_LEASE_ACQUIRED', actorType: 'SYSTEM', occurredAt: at,
-        details: { clientId, operationId, policyRevision: revision, expiresAt } });
+        details: { clientId, operationId, policyRevision: revision, expiresAt, ...(auto ? { source: 'AUTO_BUDGET' } : {}) } });
       return { policy, locked: true, operationId, expiresAt };
     });
   }
@@ -4676,9 +4735,17 @@ export class SqliteStore {
       this.db.prepare(`
         UPDATE creator_web_policy_leases SET outcome = ?, outcome_at = ? WHERE operation_id = ? AND client_id = ?
       `).run(outcome, at, operationId, clientId);
-      // Srihiw has no verified LINE recipient. Its outcomes are durable in the
-      // lease/audit, but must never reach the paired Ppan notification lane.
-      if (clientId === CREATOR_POLICY_DEFAULTS.clientId && CREATOR_WEB_NOTICE_OUTCOMES.has(outcome)) {
+      const autoDelivery = this.db.prepare('SELECT state FROM creator_web_auto_line_deliveries WHERE operation_id = ? AND client_id = ?')
+        .get(operationId, clientId);
+      if (autoDelivery && outcome === 'APPLIED_VERIFIED') {
+        this.db.prepare(`UPDATE creator_web_auto_line_deliveries SET state = 'PENDING', verified_at = ?, next_attempt_at = ?
+          WHERE operation_id = ? AND client_id = ? AND state = 'RESERVED'`).run(at, at, operationId, clientId);
+      } else if (autoDelivery && outcome !== 'OUTCOME_UNKNOWN') {
+        this.db.prepare(`UPDATE creator_web_auto_line_deliveries SET state = 'NOT_APPLIED'
+          WHERE operation_id = ? AND client_id = ? AND state = 'RESERVED'`).run(operationId, clientId);
+      } else if (!autoDelivery && clientId === CREATOR_POLICY_DEFAULTS.clientId && CREATOR_WEB_NOTICE_OUTCOMES.has(outcome)) {
+        // Preserve the original Ppan manual result lane. No Srihiw manual
+        // result is routed through it, even if Auto is separately authorized.
         this.db.prepare(`
           INSERT INTO creator_web_line_notices (operation_id, client_id, outcome, created_at)
           VALUES (?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET outcome = excluded.outcome
@@ -4689,6 +4756,53 @@ export class SqliteStore {
       this.#insertAudit({ eventType: 'CREATOR_WEB_POLICY_LEASE_OUTCOME', actorType: 'SYSTEM', occurredAt: at,
         details: { clientId, operationId, outcome, lockHeld: outcome === 'OUTCOME_UNKNOWN' } });
       return { operationId, outcome, locked: outcome === 'OUTCOME_UNKNOWN' };
+    });
+  }
+
+  claimCreatorWebAutoLineDelivery({ clientId, recipientUserId, now } = {}) {
+    assertCreatorWebPolicyClient(clientId);
+    if (!validCreatorLineRecipient(recipientUserId)) return null;
+    const at = requiredIsoTime(now, 'now');
+    const oldest = new Date(Date.parse(at) - CREATOR_AUTO_LINE_RETRY_WINDOW_MS).toISOString();
+    return this.#transaction(() => {
+      this.db.prepare(`UPDATE creator_web_auto_line_deliveries SET state = 'EXPIRED', next_attempt_at = NULL,
+        claim_token = NULL, claim_expires_at = NULL
+        WHERE client_id = ? AND state = 'PENDING' AND verified_at <= ? AND (claim_expires_at IS NULL OR claim_expires_at <= ?)`)
+        .run(clientId, oldest, at);
+      const owners = this.listLineApprovers({ clientId: CREATOR_POLICY_DEFAULTS.clientId });
+      if (owners.length !== 1 || owners[0].active !== true || owners[0].lineUserId !== recipientUserId) return null;
+      const row = this.db.prepare(`SELECT * FROM creator_web_auto_line_deliveries
+        WHERE client_id = ? AND recipient_user_id = ? AND state = 'PENDING' AND next_attempt_at <= ?
+        AND verified_at > ? AND (claim_expires_at IS NULL OR claim_expires_at <= ?)
+        ORDER BY next_attempt_at, verified_at, operation_id LIMIT 1`).get(clientId, recipientUserId, at, oldest, at);
+      if (!row) return null;
+      const claimToken = randomUUID();
+      const retryUntil = new Date(Date.parse(row.verified_at) + CREATOR_AUTO_LINE_RETRY_WINDOW_MS).toISOString();
+      const claimExpiresAt = new Date(Math.min(Date.parse(retryUntil), Date.parse(at) + CREATOR_AUTO_LINE_CLAIM_MS)).toISOString();
+      this.db.prepare(`UPDATE creator_web_auto_line_deliveries SET claim_token = ?, claim_expires_at = ?, attempts = attempts + 1
+        WHERE operation_id = ?`).run(claimToken, claimExpiresAt, row.operation_id);
+      return { operationId: row.operation_id, clientId, recipientUserId, claimToken, claimExpiresAt,
+        retryKey: row.retry_key, messageText: row.message_text };
+    });
+  }
+
+  finishCreatorWebAutoLineDelivery({ operationId, claimToken, result, now } = {}) {
+    if (!validCreatorWebOperationId(operationId) || !validCreatorWebOperationId(claimToken) ||
+      !['ACCEPTED', 'RETRYABLE', 'UNCONFIRMED'].includes(result)) throw new DomainError('INVALID_REQUEST', 'Invalid auto LINE delivery result');
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const row = this.db.prepare(`SELECT * FROM creator_web_auto_line_deliveries
+        WHERE operation_id = ? AND claim_token = ? AND state = 'PENDING'`).get(operationId, claimToken);
+      if (!row || at < row.verified_at) return false;
+      const nextAttemptMs = Date.parse(at) + autoLineBackoffMs(row.attempts);
+      const retry = result === 'RETRYABLE' && nextAttemptMs < Date.parse(row.verified_at) + CREATOR_AUTO_LINE_RETRY_WINDOW_MS;
+      const status = retry ? 'PENDING' : result === 'ACCEPTED' ? 'ACCEPTED' : 'UNCONFIRMED';
+      this.db.prepare(`UPDATE creator_web_auto_line_deliveries SET state = ?, next_attempt_at = ?,
+        claim_token = NULL, claim_expires_at = NULL WHERE operation_id = ? AND claim_token = ?`)
+        .run(status, retry ? new Date(nextAttemptMs).toISOString() : null, operationId, claimToken);
+      this.#insertAudit({ eventType: 'CREATOR_WEB_AUTO_LINE_DELIVERY', actorType: 'SYSTEM', occurredAt: at,
+        details: { clientId: row.client_id, operationId, status, attempts: row.attempts } });
+      return status;
     });
   }
 

@@ -212,7 +212,8 @@ export function createHttpServer({
     }
   };
   const shopCallback = createShopCallbackHandler();
-  const creatorWebPolicy = createCreatorWebPolicyHandler({ ...creatorWebPolicyOptions, store, clock });
+  const creatorWebPolicy = createCreatorWebPolicyHandler({ ...creatorWebPolicyOptions, store, clock,
+    resolveAutoLineRecipient: (clientId) => service.creatorWebAutoLineRecipient?.(clientId) ?? null });
   return http.createServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
     if (url.pathname === SHOP_CALLBACK_PATH) {
@@ -636,6 +637,7 @@ export async function startFromEnvironment() {
     telemetryAlertsEnabled: runtime.telemetryAlertsEnabled,
     creatorRead,
     creatorWebLineUpdatesEnabled: process.env.CREATOR_WEB_LINE_UPDATES_ENABLED === "true",
+    creatorWebSrihiwLineSharedOwnerSha256: process.env.CREATOR_WEB_SRIHIW_LINE_SHARED_OWNER_SHA256,
     creatorLineCapWriteDisabled: process.env.CREATOR_LINE_CAP_WRITE_DISABLED === "true",
     creatorLineWebsiteOnly: process.env.CREATOR_LINE_WEBSITE_ONLY === "true"
   });

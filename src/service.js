@@ -15,8 +15,9 @@ import { fromMinor, toMinor } from "./money.js";
 import {
   buildCreatorCapProposalMessage, buildCreatorCapResultMessage, buildCreatorCapWebsiteOnlyMessage,
   buildCreatorPolicyStatusMessage, creatorCapChangeNonce, CREATOR_AUTOMATION_WEB_URL as AUTOMATION_WEB,
-  parseCreatorPolicyPostback, parseCreatorPolicyText
+  parseCreatorPolicyPostback, parseCreatorPolicyText, SRIHIW_CREATOR_POLICY_CLIENT
 } from "./creator-policy.js";
+import { isExplicitSrihiwSharedOwner, retryableCreatorAutoLineError, validCreatorLineRecipient } from "./creator-web-auto-line.js";
 import { evaluateCreatorBudgetPreview } from "./creator-budget-preview.js";
 import { CREATOR_BINDING } from "./creator-read.js";
 import {
@@ -336,6 +337,7 @@ export class BudgetGuardService {
     creatorRead = null,
     creatorBudgetTest = null,
     creatorWebLineUpdatesEnabled = false,
+    creatorWebSrihiwLineSharedOwnerSha256 = null,
     creatorLineCapWriteDisabled = false,
     creatorLineWebsiteOnly = false,
     logger = console,
@@ -350,6 +352,7 @@ export class BudgetGuardService {
     this.creatorRead = creatorRead;
     this.creatorBudgetTest = creatorBudgetTest;
     this.creatorWebLineUpdatesEnabled = creatorWebLineUpdatesEnabled;
+    this.creatorWebSrihiwLineSharedOwnerSha256 = creatorWebSrihiwLineSharedOwnerSha256;
     this.creatorLineWebsiteOnly = creatorLineWebsiteOnly === true;
     this.creatorLineCapWriteDisabled = this.creatorLineWebsiteOnly || creatorLineCapWriteDisabled === true;
     this.logger = logger;
@@ -594,6 +597,49 @@ export class BudgetGuardService {
       sendsAdCommands: false };
   }
 
+  creatorWebAutoLineRecipient(clientId) {
+    if (![CREATOR_PREVIEW_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT].includes(clientId) ||
+      !this.creatorWebLineUpdatesHealth().enabled || this.executionEnabled !== false || typeof this.line?.push !== "function" ||
+      typeof this.store.claimCreatorWebAutoLineDelivery !== "function" || typeof this.store.finishCreatorWebAutoLineDelivery !== "function") return null;
+    const ppan = this.#clientById(CREATOR_PREVIEW_CLIENT);
+    if (ppan?.lineControl?.enabled !== true || ppan.advertiserId !== CREATOR_BINDING.advertiserId ||
+      ppan.campaignSelector?.expectedTikTokAccountId !== CREATOR_BINDING.tiktokAccountId) return null;
+    const owners = this.store.listLineApprovers({ clientId: CREATOR_PREVIEW_CLIENT });
+    const owner = owners.length === 1 && owners[0].active === true ? owners[0].lineUserId : null;
+    if (!validCreatorLineRecipient(owner)) return null;
+    if (clientId === SRIHIW_CREATOR_POLICY_CLIENT &&
+      !isExplicitSrihiwSharedOwner(owner, this.creatorWebSrihiwLineSharedOwnerSha256)) return null;
+    return owner;
+  }
+
+  async #processCreatorWebAutoLineUpdates() {
+    const results = [];
+    // Bounded work per tick. Separate claims and exact recipient checks prevent
+    // a second worker or a rotated pairing from re-routing a pending notice.
+    for (const clientId of [CREATOR_PREVIEW_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT]) {
+      const recipientUserId = this.creatorWebAutoLineRecipient(clientId);
+      if (!recipientUserId) continue;
+      const delivery = this.store.claimCreatorWebAutoLineDelivery({ clientId, recipientUserId, now: this.now() });
+      if (!delivery || this.creatorWebAutoLineRecipient(clientId) !== recipientUserId ||
+        delivery.clientId !== clientId || delivery.recipientUserId !== recipientUserId ||
+        Date.parse(delivery.claimExpiresAt) <= this.now().getTime()) continue;
+      let result = "ACCEPTED";
+      try {
+        await this.line.push(recipientUserId, { type: "text", text: delivery.messageText }, delivery.retryKey);
+      } catch (error) {
+        result = retryableCreatorAutoLineError(error) ? "RETRYABLE" : "UNCONFIRMED";
+      }
+      const state = this.store.finishCreatorWebAutoLineDelivery({ operationId: delivery.operationId, claimToken: delivery.claimToken,
+        result, now: this.now() });
+      if (!state) continue;
+      const event = { event: "creator_web_line_update", type: "AUTO_BUDGET_RESULT", clientId,
+        status: state === "ACCEPTED" ? "LINE_ACCEPTED" : state === "PENDING" ? "LINE_RETRY_PENDING" : "LINE_UNCONFIRMED" };
+      this.logger.info?.(JSON.stringify(event));
+      results.push(event);
+    }
+    return results;
+  }
+
   // Alert-only channel. Never accepts a budget or approval from LINE.
   async processCreatorWebLineUpdates() {
     if (!this.creatorWebLineUpdatesHealth().enabled) return [];
@@ -623,6 +669,7 @@ export class BudgetGuardService {
         ? "✅ Ppan — ปรับงบผ่านเว็บสำเร็จ และอ่านผลกลับจาก TikTok แล้ว"
         : "⚠️ Ppan — ยังยืนยันผลการปรับงบจาก TikTok ไม่ได้ ระบบระงับรายการใหม่และจะไม่ส่งคำสั่งซ้ำ");
     }
+    results.push(...await this.#processCreatorWebAutoLineUpdates());
 
     const now = this.now(), slot = creatorWebDigestSlot(now);
     if (!slot || !authorized() || this.store.getReportSubscription({ clientId: client.id, lineUserId: ownerId })?.enabled === true) return results;
