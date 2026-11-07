@@ -12,6 +12,7 @@ import { CALLBACK_PATH as SHOP_CALLBACK_PATH, createShopCallbackHandler } from "
 import { LineClient } from "./line.js";
 import { creatorReadFromEnvironment } from "./creator-read.js";
 import { creatorBudgetTestFromEnvironment } from "./creator-budget-test.js";
+import { createCreatorWebPolicyHandler, isCreatorWebPolicyPath, resolveCreatorWebPolicyOptions } from "./creator-web-policy.js";
 import {
   TelemetryError,
   telemetryCredentialIdFromHeaders,
@@ -192,6 +193,7 @@ export function createHttpServer({
   runtime,
   config = { clients: [] },
   telemetryOptions = { maxClockSkewSeconds: 300 },
+  creatorWebPolicyOptions = {},
   clock = () => new Date(),
   logger = console
 }) {
@@ -210,12 +212,15 @@ export function createHttpServer({
     }
   };
   const shopCallback = createShopCallbackHandler();
+  const creatorWebPolicy = createCreatorWebPolicyHandler({ ...creatorWebPolicyOptions, store, clock });
   return http.createServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
     if (url.pathname === SHOP_CALLBACK_PATH) {
       return shopCallback(request, response);
     }
     try {
+      if (isCreatorWebPolicyPath(url.pathname)) return await creatorWebPolicy(request, response, url.pathname);
+
       if (request.method === "GET" && url.pathname === "/health") {
         const adapters = {
           ...runtimeStatus.adapters,
@@ -231,6 +236,9 @@ export function createHttpServer({
         }
         if (typeof service.creatorBudgetPreviewHealth === "function") {
           adapters.creatorBudgetPreview = service.creatorBudgetPreviewHealth();
+        }
+        if (typeof service.creatorWebLineUpdatesHealth === "function") {
+          adapters.creatorWebLineUpdates = { enabled: service.creatorWebLineUpdatesHealth()?.enabled === true };
         }
         return jsonResponse(response, 200, {
           ok: true,
@@ -626,7 +634,8 @@ export async function startFromEnvironment() {
     tiktok,
     executionEnabled: runtime.executionEnabled,
     telemetryAlertsEnabled: runtime.telemetryAlertsEnabled,
-    creatorRead
+    creatorRead,
+    creatorWebLineUpdatesEnabled: process.env.CREATOR_WEB_LINE_UPDATES_ENABLED === "true"
   });
   // This isolated worker never changes the legacy execution/Auto flags.
   // Invalid/missing permission must leave LINE and the read bridge available.
@@ -659,7 +668,11 @@ export async function startFromEnvironment() {
     adminApiKey: process.env.ADMIN_API_KEY,
     runtime,
     config,
-    telemetryOptions
+    telemetryOptions,
+    creatorWebPolicyOptions: resolveCreatorWebPolicyOptions(process.env, {
+      controlPlaneOnly: runtime.controlPlaneOnly,
+      creatorReadEnabled: Boolean(creatorRead)
+    })
   });
 
   if (!runtime.controlPlaneOnly) {

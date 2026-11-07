@@ -29,6 +29,12 @@ const DEFAULT_WEBHOOK_LEASE_MS = 120_000;
 const MAX_WEBHOOK_LEASE_MS = 15 * 60_000;
 const CREATOR_PREVIEW_KEY = /^cbp_[a-f0-9]{64}$/;
 const CREATOR_PREVIEW_RETENTION_MS = 7 * 24 * 60 * 60_000;
+const CREATOR_WEB_LEASE_MS = 60_000;
+const CREATOR_WEB_OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const validCreatorWebOperationId = (value) => typeof value === 'string' && value.length === 36 && CREATOR_WEB_OPERATION_ID.test(value);
+const CREATOR_WEB_OUTCOMES = new Set(['NOT_SENT', 'PROVIDER_REJECTED', 'APPLIED_VERIFIED', 'OUTCOME_UNKNOWN']);
+const CREATOR_WEB_NOTICE_OUTCOMES = new Set(['APPLIED_VERIFIED', 'OUTCOME_UNKNOWN']);
+const CREATOR_WEB_DIGEST_SLOTS = new Set(['12:00', '21:00']);
 const CREATOR_PREVIEW_BANGKOK_DATE = new Intl.DateTimeFormat('en-CA', {
   timeZone: CREATOR_POLICY_DEFAULTS.timezone,
   year: 'numeric', month: '2-digit', day: '2-digit',
@@ -516,6 +522,46 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS creator_budget_preview_client_claimed_at
         ON creator_budget_preview_notifications(client_id, claimed_at);
+
+      -- Lease expiry ends dispatch authority; it does not end policy exclusion.
+      -- NULL and UNKNOWN outcomes keep the lock until a proven terminal result.
+      CREATE TABLE IF NOT EXISTS creator_web_policy_leases (
+        operation_id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        policy_revision INTEGER NOT NULL CHECK(policy_revision > 0),
+        acquired_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        outcome TEXT CHECK(outcome IN ('NOT_SENT', 'PROVIDER_REJECTED', 'APPLIED_VERIFIED', 'OUTCOME_UNKNOWN')),
+        outcome_at TEXT,
+        CHECK(expires_at > acquired_at),
+        CHECK((outcome IS NULL AND outcome_at IS NULL) OR (outcome IS NOT NULL AND outcome_at IS NOT NULL)),
+        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
+      ) STRICT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS creator_web_policy_one_held_lease
+        ON creator_web_policy_leases(client_id) WHERE outcome IS NULL OR outcome = 'OUTCOME_UNKNOWN';
+
+      CREATE TABLE IF NOT EXISTS creator_web_line_notices (
+        operation_id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK(outcome IN ('APPLIED_VERIFIED', 'OUTCOME_UNKNOWN')),
+        created_at TEXT NOT NULL,
+        claimed_at TEXT,
+        FOREIGN KEY(operation_id) REFERENCES creator_web_policy_leases(operation_id),
+        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS creator_web_line_notices_pending
+        ON creator_web_line_notices(client_id, created_at, operation_id) WHERE claimed_at IS NULL;
+
+      CREATE TABLE IF NOT EXISTS creator_web_digest_claims (
+        client_id TEXT NOT NULL,
+        local_date TEXT NOT NULL,
+        slot TEXT NOT NULL CHECK(slot IN ('12:00', '21:00')),
+        claimed_at TEXT NOT NULL,
+        PRIMARY KEY(client_id, local_date, slot),
+        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
+      ) STRICT;
 
       -- This is a separate, one-shot test ledger, not an Auto optimization job.
       -- An uncertain dispatch keeps the cap lock across restarts indefinitely.
@@ -4505,6 +4551,130 @@ export class SqliteStore {
     return this.getCreatorPolicy({ clientId });
   }
 
+  #getHeldCreatorWebLease(clientId) {
+    return this.db.prepare(`
+      SELECT operation_id FROM creator_web_policy_leases
+      WHERE client_id = ? AND (outcome IS NULL OR outcome = 'OUTCOME_UNKNOWN')
+    `).get(clientId);
+  }
+
+  getCreatorWebPolicyState({ clientId = CREATOR_POLICY_DEFAULTS.clientId } = {}) {
+    assertCreatorPolicyClient(clientId);
+    const row = this.db.prepare(`
+      SELECT p.*,
+        (EXISTS(SELECT 1 FROM creator_web_policy_leases l
+          WHERE l.client_id = p.client_id AND (l.outcome IS NULL OR l.outcome = 'OUTCOME_UNKNOWN'))
+         OR EXISTS(SELECT 1 FROM creator_budget_tests t WHERE t.client_id = p.client_id AND t.lock_held = 1)) AS policy_locked
+      FROM creator_auto_policies p WHERE p.client_id = ?
+    `).get(clientId);
+    return row ? { policy: this.#mapCreatorPolicy(row), locked: row.policy_locked === 1 } : null;
+  }
+
+  acquireCreatorWebPolicyLease({ clientId = CREATOR_POLICY_DEFAULTS.clientId, operationId, revision, now } = {}) {
+    assertCreatorPolicyClient(clientId);
+    if (!validCreatorWebOperationId(operationId)) {
+      throw new DomainError('INVALID_REQUEST', 'operationId must be a canonical UUID');
+    }
+    positiveInteger(revision, 'revision');
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const policy = this.getCreatorPolicy({ clientId });
+      if (!policy || policy.revision !== revision || policy.mode !== CREATOR_POLICY_DEFAULTS.mode
+        || policy.executionEnabled !== false || at < policy.updatedAt) {
+        throw new DomainError('CREATOR_WEB_POLICY_CHANGED', 'Creator web policy changed or unavailable');
+      }
+      const existing = this.db.prepare('SELECT * FROM creator_web_policy_leases WHERE operation_id = ?').get(operationId);
+      if (existing) {
+        if (existing.client_id !== clientId || existing.policy_revision !== revision || existing.outcome !== null || at < existing.acquired_at) {
+          throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator web lease cannot be acquired again');
+        }
+        if (at >= existing.expires_at) throw new DomainError('CREATOR_WEB_LEASE_EXPIRED', 'Creator web lease has expired');
+        return { policy, locked: true, operationId, expiresAt: existing.expires_at };
+      }
+      if (this.#getHeldCreatorWebLease(clientId) || this.getCreatorBudgetTestLock({ clientId })) {
+        throw new DomainError('CREATOR_WEB_POLICY_LOCKED', 'Another Creator budget operation holds the policy');
+      }
+      const expiresAt = new Date(Date.parse(at) + CREATOR_WEB_LEASE_MS).toISOString();
+      this.db.prepare(`
+        INSERT INTO creator_web_policy_leases (operation_id, client_id, policy_revision, acquired_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+      `).run(operationId, clientId, revision, at, expiresAt);
+      this.#insertAudit({ eventType: 'CREATOR_WEB_POLICY_LEASE_ACQUIRED', actorType: 'SYSTEM', occurredAt: at,
+        details: { clientId, operationId, policyRevision: revision, expiresAt } });
+      return { policy, locked: true, operationId, expiresAt };
+    });
+  }
+
+  finishCreatorWebPolicyLease({ clientId = CREATOR_POLICY_DEFAULTS.clientId, operationId, outcome, now } = {}) {
+    assertCreatorPolicyClient(clientId);
+    if (!validCreatorWebOperationId(operationId) || !CREATOR_WEB_OUTCOMES.has(outcome)) {
+      throw new DomainError('INVALID_REQUEST', 'Creator web lease outcome is invalid');
+    }
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const existing = this.db.prepare(`
+        SELECT * FROM creator_web_policy_leases WHERE operation_id = ? AND client_id = ?
+      `).get(operationId, clientId);
+      if (!existing) throw new DomainError('CREATOR_WEB_LEASE_NOT_FOUND', 'Creator web lease not found');
+      if (at < existing.acquired_at || (existing.outcome_at !== null && at < existing.outcome_at)) {
+        throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator web lease outcome time is invalid');
+      }
+      if (existing.outcome === outcome) return { operationId, outcome, locked: outcome === 'OUTCOME_UNKNOWN' };
+      // An ambiguous send may later be proven applied. Never downgrade it to
+      // a claim of no send or rejection, and never change a terminal outcome.
+      if (existing.outcome !== null && !(existing.outcome === 'OUTCOME_UNKNOWN' && outcome === 'APPLIED_VERIFIED')) {
+        throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator web lease outcome cannot be overwritten');
+      }
+      this.db.prepare(`
+        UPDATE creator_web_policy_leases SET outcome = ?, outcome_at = ? WHERE operation_id = ? AND client_id = ?
+      `).run(outcome, at, operationId, clientId);
+      if (CREATOR_WEB_NOTICE_OUTCOMES.has(outcome)) {
+        this.db.prepare(`
+          INSERT INTO creator_web_line_notices (operation_id, client_id, outcome, created_at)
+          VALUES (?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET outcome = excluded.outcome
+          WHERE creator_web_line_notices.claimed_at IS NULL
+            AND creator_web_line_notices.outcome = 'OUTCOME_UNKNOWN' AND excluded.outcome = 'APPLIED_VERIFIED'
+        `).run(operationId, clientId, outcome, at);
+      }
+      this.#insertAudit({ eventType: 'CREATOR_WEB_POLICY_LEASE_OUTCOME', actorType: 'SYSTEM', occurredAt: at,
+        details: { clientId, operationId, outcome, lockHeld: outcome === 'OUTCOME_UNKNOWN' } });
+      return { operationId, outcome, locked: outcome === 'OUTCOME_UNKNOWN' };
+    });
+  }
+
+  claimCreatorWebLineNotices({ now, limit = 5 } = {}) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 25) throw new DomainError('INVALID_REQUEST', 'Invalid notice limit');
+    const at = requiredIsoTime(now, 'now');
+    const clientId = CREATOR_POLICY_DEFAULTS.clientId;
+    return this.#transaction(() => {
+      if (this.listLineApprovers({ clientId }).filter((owner) => owner.active).length !== 1) return [];
+      const rows = this.db.prepare(`
+        SELECT operation_id, outcome FROM creator_web_line_notices
+        WHERE client_id = ? AND claimed_at IS NULL AND created_at <= ?
+        ORDER BY created_at, operation_id LIMIT ?
+      `).all(clientId, at, limit);
+      const mark = this.db.prepare(`
+        UPDATE creator_web_line_notices SET claimed_at = ? WHERE operation_id = ? AND claimed_at IS NULL
+      `);
+      return rows.filter((row) => mark.run(at, row.operation_id).changes === 1)
+        .map((row) => ({ operationId: row.operation_id, outcome: row.outcome }));
+    });
+  }
+
+  reserveCreatorWebDigest({ slot, now } = {}) {
+    if (!CREATOR_WEB_DIGEST_SLOTS.has(slot)) throw new DomainError('INVALID_REQUEST', 'Invalid Creator web digest slot');
+    const at = requiredIsoTime(now, 'now');
+    const clientId = CREATOR_POLICY_DEFAULTS.clientId;
+    const localDate = CREATOR_PREVIEW_BANGKOK_DATE.format(new Date(at));
+    return this.#transaction(() => {
+      if (!this.getCreatorPolicy({ clientId }) || this.listLineApprovers({ clientId }).filter((owner) => owner.active).length !== 1) return false;
+      return this.db.prepare(`
+        INSERT INTO creator_web_digest_claims (client_id, local_date, slot, claimed_at)
+        VALUES (?, ?, ?, ?) ON CONFLICT(client_id, local_date, slot) DO NOTHING
+      `).run(clientId, localDate, slot, at).changes === 1;
+    });
+  }
+
   /** Persist one attempt before pushing the preview. An ambiguous delivery is not retried. */
   reserveCreatorBudgetPreview({ clientId, key, policyRevision, now, cooldownMs } = {}) {
     assertCreatorPolicyClient(clientId);
@@ -4625,7 +4795,7 @@ export class SqliteStore {
       if (Date.parse(at) >= Date.parse(change.expiresAt)) throw new DomainError('CREATOR_CAP_EXPIRED', 'คำขอยืนยันเพดานหมดอายุ กรุณาส่งคำสั่งใหม่');
       if (Date.parse(at) < Date.parse(change.createdAt)) throw new DomainError('CREATOR_CAP_TIME_INVALID', 'เวลายืนยันเพดานไม่ถูกต้อง');
       if (policy.revision !== change.baseRevision) throw new DomainError('CREATOR_POLICY_CHANGED', 'เพดานถูกเปลี่ยนแล้ว กรุณาส่งคำสั่งใหม่');
-      if (this.getCreatorBudgetTestLock({ clientId: change.clientId })) {
+      if (this.getCreatorBudgetTestLock({ clientId: change.clientId }) || this.#getHeldCreatorWebLease(change.clientId)) {
         throw new DomainError('CREATOR_BUDGET_TEST_IN_FLIGHT', 'กำลังตรวจผลการปรับงบ Ppan กรุณารอผลยืนยันก่อนเปลี่ยนเพดาน เพื่อป้องกันงบเกิน');
       }
       const result = this.db.prepare(`
@@ -4726,7 +4896,9 @@ export class SqliteStore {
       if (owners.length !== 1 || (existing && owners[0].lineUserId !== existing.ownerLineUserId)) {
         throw new DomainError('CREATOR_BUDGET_TEST_OWNER_UNVERIFIED', 'ต้องมีผู้อนุมัติ LINE ของ Ppan เพียงคนเดียวที่ตรวจยืนยันแล้ว');
       }
-      if (this.getCreatorBudgetTestLock({ clientId: permit.clientId })) throw new DomainError('CREATOR_BUDGET_TEST_IN_FLIGHT', 'Ppan ยังมีรายการปรับงบที่รอยืนยันผล');
+      if (this.getCreatorBudgetTestLock({ clientId: permit.clientId }) || this.#getHeldCreatorWebLease(permit.clientId)) {
+        throw new DomainError('CREATOR_BUDGET_TEST_IN_FLIGHT', 'Ppan ยังมีรายการปรับงบที่รอยืนยันผล');
+      }
       if (!existing) this.db.prepare(`
         INSERT INTO creator_budget_tests
           (permit_id, client_id, local_date, permit_digest, owner_line_user_id, state, lock_held, dispatch_count, created_at, updated_at)

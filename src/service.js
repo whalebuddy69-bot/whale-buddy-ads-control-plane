@@ -56,6 +56,17 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const parseLineControlCommand = (text) => parseCreatorPolicyText(text) ?? parseControlCommand(text);
 const CREATOR_PREVIEW_CLIENT = "punpan_020";
 const CREATOR_PREVIEW_COOLDOWN_MS = 15 * 60_000;
+const AUTOMATION_WEB = "https://report.whalebuddy69.com/automation";
+const WEB_DIGEST_CLOCK = new Intl.DateTimeFormat("en-GB", {
+  timeZone: "Asia/Bangkok", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
+});
+
+function creatorWebDigestSlot(now) {
+  const time = WEB_DIGEST_CLOCK.format(now);
+  if (time >= "12:00" && time < "12:15") return "12:00";
+  if (time >= "21:00" && time < "21:15") return "21:00";
+  return null;
+}
 
 function safeError(error) {
   return {
@@ -323,6 +334,7 @@ export class BudgetGuardService {
     telemetryAlertsEnabled = false,
     creatorRead = null,
     creatorBudgetTest = null,
+    creatorWebLineUpdatesEnabled = false,
     logger = console,
     now = () => new Date()
   }) {
@@ -334,6 +346,7 @@ export class BudgetGuardService {
     this.telemetryAlertsEnabled = telemetryAlertsEnabled;
     this.creatorRead = creatorRead;
     this.creatorBudgetTest = creatorBudgetTest;
+    this.creatorWebLineUpdatesEnabled = creatorWebLineUpdatesEnabled;
     this.logger = logger;
     this.now = now;
   }
@@ -558,6 +571,57 @@ export class BudgetGuardService {
 
   creatorBudgetPreviewHealth() {
     return { enabled: this.#creatorBudgetPreviewClient() !== null, mode: "dry-run", budgetWriteEnabled: false };
+  }
+
+  creatorWebLineUpdatesHealth() {
+    return { enabled: this.creatorWebLineUpdatesEnabled === true && this.creatorRead?.supports(CREATOR_PREVIEW_CLIENT) === true,
+      sendsAdCommands: false };
+  }
+
+  // Alert-only channel. Never accepts a budget or approval from LINE.
+  async processCreatorWebLineUpdates() {
+    if (!this.creatorWebLineUpdatesHealth().enabled) return [];
+    const client = this.#clientById(CREATOR_PREVIEW_CLIENT);
+    if (client?.lineControl?.enabled !== true || client.advertiserId !== CREATOR_BINDING.advertiserId ||
+      client.campaignSelector?.expectedTikTokAccountId !== CREATOR_BINDING.tiktokAccountId) return [];
+    const owners = this.store.listLineApprovers({ clientId: client.id });
+    if (owners.length !== 1 || owners[0].active !== true) return [];
+    const ownerId = owners[0].lineUserId;
+    const authorized = () => {
+      const current = this.store.listLineApprovers({ clientId: client.id });
+      return current.length === 1 && current[0].active === true && current[0].lineUserId === ownerId;
+    };
+    const results = [];
+    const push = async (type, key, body) => {
+      if (!authorized()) return;
+      let status = "LINE_ACCEPTED";
+      try { await this.line.push(ownerId, { type: "text", text: `${body}\nดูรายละเอียด: ${AUTOMATION_WEB}` }, stableRetryKey(type, key, ownerId)); }
+      catch { status = "LINE_UNCONFIRMED"; }
+      const event = { event: "creator_web_line_update", type, status };
+      this.logger.info?.(JSON.stringify(event));
+      results.push(event);
+    };
+    for (const notice of this.store.claimCreatorWebLineNotices({ now: this.now(), limit: 2 })) {
+      if (!["APPLIED_VERIFIED", "OUTCOME_UNKNOWN"].includes(notice.outcome)) continue;
+      await push("WEB_BUDGET_RESULT", notice.operationId, notice.outcome === "APPLIED_VERIFIED"
+        ? "✅ Ppan — ปรับงบผ่านเว็บสำเร็จ และอ่านผลกลับจาก TikTok แล้ว"
+        : "⚠️ Ppan — ยังยืนยันผลการปรับงบจาก TikTok ไม่ได้ ระบบระงับรายการใหม่และจะไม่ส่งคำสั่งซ้ำ");
+    }
+
+    const now = this.now(), slot = creatorWebDigestSlot(now);
+    if (!slot || !authorized() || this.store.getReportSubscription({ clientId: client.id, lineUserId: ownerId })?.enabled === true) return results;
+    const entry = this.creatorRead.getReadSnapshot(client.id);
+    const data = entry?.snapshot;
+    const date = bangkokLocalDate(now);
+    if (entry?.stale !== false || !data || data.unavailable || data.reportingDate !== date ||
+      data.source !== "tiktok-creator-api" || data.readOnly !== true || data.advertiserId !== CREATOR_BINDING.advertiserId ||
+      data.tiktokAccountId !== CREATOR_BINDING.tiktokAccountId) return results;
+    if (!this.store.reserveCreatorWebDigest({ slot, now })) return results;
+    const thb = (value) => Number.isSafeInteger(value) && value >= 0 ? formatMoney(fromMinor(value, "THB"), "THB") : "ไม่มีข้อมูล";
+    const body = data.noActiveCampaign ? "ไม่พบแคมเปญ Creator ที่เปิดใช้งานจากข้อมูลล่าสุด"
+      : `งบ ${thb(data.dailyBudgetMinor)} · ใช้ไปประมาณ ${thb(data.costMinor)}\nROI Target: ${Number.isFinite(data.targetRoi) ? data.targetRoi : "ไม่มีข้อมูล"}`;
+    await push("WEB_BUDGET_DIGEST", `${date}/${slot}`, `📊 สรุป Automation Ppan — รอบ ${slot} น. (เวลาไทย)\n${body}`);
+    return results;
   }
 
   // This lane only reads the Creator snapshot and pushes an informational LINE message.
@@ -3469,6 +3533,10 @@ export class BudgetGuardService {
         });
         outcomes.push({ type: "REPORT", clientId: client.id, status: "FAILED_NEXT_INTERVAL" });
       }
+    }
+    if (this.creatorWebLineUpdatesEnabled) {
+      try { outcomes.push(...await this.processCreatorWebLineUpdates()); }
+      catch { this.logger.warn?.(JSON.stringify({ event: "creator_web_line_update", status: "UNAVAILABLE" })); }
     }
     return outcomes;
   }
