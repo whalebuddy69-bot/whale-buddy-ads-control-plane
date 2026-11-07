@@ -13,8 +13,9 @@ import {
 } from "./line.js";
 import { fromMinor, toMinor } from "./money.js";
 import {
-  buildCreatorCapProposalMessage, buildCreatorCapResultMessage, buildCreatorPolicyStatusMessage,
-  creatorCapChangeNonce, parseCreatorPolicyPostback, parseCreatorPolicyText
+  buildCreatorCapProposalMessage, buildCreatorCapResultMessage, buildCreatorCapWebsiteOnlyMessage,
+  buildCreatorPolicyStatusMessage, creatorCapChangeNonce, CREATOR_AUTOMATION_WEB_URL as AUTOMATION_WEB,
+  parseCreatorPolicyPostback, parseCreatorPolicyText
 } from "./creator-policy.js";
 import { evaluateCreatorBudgetPreview } from "./creator-budget-preview.js";
 import { CREATOR_BINDING } from "./creator-read.js";
@@ -56,7 +57,7 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const parseLineControlCommand = (text) => parseCreatorPolicyText(text) ?? parseControlCommand(text);
 const CREATOR_PREVIEW_CLIENT = "punpan_020";
 const CREATOR_PREVIEW_COOLDOWN_MS = 15 * 60_000;
-const AUTOMATION_WEB = "https://report.whalebuddy69.com/automation";
+const WEBSITE_ONLY_LINE_READS = new Set(["creator_cap_view", "status", "agency_report"]);
 const WEB_DIGEST_CLOCK = new Intl.DateTimeFormat("en-GB", {
   timeZone: "Asia/Bangkok", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
 });
@@ -335,6 +336,8 @@ export class BudgetGuardService {
     creatorRead = null,
     creatorBudgetTest = null,
     creatorWebLineUpdatesEnabled = false,
+    creatorLineCapWriteDisabled = false,
+    creatorLineWebsiteOnly = false,
     logger = console,
     now = () => new Date()
   }) {
@@ -347,12 +350,24 @@ export class BudgetGuardService {
     this.creatorRead = creatorRead;
     this.creatorBudgetTest = creatorBudgetTest;
     this.creatorWebLineUpdatesEnabled = creatorWebLineUpdatesEnabled;
+    this.creatorLineWebsiteOnly = creatorLineWebsiteOnly === true;
+    this.creatorLineCapWriteDisabled = this.creatorLineWebsiteOnly || creatorLineCapWriteDisabled === true;
     this.logger = logger;
     this.now = now;
   }
 
   #clientById(clientId) {
     return this.config.clients.find((client) => client.id === clientId) ?? null;
+  }
+
+  #interceptWebsiteOnlyLineCommand(command) {
+    return this.creatorLineWebsiteOnly && command != null && command.kind !== "pairing"
+      && !(command.kind === "control_command" && WEBSITE_ONLY_LINE_READS.has(command.command?.kind));
+  }
+
+  #websiteOnlyLineMessage(sourceType) {
+    if (sourceType !== "user") return this.#privateChatOnlyMessage();
+    return { type: "text", text: `LINE ใช้ดูสถานะและรับแจ้งเตือน หากต้องการสั่งงานหรือแก้การตั้งค่า ให้ใช้หน้า Automation: ${AUTOMATION_WEB}` };
   }
 
   #approversForClient(client) {
@@ -543,7 +558,8 @@ export class BudgetGuardService {
       const entry = this.creatorRead.getReadSnapshot(client.id);
       const policy = this.store.getCreatorPolicy?.({ clientId: client.id });
       return policy ? { ...entry, snapshot: { ...entry.snapshot, creatorPolicy: {
-        capMinor: policy.capMinor, revision: policy.revision, executionEnabled: false
+        capMinor: policy.capMinor, revision: policy.revision, executionEnabled: false,
+        websiteOnly: this.creatorLineCapWriteDisabled
       }, creatorBudgetTest: this.creatorBudgetTest?.health() ?? null } } : entry;
     }
     return this.#latestControlSnapshot(client);
@@ -2127,7 +2143,9 @@ export class BudgetGuardService {
       });
       await this.#replySafely(replyToken, {
         type: "text",
-        text: `✅ จับคู่ผู้อนุมัติสำเร็จ\nลูกค้า: ${client.name}\nระบบจะส่งคำขอเพิ่มงบมาที่แชตนี้`
+        text: this.creatorLineWebsiteOnly
+          ? `✅ จับคู่รับแจ้งเตือนสำเร็จ\nลูกค้า: ${client.name}\nสั่งงานบนหน้า Automation: ${AUTOMATION_WEB}`
+          : `✅ จับคู่ผู้อนุมัติสำเร็จ\nลูกค้า: ${client.name}\nระบบจะส่งคำขอเพิ่มงบมาที่แชตนี้`
       });
       return { paired: true, alreadyPaired: false, clientId: client.id };
     } catch (error) {
@@ -2165,9 +2183,16 @@ export class BudgetGuardService {
           await this.#replyControlDurably(event.replyToken, this.#lineControlPairingRequiredMessage());
           return true;
         }
-        const policy = this.store.ensureCreatorPolicy({ clientId: client.id, now: this.now() });
+        if (command.kind === "creator_cap_propose" && this.creatorLineCapWriteDisabled) {
+          await this.#replyControlDurably(event.replyToken, buildCreatorCapWebsiteOnlyMessage());
+          return true;
+        }
+        const policy = this.creatorLineCapWriteDisabled ? this.store.getCreatorPolicy({ clientId: client.id })
+          : this.store.ensureCreatorPolicy({ clientId: client.id, now: this.now() });
         if (command.kind === "creator_cap_view") {
-          await this.#replyControlDurably(event.replyToken, buildCreatorPolicyStatusMessage(policy));
+          await this.#replyControlDurably(event.replyToken, policy
+            ? buildCreatorPolicyStatusMessage(policy, { websiteOnly: this.creatorLineCapWriteDisabled })
+            : { type: "text", text: "ยังตรวจเพดาน Ppan ไม่ได้ กรุณาดูสถานะในหน้า Automation" });
         } else {
           const result = this.store.proposeCreatorCapChange({
             clientId: client.id, ownerLineUserId: userId, capMinor: command.capMinor,
@@ -2440,6 +2465,10 @@ export class BudgetGuardService {
         await this.#replyControlDurably(event.replyToken, this.#lineControlPairingRequiredMessage());
         return true;
       }
+      if (this.creatorLineCapWriteDisabled) {
+        await this.#replyControlDurably(event.replyToken, buildCreatorCapWebsiteOnlyMessage());
+        return true;
+      }
       try {
         const options = { nonce: creatorPolicy.nonce, ownerLineUserId: userId, now: this.now() };
         const result = creatorPolicy.kind === "creator_cap_confirm"
@@ -2681,6 +2710,7 @@ export class BudgetGuardService {
     const results = [];
     for (const event of events ?? []) {
       const eventId = webhookEventId(event);
+      const command = normalizedLineCommand(event);
       this.store.recordWebhookEvent({
         provider: "LINE",
         eventId,
@@ -2690,7 +2720,7 @@ export class BudgetGuardService {
           sourceType: event.source?.type ?? null,
           messageType: event.message?.type ?? null,
           isRedelivery: Boolean(event.deliveryContext?.isRedelivery),
-          command: normalizedLineCommand(event)
+          command
         },
         receivedAt: this.now()
       });
@@ -2712,11 +2742,15 @@ export class BudgetGuardService {
           results.push({ eventId, status: "IGNORED_NO_USER" });
           continue;
         }
-        if (event.type === "postback") {
-          const handledControl = await this.#handleControlPostback(event, userId);
-          if (!handledControl) await this.#handlePostback(event, userId);
+        if (this.#interceptWebsiteOnlyLineCommand(command)) {
+          await this.#replyControlDurably(event.replyToken, this.#websiteOnlyLineMessage(event.source?.type));
+        } else {
+          if (event.type === "postback") {
+            const handledControl = await this.#handleControlPostback(event, userId);
+            if (!handledControl) await this.#handlePostback(event, userId);
+          }
+          if (event.type === "message" && event.message?.type === "text") await this.#handleText(event, userId, eventId);
         }
-        if (event.type === "message" && event.message?.type === "text") await this.#handleText(event, userId, eventId);
         this.store.markWebhookEvent({ provider: "LINE", eventId, leaseToken, status: "PROCESSED", processedAt: this.now() });
         results.push({ eventId, status: "PROCESSED" });
       } catch (error) {
@@ -2769,6 +2803,7 @@ export class BudgetGuardService {
     }
     if (control.kind === "creator_cap_view") return true;
     if (control.kind === "creator_cap_propose") {
+      if (this.creatorLineCapWriteDisabled) return true;
       const nonce = creatorCapChangeNonce({ clientId: client.id, ownerLineUserId: command.userId, sourceEventId: eventId });
       return Boolean(this.store.getCreatorCapChange(nonce));
     }
@@ -2830,9 +2865,10 @@ export class BudgetGuardService {
       if (!client || change.ownerLineUserId !== command.userId || !this.#isCurrentApprover(client, command.userId)
         || !this.store.isLineApprover({ clientId: client.id, lineUserId: command.userId })) return null;
       const policy = this.store.getCreatorPolicy({ clientId: client.id });
-      message = change.status === "PENDING"
-        ? { type: "text", text: "คำขอเพดานยังไม่ได้ยืนยันหรือหมดอายุ กรุณาส่งคำสั่งใหม่ ไม่มีการปรับงบ TikTok" }
-        : buildCreatorCapResultMessage({ policy, status: change.status === "CONFIRMED" ? "ALREADY_CONFIRMED" : "ALREADY_CANCELLED" });
+      message = this.creatorLineCapWriteDisabled ? buildCreatorCapWebsiteOnlyMessage()
+        : change.status === "PENDING"
+          ? { type: "text", text: "คำขอเพดานยังไม่ได้ยืนยันหรือหมดอายุ กรุณาส่งคำสั่งใหม่ ไม่มีการปรับงบ TikTok" }
+          : buildCreatorCapResultMessage({ policy, status: change.status === "CONFIRMED" ? "ALREADY_CONFIRMED" : "ALREADY_CANCELLED" });
     } else if (command.kind === "control_postback") {
       if (command.sourceType && command.sourceType !== "user") return null;
       const parsed = parseControlPostbackData(command.data);
@@ -2892,8 +2928,9 @@ export class BudgetGuardService {
         if (new Set(["creator_cap_view", "creator_cap_propose"]).has(control.kind) && client) {
           if (command.sourceType !== "user" || !this.store.isLineApprover({ clientId: client.id, lineUserId: command.userId })) return null;
           const policy = this.store.getCreatorPolicy({ clientId: client.id });
-          if (!policy) return null;
-          if (control.kind === "creator_cap_view") message = buildCreatorPolicyStatusMessage(policy);
+          if (control.kind === "creator_cap_propose" && this.creatorLineCapWriteDisabled) message = buildCreatorCapWebsiteOnlyMessage();
+          else if (!policy) return null;
+          else if (control.kind === "creator_cap_view") message = buildCreatorPolicyStatusMessage(policy, { websiteOnly: this.creatorLineCapWriteDisabled });
           else {
             const nonce = creatorCapChangeNonce({ clientId: client.id, ownerLineUserId: command.userId, sourceEventId: eventId });
             const change = this.store.getCreatorCapChange(nonce);
@@ -3040,12 +3077,24 @@ export class BudgetGuardService {
       const command = event.payload.command;
       let requestId = null;
       try {
+        // Block stale workflow commands at the same dispatch boundary as new
+        // ones. Do not touch previously created requests or queued work.
+        if (this.#interceptWebsiteOnlyLineCommand(command)) {
+          if ((command.sourceType ?? event.payload.sourceType) === "user" && typeof command.userId === "string" && command.userId) {
+            await this.line.push(command.userId, this.#websiteOnlyLineMessage("user"),
+              stableRetryKey("webhook-recovery", event.eventId, command.userId));
+          }
+          this.store.markWebhookEvent({ provider: "LINE", eventId: event.eventId, leaseToken: event.leaseToken,
+            status: "PROCESSED", processedAt: this.now() });
+          outcomes.push({ eventId: event.eventId, status: "RECOVERED" });
+          continue;
+        }
         const replyOnlyRecovery = claim.priorStatus === "FAILED"
           && claim.priorErrorCode === "LINE_CONTROL_REPLY_FAILED";
         if (command?.kind === "control_postback") {
           const creatorPolicy = parseCreatorPolicyPostback(command.data);
           const creatorChange = creatorPolicy ? this.store.getCreatorCapChange(creatorPolicy.nonce) : null;
-          if (!replyOnlyRecovery && creatorChange?.status === "PENDING") {
+          if (!this.creatorLineCapWriteDisabled && !replyOnlyRecovery && creatorChange?.status === "PENDING") {
             await this.#handleControlPostback({
               type: "postback", source: { userId: command.userId, type: command.sourceType },
               postback: { data: command.data }
@@ -3169,6 +3218,14 @@ export class BudgetGuardService {
           throw new DomainError("COUPON_SCHEDULE_EXPIRED", "Coupon reminder is more than 15 minutes late");
         }
         this.#validateControlBudget(client, schedule.budgetMinor / 100);
+        if (this.creatorLineWebsiteOnly) {
+          await this.line.push(schedule.lineUserId, buildCouponReminderMessage({ clientName: client.name,
+            eventAt: schedule.eventAt, budgetMinor: schedule.budgetMinor, websiteOnly: true }),
+          stableRetryKey("coupon-reminder", schedule.id, schedule.lineUserId));
+          this.store.finishCouponSchedule({ id: schedule.id, ok: true, now: this.now() });
+          outcomes.push({ type: "COUPON", clientId: schedule.clientId, status: "SENT" });
+          continue;
+        }
         const { snapshot, stale } = this.#latestControlSnapshot(client);
         const requestId = controlRequestIdForEvent(`coupon:${schedule.id}`);
         const request = this.#createControlRequest({

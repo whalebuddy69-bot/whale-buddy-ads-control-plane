@@ -11,6 +11,8 @@ export const CREATOR_POLICY_DEFAULTS = Object.freeze({
   executionEnabled: false,
 });
 export const CREATOR_CAP_TTL_MS = 15 * 60_000;
+export const CREATOR_AUTOMATION_WEB_URL = 'https://report.whalebuddy69.com/automation';
+export const SRIHIW_CREATOR_POLICY_CLIENT = 'srihiw';
 const CHANGE_NONCE = /^cc_[a-f0-9]{32}$/;
 const ALIAS = '(Ppan|punpan_020)';
 
@@ -19,6 +21,12 @@ export function assertCreatorPolicyClient(clientId) {
     throw new DomainError('CREATOR_POLICY_CLIENT_NOT_ALLOWED', 'Creator policy ยังรองรับเฉพาะ Ppan');
   }
   return clientId;
+}
+
+// The website policy bridge is scoped independently from Ppan-only LINE
+// control, preview, and legacy test permit.
+export function assertCreatorWebPolicyClient(clientId) {
+  return clientId === SRIHIW_CREATOR_POLICY_CLIENT ? clientId : assertCreatorPolicyClient(clientId);
 }
 
 export function assertCreatorCapMinor(value) {
@@ -75,13 +83,22 @@ function formatMinor(value) {
   return whole.toLocaleString('en-US') + (cents === 0n ? '' : `.${String(cents).padStart(2, '0')}`);
 }
 
-export function buildCreatorPolicyStatusMessage(policy) {
+export function buildCreatorCapWebsiteOnlyMessage() {
+  return {
+    type: 'text',
+    text: `การตั้งและยืนยันเพดาน Ppan ย้ายไปหน้า Automation แล้ว กรุณาเปลี่ยนผ่านเว็บไซต์: ${CREATOR_AUTOMATION_WEB_URL}\nLINE ดูเพดานปัจจุบันได้ด้วย “ดูเพดาน Ppan”`,
+  };
+}
+
+export function buildCreatorPolicyStatusMessage(policy, { websiteOnly = false } = {}) {
   const cap = formatMinor(policy.capMinor ?? policy.campaignCapMinor);
   const mode = policy.mode === 'PAUSED' ? 'พัก Auto — เปลี่ยนเพดานแล้วก็ยังไม่เปิดเอง'
     : policy.executionEnabled === true ? 'Auto เปิดตามสิทธิ์ระบบ' : 'รอผ่านการทดสอบเขียนจริง — ยังไม่เพิ่มงบอัตโนมัติ';
+  const location = websiteOnly ? 'เว็บไซต์' : 'LINE';
+  const edit = websiteOnly ? CREATOR_AUTOMATION_WEB_URL : 'ตั้งเพดาน Ppan 10000';
   return {
     type: 'text',
-    text: `เพดาน Creator Ppan: ${cap} บาท\nใช้เป็นเพดานต่อแคมเปญและรวมลูกค้าต่อวัน\nใช้ถึง 80% → เพิ่ม 20% จากงบปัจจุบัน\nสถานะ: ${mode}\nมีผลจนกว่าจะเปลี่ยนผ่าน LINE (เวลาไทย)\nยังไม่ใช้ GMV/ROI จริงเพื่อตัดสินใจปิดหรือเปิดใหม่\nแก้ไข: ตั้งเพดาน Ppan 10000\nPolicy revision: ${policy.revision}`,
+    text: `เพดาน Creator Ppan: ${cap} บาท\nใช้เป็นเพดานต่อแคมเปญและรวมลูกค้าต่อวัน\nใช้ถึง 80% → เพิ่ม 20% จากงบปัจจุบัน\nสถานะ: ${mode}\nมีผลจนกว่าจะเปลี่ยนผ่าน ${location} (เวลาไทย)\nยังไม่ใช้ GMV/ROI จริงเพื่อตัดสินใจปิดหรือเปิดใหม่\nแก้ไข: ${edit}\nPolicy revision: ${policy.revision}`,
   };
 }
 

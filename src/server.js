@@ -635,7 +635,9 @@ export async function startFromEnvironment() {
     executionEnabled: runtime.executionEnabled,
     telemetryAlertsEnabled: runtime.telemetryAlertsEnabled,
     creatorRead,
-    creatorWebLineUpdatesEnabled: process.env.CREATOR_WEB_LINE_UPDATES_ENABLED === "true"
+    creatorWebLineUpdatesEnabled: process.env.CREATOR_WEB_LINE_UPDATES_ENABLED === "true",
+    creatorLineCapWriteDisabled: process.env.CREATOR_LINE_CAP_WRITE_DISABLED === "true",
+    creatorLineWebsiteOnly: process.env.CREATOR_LINE_WEBSITE_ONLY === "true"
   });
   // This isolated worker never changes the legacy execution/Auto flags.
   // Invalid/missing permission must leave LINE and the read bridge available.

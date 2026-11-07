@@ -13,9 +13,11 @@ import {
 import {
   assertCreatorCapMinor,
   assertCreatorPolicyClient,
+  assertCreatorWebPolicyClient,
   CREATOR_CAP_TTL_MS,
   CREATOR_POLICY_DEFAULTS,
   creatorCapChangeNonce,
+  SRIHIW_CREATOR_POLICY_CLIENT,
 } from './creator-policy.js';
 
 const WEBHOOK_STATUSES = new Set(['RECEIVED', 'PROCESSING', 'PROCESSED', 'FAILED']);
@@ -4559,7 +4561,7 @@ export class SqliteStore {
   }
 
   getCreatorWebPolicyState({ clientId = CREATOR_POLICY_DEFAULTS.clientId } = {}) {
-    assertCreatorPolicyClient(clientId);
+    assertCreatorWebPolicyClient(clientId);
     const row = this.db.prepare(`
       SELECT p.*,
         (EXISTS(SELECT 1 FROM creator_web_policy_leases l
@@ -4570,15 +4572,61 @@ export class SqliteStore {
     return row ? { policy: this.#mapCreatorPolicy(row), locked: row.policy_locked === 1 } : null;
   }
 
+  updateCreatorWebCap({ clientId = CREATOR_POLICY_DEFAULTS.clientId, revision, capMinor, actorUserId, now } = {}) {
+    assertCreatorWebPolicyClient(clientId);
+    if (clientId !== SRIHIW_CREATOR_POLICY_CLIENT || revision !== 0) positiveInteger(revision, 'revision');
+    positiveInteger(actorUserId, 'actorUserId');
+    assertCreatorCapMinor(capMinor);
+    const at = requiredIsoTime(now, 'now');
+    // BEGIN IMMEDIATE holds the same SQLite writer lock used by the website
+    // budget lease, one-shot budget test, and legacy LINE cap confirmations.
+    return this.#transaction(() => {
+      const state = this.getCreatorWebPolicyState({ clientId });
+      const policy = state?.policy;
+      if (!policy && clientId === SRIHIW_CREATOR_POLICY_CLIENT && revision === 0) {
+        // The absence of a user-supplied cap is an intentional OFF state.
+        // Never initialize Srihiw from Ppan's cap or a system default.
+        this.db.prepare(`
+          INSERT INTO creator_auto_policies
+            (client_id, revision, campaign_cap_minor, client_day_cap_minor,
+             threshold_bps, increase_bps, timezone, mode, execution_enabled, created_at, updated_at)
+          VALUES (?, 1, ?, ?, 8000, 2000, 'Asia/Bangkok', 'AUTO_PENDING_TEST', 0, ?, ?)
+        `).run(clientId, capMinor, capMinor, at, at);
+        this.#insertAudit({ eventType: 'CREATOR_WEB_CAP_CHANGED', actorType: 'WEB_USER', actorId: String(actorUserId),
+          occurredAt: at, details: { clientId, previousCampaignCapMinor: null, previousClientDailyCapMinor: null, capMinor, revision: 1 } });
+        return this.getCreatorWebPolicyState({ clientId });
+      }
+      if (!policy || policy.revision !== revision || at < policy.updatedAt) {
+        throw new DomainError('POLICY_CHANGED', 'Creator policy changed; reload before saving');
+      }
+      if (state.locked) throw new DomainError('POLICY_LOCKED', 'A Creator budget operation still holds the cap');
+      if (policy.campaignCapMinor === capMinor && policy.clientDailyCapMinor === capMinor) return state;
+      if (!Number.isSafeInteger(revision + 1)) throw new DomainError('POLICY_CHANGED', 'Creator policy revision is unavailable');
+      const result = this.db.prepare(`
+        UPDATE creator_auto_policies
+        SET revision = revision + 1, campaign_cap_minor = ?, client_day_cap_minor = ?, updated_at = ?
+        WHERE client_id = ? AND revision = ?
+      `).run(capMinor, capMinor, at, clientId, revision);
+      if (result.changes !== 1) throw new DomainError('POLICY_CHANGED', 'Creator policy changed during save');
+      this.#insertAudit({
+        eventType: 'CREATOR_WEB_CAP_CHANGED', actorType: 'WEB_USER', actorId: String(actorUserId), occurredAt: at,
+        details: { clientId, previousCampaignCapMinor: policy.campaignCapMinor,
+          previousClientDailyCapMinor: policy.clientDailyCapMinor, capMinor, revision: revision + 1 },
+      });
+      return this.getCreatorWebPolicyState({ clientId });
+    });
+  }
+
   acquireCreatorWebPolicyLease({ clientId = CREATOR_POLICY_DEFAULTS.clientId, operationId, revision, now } = {}) {
-    assertCreatorPolicyClient(clientId);
+    assertCreatorWebPolicyClient(clientId);
     if (!validCreatorWebOperationId(operationId)) {
       throw new DomainError('INVALID_REQUEST', 'operationId must be a canonical UUID');
     }
     positiveInteger(revision, 'revision');
     const at = requiredIsoTime(now, 'now');
     return this.#transaction(() => {
-      const policy = this.getCreatorPolicy({ clientId });
+      const state = this.getCreatorWebPolicyState({ clientId });
+      const policy = state?.policy;
       if (!policy || policy.revision !== revision || policy.mode !== CREATOR_POLICY_DEFAULTS.mode
         || policy.executionEnabled !== false || at < policy.updatedAt) {
         throw new DomainError('CREATOR_WEB_POLICY_CHANGED', 'Creator web policy changed or unavailable');
@@ -4591,7 +4639,7 @@ export class SqliteStore {
         if (at >= existing.expires_at) throw new DomainError('CREATOR_WEB_LEASE_EXPIRED', 'Creator web lease has expired');
         return { policy, locked: true, operationId, expiresAt: existing.expires_at };
       }
-      if (this.#getHeldCreatorWebLease(clientId) || this.getCreatorBudgetTestLock({ clientId })) {
+      if (state.locked) {
         throw new DomainError('CREATOR_WEB_POLICY_LOCKED', 'Another Creator budget operation holds the policy');
       }
       const expiresAt = new Date(Date.parse(at) + CREATOR_WEB_LEASE_MS).toISOString();
@@ -4606,7 +4654,7 @@ export class SqliteStore {
   }
 
   finishCreatorWebPolicyLease({ clientId = CREATOR_POLICY_DEFAULTS.clientId, operationId, outcome, now } = {}) {
-    assertCreatorPolicyClient(clientId);
+    assertCreatorWebPolicyClient(clientId);
     if (!validCreatorWebOperationId(operationId) || !CREATOR_WEB_OUTCOMES.has(outcome)) {
       throw new DomainError('INVALID_REQUEST', 'Creator web lease outcome is invalid');
     }
@@ -4628,7 +4676,9 @@ export class SqliteStore {
       this.db.prepare(`
         UPDATE creator_web_policy_leases SET outcome = ?, outcome_at = ? WHERE operation_id = ? AND client_id = ?
       `).run(outcome, at, operationId, clientId);
-      if (CREATOR_WEB_NOTICE_OUTCOMES.has(outcome)) {
+      // Srihiw has no verified LINE recipient. Its outcomes are durable in the
+      // lease/audit, but must never reach the paired Ppan notification lane.
+      if (clientId === CREATOR_POLICY_DEFAULTS.clientId && CREATOR_WEB_NOTICE_OUTCOMES.has(outcome)) {
         this.db.prepare(`
           INSERT INTO creator_web_line_notices (operation_id, client_id, outcome, created_at)
           VALUES (?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET outcome = excluded.outcome

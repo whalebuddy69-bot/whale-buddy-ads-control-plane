@@ -1,14 +1,23 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { CREATOR_POLICY_DEFAULTS, SRIHIW_CREATOR_POLICY_CLIENT } from "./creator-policy.js";
 
-const CLIENT_ID = "punpan_020";
+const CLIENT_ID = CREATOR_POLICY_DEFAULTS.clientId;
 const ROOT = "/internal/automation/ppan/policy";
-const PATHS = new Set([ROOT, `${ROOT}/lease`, `${ROOT}/finish`]);
+const CAP = `${ROOT}/cap`;
+const LEASE = `${ROOT}/lease`;
+const FINISH = `${ROOT}/finish`;
+const SRIHIW_ROOT = "/internal/automation/srihiw/policy";
+const SRIHIW_CAP = `${SRIHIW_ROOT}/cap`;
+const SRIHIW_LEASE = `${SRIHIW_ROOT}/lease`;
+const SRIHIW_FINISH = `${SRIHIW_ROOT}/finish`;
+const SRIHIW_PATHS = new Set([SRIHIW_ROOT, SRIHIW_CAP, SRIHIW_LEASE, SRIHIW_FINISH]);
+const PATHS = new Set([ROOT, CAP, LEASE, FINISH, ...SRIHIW_PATHS]);
 const KEY = /^[A-Za-z0-9_-]{43,128}$/;
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const OUTCOMES = new Set(["NOT_SENT", "PROVIDER_REJECTED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN"]);
 const CONFLICTS = new Set([
   "CREATOR_WEB_POLICY_CHANGED", "CREATOR_WEB_POLICY_LOCKED", "CREATOR_WEB_LEASE_EXPIRED",
-  "CREATOR_WEB_LEASE_CONFLICT", "CREATOR_WEB_LEASE_NOT_FOUND"
+  "CREATOR_WEB_LEASE_CONFLICT", "CREATOR_WEB_LEASE_NOT_FOUND", "POLICY_CHANGED", "POLICY_LOCKED"
 ]);
 const MAX_BODY_BYTES = 512;
 const digest = (value) => createHash("sha256").update(value).digest();
@@ -23,7 +32,9 @@ export function resolveCreatorWebPolicyOptions(env, { controlPlaneOnly, creatorR
     env?.LINE_CHANNEL_SECRET, env?.LINE_CHANNEL_ACCESS_TOKEN, env?.TIKTOK_ACCESS_TOKEN];
   const key = controlPlaneOnly === true && creatorReadEnabled === true
     && validKey(value) && !otherKeys.includes(value) ? value : null;
-  return { key, leaseEnabled: key !== null && env?.CREATOR_WEB_POLICY_LEASE_ENABLED === "true" };
+  return { key, leaseEnabled: key !== null && env?.CREATOR_WEB_POLICY_LEASE_ENABLED === "true",
+    srihiwLeaseEnabled: key !== null && env?.CREATOR_WEB_SRIHIW_BUDGET_LEASE_ENABLED === "true",
+    capWriteEnabled: key !== null && env?.CREATOR_WEB_POLICY_CAP_WRITE_ENABLED === "true" };
 }
 
 function write(response, status, body, headers = {}) {
@@ -73,17 +84,18 @@ function validPositive(value) {
   return Number.isSafeInteger(value) && value > 0;
 }
 
-function payloadOf(result, now) {
+function payloadOf(result, now, clientId = CLIENT_ID) {
   const p = result?.policy;
-  if (!p || p.clientId !== CLIENT_ID || !validPositive(p.revision) || !validPositive(p.campaignCapMinor)
+  if (!p || p.clientId !== clientId || !validPositive(p.revision) || !validPositive(p.campaignCapMinor)
     || !validPositive(p.clientDailyCapMinor) || typeof result.locked !== "boolean") return null;
-  return { schemaVersion: 1, clientId: CLIENT_ID, revision: p.revision,
+  return { schemaVersion: 1, clientId, revision: p.revision,
     campaignCapMinor: p.campaignCapMinor, clientDailyCapMinor: p.clientDailyCapMinor,
     readAt: now.toISOString(), locked: result.locked };
 }
 
-/** Only the Railway peer may read or hold this policy. No path calls TikTok. */
-export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false, clock = () => new Date() } = {}) {
+/** Only the Railway peer may read, edit the cap, or hold this policy. No path calls TikTok. */
+export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false, srihiwLeaseEnabled = false,
+  capWriteEnabled = false, clock = () => new Date() } = {}) {
   const expected = validKey(key) ? digest(key) : null;
   return async (request, response, pathname) => {
     if (!expected) return fail(response, 404, "NOT_FOUND");
@@ -93,35 +105,59 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
     if (!validKey(supplied) || !timingSafeEqual(digest(supplied), expected)) {
       return fail(response, 401, "UNAUTHORIZED");
     }
-    const method = pathname === ROOT ? "GET" : "POST";
+    const srihiw = SRIHIW_PATHS.has(pathname);
+    const clientId = srihiw ? SRIHIW_CREATOR_POLICY_CLIENT : CLIENT_ID;
+    const capPath = pathname === CAP || pathname === SRIHIW_CAP;
+    const method = pathname === ROOT || pathname === SRIHIW_ROOT ? "GET" : "POST";
     if (request.method !== method) return fail(response, 405, "METHOD_NOT_ALLOWED", { allow: method });
-    if (method === "POST" && leaseEnabled !== true) return fail(response, 503, "LEASE_DISABLED");
+    if (capPath && capWriteEnabled !== true) return fail(response, 503, "CAP_WRITE_DISABLED");
+    if (method === "POST" && !capPath && (srihiw ? srihiwLeaseEnabled : leaseEnabled) !== true) {
+      return fail(response, 503, "LEASE_DISABLED");
+    }
 
     try {
       if (method === "GET") {
         if (request.headers["transfer-encoding"] !== undefined || Number(request.headers["content-length"] ?? 0) !== 0) {
           return fail(response, 400, "INVALID_REQUEST");
         }
-        const result = payloadOf(store.getCreatorWebPolicyState({ clientId: CLIENT_ID }), new Date(clock()));
-        return result ? write(response, 200, result) : fail(response, 503, "POLICY_UNAVAILABLE");
+        const state = store.getCreatorWebPolicyState({ clientId });
+        const now = new Date(clock());
+        const capability = capWriteEnabled === true;
+        if (srihiw && state === null) return write(response, 200, { schemaVersion: 1, clientId,
+          configured: false, readAt: now.toISOString(), locked: false, capWriteEnabled: capability });
+        const result = payloadOf(state, now, clientId);
+        return result ? write(response, 200, { ...result, ...(srihiw ? { configured: true } : {}),
+          capWriteEnabled: capability }) : fail(response, 503, "POLICY_UNAVAILABLE");
       }
 
       const parsed = await body(request);
       if (!parsed.payload) return fail(response, parsed.status, parsed.code, parsed.status === 413 ? { connection: "close" } : {});
       const input = parsed.payload;
+      const now = new Date(clock());
+      if (capPath) {
+        const fields = ["revision", "capMinor", "actorUserId"];
+        if (Object.keys(input).length !== fields.length || !fields.every(field => Object.hasOwn(input, field)
+          && (validPositive(input[field]) || (srihiw && field === "revision" && input[field] === 0)))) {
+          return fail(response, 400, "INVALID_REQUEST");
+        }
+        const result = payloadOf(store.updateCreatorWebCap({ clientId,
+          revision: input.revision, capMinor: input.capMinor, actorUserId: input.actorUserId, now }), now, clientId);
+        return result ? write(response, 200, { ...result, ...(srihiw ? { configured: true } : {}),
+          capWriteEnabled: true }) : fail(response, 503, "POLICY_UNAVAILABLE");
+      }
       if (Object.keys(input).length !== 2 || !Object.hasOwn(input, "operationId") || typeof input.operationId !== "string"
         || input.operationId.length !== 36 || !OPERATION_ID.test(input.operationId)) return fail(response, 400, "INVALID_REQUEST");
-      const now = new Date(clock());
-      if (pathname === `${ROOT}/lease`) {
+      if (pathname === LEASE || pathname === SRIHIW_LEASE) {
         if (!Object.hasOwn(input, "revision") || !validPositive(input.revision)) return fail(response, 400, "INVALID_REQUEST");
-        const result = store.acquireCreatorWebPolicyLease({ clientId: CLIENT_ID, operationId: input.operationId, revision: input.revision, now });
-        const policy = payloadOf(result, now);
+        const result = store.acquireCreatorWebPolicyLease({ clientId, operationId: input.operationId, revision: input.revision, now });
+        const policy = payloadOf(result, now, clientId);
         if (!policy) return fail(response, 503, "POLICY_UNAVAILABLE");
-        return write(response, 200, { ...policy, operationId: result.operationId, expiresAt: result.expiresAt });
+        return write(response, 200, { ...policy, ...(srihiw ? { configured: true } : {}),
+          operationId: result.operationId, expiresAt: result.expiresAt });
       }
 
       if (!Object.hasOwn(input, "outcome") || !OUTCOMES.has(input.outcome)) return fail(response, 400, "INVALID_REQUEST");
-      const result = store.finishCreatorWebPolicyLease({ clientId: CLIENT_ID, operationId: input.operationId, outcome: input.outcome, now });
+      const result = store.finishCreatorWebPolicyLease({ clientId, operationId: input.operationId, outcome: input.outcome, now });
       return write(response, 200, { schemaVersion: 1, ...result });
     } catch (error) {
       if (CONFLICTS.has(error?.code)) return fail(response, 409, error.code);

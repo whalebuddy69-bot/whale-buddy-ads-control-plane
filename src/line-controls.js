@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { parseAutoBoostTimeWindow } from "./auto-boost.js";
+import { CREATOR_AUTOMATION_WEB_URL } from "./creator-policy.js";
 
 const CONTROL_REQUEST_ID = /^ca_[A-Za-z0-9-]{16,80}$/;
 const SHORTCUT_NAME = /^[A-Za-z0-9ก-๙_-]{1,32}$/u;
@@ -807,7 +808,9 @@ function creatorReportLines({ client, snapshot, stale, now }) {
   }
   if (snapshot.creatorPolicy) lines.push(
     `เพดานต่อแคมเปญ/รวม Ppan ต่อวัน: ${formatMinor(snapshot.creatorPolicy.capMinor, "THB")}`,
-    `แก้เพดานผ่าน LINE: ตั้งเพดาน Ppan 10000 (ต้องกดยืนยัน) · revision ${snapshot.creatorPolicy.revision}`
+    snapshot.creatorPolicy.websiteOnly === true
+      ? `แก้เพดานผ่านเว็บไซต์: ${CREATOR_AUTOMATION_WEB_URL} · revision ${snapshot.creatorPolicy.revision}`
+      : `แก้เพดานผ่าน LINE: ตั้งเพดาน Ppan 10000 (ต้องกดยืนยัน) · revision ${snapshot.creatorPolicy.revision}`
   );
   if (stale) lines.push("ไม่ใช้ข้อมูลชุดนี้ตัดสินใจเปลี่ยนแปลงแคมเปญ");
   return lines;
@@ -1277,19 +1280,18 @@ export function buildControlConfirmationMessage(request) {
   };
 }
 
-export function buildCouponReminderMessage({ clientName, eventAt, budgetMinor, request }) {
-  return [
-    {
+export function buildCouponReminderMessage({ clientName, eventAt, budgetMinor, request, websiteOnly = false }) {
+  const notice = {
       type: "text",
       text: [
         `🎟️ ใกล้ถึงเวลาคูปอง — ${clientName}`,
         `เวลาคูปอง: ${bangkokTime(eventAt)}`,
         `งบพิเศษที่เตรียมไว้: ${formatMinor(budgetMinor, request?.data?.currency ?? "THB")}`,
-        "โปรดตรวจ LIVE และใช้ปุ่มยืนยันด้านล่าง"
+        websiteOnly ? `ตรวจ LIVE และสั่งงานผ่านหน้า Automation: ${CREATOR_AUTOMATION_WEB_URL}`
+          : "โปรดตรวจ LIVE และใช้ปุ่มยืนยันด้านล่าง"
       ].join("\n")
-    },
-    buildControlConfirmationMessage(request)
-  ];
+  };
+  return websiteOnly ? notice : [notice, buildControlConfirmationMessage(request)];
 }
 
 export function controlHelpText(client) {

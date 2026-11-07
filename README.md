@@ -6,6 +6,16 @@ Ppan LINE Command Center, interactive campaign templates, multi-account latest r
 
 สถานะปัจจุบัน: LINE control plane, backend รับ Chrome telemetry แบบ signed/read-only และ MV3 extension สำหรับอ่านหน้า TikTok พร้อมทดสอบแล้ว ค่าเริ่มต้น **ยังไม่อนุญาตให้ monitor หรือแก้งบจริง** จนกว่าจะ deploy, enroll และผ่านการตรวจ snapshot จริง
 
+## Creator: ตั้งเพดานบนเว็บไซต์
+
+หน้า Automation ใช้ Render เป็นแหล่งข้อมูลเพดานเดียวสำหรับ Ppan และ Srihiw ผ่าน Railway server เท่านั้น คำสั่งบันทึกเพดานต้องส่ง revision ล่าสุด และอัปเดตเพดานต่อแคมเปญกับเพดานรวมต่อวันพร้อมกัน การแก้เพดานไม่ส่งคำสั่งไป TikTok และไม่เปิด Auto; Srihiw ไม่มีค่าเริ่มต้นจนกว่าผู้ใช้บันทึกเอง
+
+เปิด `CREATOR_WEB_POLICY_CAP_WRITE_ENABLED=true` หลังเชื่อมกุญแจแยก `CREATOR_WEB_POLICY_BRIDGE_KEY` แล้ว เมื่อยืนยันการทำงานบนเว็บจึงตั้ง `CREATOR_LINE_CAP_WRITE_DISABLED=true` เพื่อปิดคำสั่งแก้เพดานและปุ่มยืนยันเก่าใน LINE โดยคงการอ่านและแจ้งผลไว้ หากการเปลี่ยนงบ Ppan ยังอยู่ระหว่างส่งหรือตรวจผล เพดานจะถูกล็อกจนกว่าจะยืนยันผลได้
+
+ทางเชื่อมล็อกเพดานสำหรับการแก้งบด้วยมือของ Srihiw แยกเปิดด้วย `CREATOR_WEB_SRIHIW_BUDGET_LEASE_ENABLED=true` หลังผู้ใช้ตั้งเพดานแล้วเท่านั้น ผลที่ยังยืนยันไม่ได้จะล็อกเพดานของบัญชีนั้นไว้ ไม่กระทบ Ppan และไม่ส่งการแจ้งเตือน Srihiw ไปยังผู้รับ LINE ของ Ppan
+
+เมื่อพร้อมย้ายทุกคำสั่ง ให้ตั้ง `CREATOR_LINE_WEBSITE_ONLY=true` ซึ่งบล็อกการเปลี่ยนการตั้งค่า คำสั่งแคมเปญ และปุ่มเก่า รวมทั้งคำสั่งที่รอกู้คืนใน LINE การจับคู่ผู้รับแจ้งเตือน การดูสถานะ และรายงานตามเวลาที่ยังใช้งานอยู่จะคงเดิม ส่วนแจ้งเตือนคูปองเดิมจะลิงก์ไปหน้า Automation โดยไม่สร้างคำขอเพิ่มงบใหม่ใน LINE
+
 ## Flow
 
 ```mermaid

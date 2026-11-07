@@ -568,6 +568,32 @@ test("coupon boost is approved in advance and produces a durable timed reminder"
   assert.match(JSON.stringify(line.pushes.at(-1).message), /DRY-RUN/);
 });
 
+test("moving commands to the website preserves due coupon reminders without opening a new LINE confirmation", async t => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  const line = new FakeLine();
+  let now = new Date("2026-07-20T10:00:00.000Z");
+  const deps = { config: controlConfig(), store, line, tiktok: null, executionEnabled: false,
+    now: () => new Date(now), logger: { error() {} } };
+  const before = new BudgetGuardService(deps);
+  await before.handleLineEvents([lineEvent({ id: "coupon-before-website",
+    text: "คูปอง Ppan 2026-07-20 20:00 ก่อน 30 นาที งบ 5000" })]);
+  const id = JSON.stringify(line.replies.at(-1).message).match(/op=confirm&id=(ca_[0-9a-f]+)&v=1/)?.[1];
+  assert.ok(id);
+  await before.handleLineEvents([{ webhookEventId: "confirm-coupon-before-website", type: "postback",
+    source: { type: "user", userId: "U1" }, replyToken: "reply-confirm-website-coupon",
+    postback: { data: `op=confirm&id=${id}&v=1` } }]);
+  assert.equal(store.db.prepare("SELECT status FROM coupon_schedules").get().status, "PENDING");
+  const count = store.db.prepare("SELECT COUNT(*) AS n FROM campaign_control_requests").get().n;
+  const after = new BudgetGuardService({ ...deps, creatorLineWebsiteOnly: true });
+  now = new Date("2026-07-20T12:30:00.000Z");
+  assert.equal((await after.processScheduledLineControls())[0].status, "SENT");
+  assert.equal(store.db.prepare("SELECT status FROM coupon_schedules").get().status, "SENT");
+  assert.equal(store.db.prepare("SELECT COUNT(*) AS n FROM campaign_control_requests").get().n, count);
+  assert.equal(line.pushes.at(-1).message.type, "text");
+  assert.match(line.pushes.at(-1).message.text, /https:\/\/report\.whalebuddy69\.com\/automation/);
+});
+
 test("custom shortcut names stay blocked until Ppan has an API campaign-id binding", async (t) => {
   const store = new SqliteStore();
   const line = new FakeLine();
