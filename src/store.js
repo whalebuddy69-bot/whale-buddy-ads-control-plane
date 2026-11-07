@@ -17,7 +17,6 @@ import {
   CREATOR_CAP_TTL_MS,
   CREATOR_POLICY_DEFAULTS,
   creatorCapChangeNonce,
-  SRIHIW_CREATOR_POLICY_CLIENT,
 } from './creator-policy.js';
 import {
   autoLineBackoffMs, creatorAutoLineMessage, CREATOR_AUTO_LINE_CLAIM_MS, CREATOR_AUTO_LINE_RETRY_WINDOW_MS,
@@ -4604,7 +4603,8 @@ export class SqliteStore {
 
   updateCreatorWebCap({ clientId = CREATOR_POLICY_DEFAULTS.clientId, revision, capMinor, actorUserId, now } = {}) {
     assertCreatorWebPolicyClient(clientId);
-    if (clientId !== SRIHIW_CREATOR_POLICY_CLIENT || revision !== 0) positiveInteger(revision, 'revision');
+    const extra = clientId !== CREATOR_POLICY_DEFAULTS.clientId;
+    if (!extra || revision !== 0) positiveInteger(revision, 'revision');
     positiveInteger(actorUserId, 'actorUserId');
     assertCreatorCapMinor(capMinor);
     const at = requiredIsoTime(now, 'now');
@@ -4613,9 +4613,9 @@ export class SqliteStore {
     return this.#transaction(() => {
       const state = this.getCreatorWebPolicyState({ clientId });
       const policy = state?.policy;
-      if (!policy && clientId === SRIHIW_CREATOR_POLICY_CLIENT && revision === 0) {
+      if (!policy && extra && revision === 0) {
         // The absence of a user-supplied cap is an intentional OFF state.
-        // Never initialize Srihiw from Ppan's cap or a system default.
+        // Never initialize an extra Creator from Ppan's cap or a system default.
         this.db.prepare(`
           INSERT INTO creator_auto_policies
             (client_id, revision, campaign_cap_minor, client_day_cap_minor,
@@ -4744,7 +4744,7 @@ export class SqliteStore {
         this.db.prepare(`UPDATE creator_web_auto_line_deliveries SET state = 'NOT_APPLIED'
           WHERE operation_id = ? AND client_id = ? AND state = 'RESERVED'`).run(operationId, clientId);
       } else if (!autoDelivery && clientId === CREATOR_POLICY_DEFAULTS.clientId && CREATOR_WEB_NOTICE_OUTCOMES.has(outcome)) {
-        // Preserve the original Ppan manual result lane. No Srihiw manual
+        // Preserve the original Ppan manual result lane. No extra manual
         // result is routed through it, even if Auto is separately authorized.
         this.db.prepare(`
           INSERT INTO creator_web_line_notices (operation_id, client_id, outcome, created_at)

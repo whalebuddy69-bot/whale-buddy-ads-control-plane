@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { CREATOR_AUTOMATION_WEB_URL, CREATOR_POLICY_DEFAULTS, SRIHIW_CREATOR_POLICY_CLIENT } from './creator-policy.js';
+import { assertCreatorWebPolicyClient, CREATOR_AUTOMATION_WEB_URL, CREATOR_POLICY_DEFAULTS } from './creator-policy.js';
 import { formatMoney } from './line.js';
 import { fromMinor } from './money.js';
 
@@ -18,13 +18,14 @@ export function parseCreatorWebAutoBudget(value) {
   return { previousBudgetMinor: value.previousBudgetMinor, targetBudgetMinor: value.targetBudgetMinor };
 }
 
-export function isExplicitSrihiwSharedOwner(lineUserId, configuredHash) {
+export function isExplicitCreatorSharedOwner(lineUserId, configuredHash) {
   return validCreatorLineRecipient(lineUserId) && typeof configuredHash === 'string' && /^[0-9a-f]{64}$/.test(configuredHash) &&
     createHash('sha256').update(lineUserId).digest('hex') === configuredHash;
 }
 
 export function creatorAutoLineMessage({ clientId, previousBudgetMinor, targetBudgetMinor }) {
-  const name = clientId === SRIHIW_CREATOR_POLICY_CLIENT ? 'srihiw' : 'Ppan';
+  assertCreatorWebPolicyClient(clientId);
+  const name = clientId === CREATOR_POLICY_DEFAULTS.clientId ? 'Ppan' : clientId;
   const money = (minor) => formatMoney(fromMinor(minor, 'THB'), 'THB');
   return `✅ ${name} — เพิ่มงบอัตโนมัติสำเร็จ และอ่านผลกลับจาก TikTok แล้ว\nงบ ${money(previousBudgetMinor)} → ${money(targetBudgetMinor)}\nดูรายละเอียด: ${CREATOR_AUTOMATION_WEB_URL}`;
 }

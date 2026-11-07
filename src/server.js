@@ -638,6 +638,8 @@ export async function startFromEnvironment() {
     creatorRead,
     creatorWebLineUpdatesEnabled: process.env.CREATOR_WEB_LINE_UPDATES_ENABLED === "true",
     creatorWebSrihiwLineSharedOwnerSha256: process.env.CREATOR_WEB_SRIHIW_LINE_SHARED_OWNER_SHA256,
+    creatorWebNnshop5719LineSharedOwnerSha256: process.env.CREATOR_WEB_NNSHOP5719_LINE_SHARED_OWNER_SHA256,
+    creatorWebAshopbythetaLineSharedOwnerSha256: process.env.CREATOR_WEB_ASHOPBYTHETA_LINE_SHARED_OWNER_SHA256,
     creatorLineCapWriteDisabled: process.env.CREATOR_LINE_CAP_WRITE_DISABLED === "true",
     creatorLineWebsiteOnly: process.env.CREATOR_LINE_WEBSITE_ONLY === "true"
   });

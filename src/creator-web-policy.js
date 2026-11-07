@@ -1,18 +1,18 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import { CREATOR_POLICY_DEFAULTS, SRIHIW_CREATOR_POLICY_CLIENT } from "./creator-policy.js";
+import {
+  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, CREATOR_POLICY_DEFAULTS, EXTRA_CREATOR_WEB_POLICY_CLIENTS,
+  NNSHOP5719_CREATOR_POLICY_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT,
+} from "./creator-policy.js";
 import { parseCreatorWebAutoBudget, validCreatorLineRecipient } from "./creator-web-auto-line.js";
 
 const CLIENT_ID = CREATOR_POLICY_DEFAULTS.clientId;
-const ROOT = "/internal/automation/ppan/policy";
-const CAP = `${ROOT}/cap`;
-const LEASE = `${ROOT}/lease`;
-const FINISH = `${ROOT}/finish`;
-const SRIHIW_ROOT = "/internal/automation/srihiw/policy";
-const SRIHIW_CAP = `${SRIHIW_ROOT}/cap`;
-const SRIHIW_LEASE = `${SRIHIW_ROOT}/lease`;
-const SRIHIW_FINISH = `${SRIHIW_ROOT}/finish`;
-const SRIHIW_PATHS = new Set([SRIHIW_ROOT, SRIHIW_CAP, SRIHIW_LEASE, SRIHIW_FINISH]);
-const PATHS = new Set([ROOT, CAP, LEASE, FINISH, ...SRIHIW_PATHS]);
+// No arbitrary caller-provided slug resolves to a policy. The legacy Ppan URL
+// is retained and every additional scope is a literal reviewed allowlist entry.
+const PATHS = new Map([["ppan", CLIENT_ID], ...EXTRA_CREATOR_WEB_POLICY_CLIENTS.map(clientId => [clientId, clientId])]
+  .flatMap(([slug, clientId]) => {
+    const root = `/internal/automation/${slug}/policy`;
+    return [[root, { clientId, action: "read" }], ...["cap", "lease", "finish"].map(action => [`${root}/${action}`, { clientId, action }])];
+  }));
 const KEY = /^[A-Za-z0-9_-]{43,128}$/;
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const OUTCOMES = new Set(["NOT_SENT", "PROVIDER_REJECTED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN"]);
@@ -35,6 +35,8 @@ export function resolveCreatorWebPolicyOptions(env, { controlPlaneOnly, creatorR
     && validKey(value) && !otherKeys.includes(value) ? value : null;
   return { key, leaseEnabled: key !== null && env?.CREATOR_WEB_POLICY_LEASE_ENABLED === "true",
     srihiwLeaseEnabled: key !== null && env?.CREATOR_WEB_SRIHIW_BUDGET_LEASE_ENABLED === "true",
+    nnshop5719LeaseEnabled: key !== null && env?.CREATOR_WEB_NNSHOP5719_BUDGET_LEASE_ENABLED === "true",
+    ashopbythetaLeaseEnabled: key !== null && env?.CREATOR_WEB_ASHOPBYTHETA_BUDGET_LEASE_ENABLED === "true",
     capWriteEnabled: key !== null && env?.CREATOR_WEB_POLICY_CAP_WRITE_ENABLED === "true" };
 }
 
@@ -96,8 +98,11 @@ function payloadOf(result, now, clientId = CLIENT_ID) {
 
 /** Only the Railway peer may read, edit the cap, or hold this policy. No path calls TikTok. */
 export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false, srihiwLeaseEnabled = false,
+  nnshop5719LeaseEnabled = false, ashopbythetaLeaseEnabled = false,
   capWriteEnabled = false, resolveAutoLineRecipient = () => null, clock = () => new Date() } = {}) {
   const expected = validKey(key) ? digest(key) : null;
+  const leaseByClient = new Map([[CLIENT_ID, leaseEnabled], [SRIHIW_CREATOR_POLICY_CLIENT, srihiwLeaseEnabled],
+    [NNSHOP5719_CREATOR_POLICY_CLIENT, nnshop5719LeaseEnabled], [ASHOPBYTHETA_CREATOR_POLICY_CLIENT, ashopbythetaLeaseEnabled]]);
   function autoRecipient(clientId) {
     try {
       const result = resolveAutoLineRecipient(clientId);
@@ -106,19 +111,21 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
   }
   return async (request, response, pathname) => {
     if (!expected) return fail(response, 404, "NOT_FOUND");
-    if (request.url !== pathname || !PATHS.has(pathname)) return fail(response, 400, "INVALID_REQUEST");
+    const scope = PATHS.get(pathname);
+    if (request.url !== pathname || !scope) return fail(response, 400, "INVALID_REQUEST");
     if (browserRequest(request.headers)) return fail(response, 403, "SERVER_TO_SERVER_ONLY");
     const supplied = request.headers["x-creator-web-key"];
     if (!validKey(supplied) || !timingSafeEqual(digest(supplied), expected)) {
       return fail(response, 401, "UNAUTHORIZED");
     }
-    const srihiw = SRIHIW_PATHS.has(pathname);
-    const clientId = srihiw ? SRIHIW_CREATOR_POLICY_CLIENT : CLIENT_ID;
-    const capPath = pathname === CAP || pathname === SRIHIW_CAP;
-    const method = pathname === ROOT || pathname === SRIHIW_ROOT ? "GET" : "POST";
+    const { clientId, action } = scope;
+    const extra = clientId !== CLIENT_ID;
+    const capPath = action === "cap";
+    const scopeLeaseEnabled = leaseByClient.get(clientId) === true;
+    const method = action === "read" ? "GET" : "POST";
     if (request.method !== method) return fail(response, 405, "METHOD_NOT_ALLOWED", { allow: method });
     if (capPath && capWriteEnabled !== true) return fail(response, 503, "CAP_WRITE_DISABLED");
-    if (method === "POST" && !capPath && (srihiw ? srihiwLeaseEnabled : leaseEnabled) !== true) {
+    if (method === "POST" && !capPath && !scopeLeaseEnabled) {
       return fail(response, 503, "LEASE_DISABLED");
     }
 
@@ -130,11 +137,11 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
         const state = store.getCreatorWebPolicyState({ clientId });
         const now = new Date(clock());
         const capability = capWriteEnabled === true;
-        const autoLineReady = (srihiw ? srihiwLeaseEnabled : leaseEnabled) === true && !!autoRecipient(clientId);
-        if (srihiw && state === null) return write(response, 200, { schemaVersion: 1, clientId,
+        const autoLineReady = scopeLeaseEnabled && !!autoRecipient(clientId);
+        if (extra && state === null) return write(response, 200, { schemaVersion: 1, clientId,
           configured: false, readAt: now.toISOString(), locked: false, capWriteEnabled: capability, autoLineReady: false });
         const result = payloadOf(state, now, clientId);
-        return result ? write(response, 200, { ...result, ...(srihiw ? { configured: true } : {}),
+        return result ? write(response, 200, { ...result, ...(extra ? { configured: true } : {}),
           capWriteEnabled: capability, autoLineReady }) : fail(response, 503, "POLICY_UNAVAILABLE");
       }
 
@@ -145,18 +152,18 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
       if (capPath) {
         const fields = ["revision", "capMinor", "actorUserId"];
         if (Object.keys(input).length !== fields.length || !fields.every(field => Object.hasOwn(input, field)
-          && (validPositive(input[field]) || (srihiw && field === "revision" && input[field] === 0)))) {
+          && (validPositive(input[field]) || (extra && field === "revision" && input[field] === 0)))) {
           return fail(response, 400, "INVALID_REQUEST");
         }
         const result = payloadOf(store.updateCreatorWebCap({ clientId,
           revision: input.revision, capMinor: input.capMinor, actorUserId: input.actorUserId, now }), now, clientId);
-        return result ? write(response, 200, { ...result, ...(srihiw ? { configured: true } : {}),
-          capWriteEnabled: true, autoLineReady: (srihiw ? srihiwLeaseEnabled : leaseEnabled) === true && !!autoRecipient(clientId) })
+        return result ? write(response, 200, { ...result, ...(extra ? { configured: true } : {}),
+          capWriteEnabled: true, autoLineReady: scopeLeaseEnabled && !!autoRecipient(clientId) })
           : fail(response, 503, "POLICY_UNAVAILABLE");
       }
       if (!Object.hasOwn(input, "operationId") || typeof input.operationId !== "string"
         || input.operationId.length !== 36 || !OPERATION_ID.test(input.operationId)) return fail(response, 400, "INVALID_REQUEST");
-      if (pathname === LEASE || pathname === SRIHIW_LEASE) {
+      if (action === "lease") {
         const isAuto = Object.hasOwn(input, "autoBudget");
         if (Object.keys(input).length !== (isAuto ? 3 : 2) || !Object.hasOwn(input, "revision") || !validPositive(input.revision)) {
           return fail(response, 400, "INVALID_REQUEST");
@@ -169,7 +176,7 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
           ...(isAuto ? { autoBudget, lineRecipientUserId } : {}) });
         const policy = payloadOf(result, now, clientId);
         if (!policy) return fail(response, 503, "POLICY_UNAVAILABLE");
-        return write(response, 200, { ...policy, ...(srihiw ? { configured: true } : {}),
+        return write(response, 200, { ...policy, ...(extra ? { configured: true } : {}),
           operationId: result.operationId, expiresAt: result.expiresAt });
       }
 

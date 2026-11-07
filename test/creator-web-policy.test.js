@@ -12,6 +12,8 @@ const KEY = "A".repeat(43);
 const NOW = new Date("2026-11-08T00:00:00.000Z");
 const ROOT = "/internal/automation/ppan/policy";
 const SRIHIW_ROOT = "/internal/automation/srihiw/policy";
+const NNSHOP_ROOT = "/internal/automation/nnshop5719/policy";
+const ASHOP_ROOT = "/internal/automation/ashopbytheta/policy";
 const CLIENT = "punpan_020";
 const OWNER = "U-fixture-ppan-owner";
 const LATER = (ms, at = NOW) => new Date(at.getTime() + ms);
@@ -31,10 +33,11 @@ function policyStore(t) {
 }
 
 async function localHttp(t, { leaseEnabled = true, srihiwLeaseEnabled = false,
+  nnshop5719LeaseEnabled = false, ashopbythetaLeaseEnabled = false,
   capWriteEnabled = false, key = KEY, store = policyStore(t), service = {} } = {}) {
   let clock = NOW;
   const server = createHttpServer({ service, store, clock: () => clock,
-    creatorWebPolicyOptions: { key, leaseEnabled, srihiwLeaseEnabled, capWriteEnabled } });
+    creatorWebPolicyOptions: { key, leaseEnabled, srihiwLeaseEnabled, nnshop5719LeaseEnabled, ashopbythetaLeaseEnabled, capWriteEnabled } });
   await new Promise((resolve, reject) => server.listen(0, "127.0.0.1", resolve).once("error", reject));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const url = `http://127.0.0.1:${server.address().port}`;
@@ -53,23 +56,27 @@ function post(body, headers = {}) {
 
 test("policy bridge is opt-in and never reuses credentials or enables leases on a truthy flag", () => {
   const env = { CREATOR_WEB_POLICY_BRIDGE_KEY: KEY, CREATOR_WEB_POLICY_LEASE_ENABLED: "true" };
-  assert.deepEqual(resolveCreatorWebPolicyOptions(env, ACTIVE), { key: KEY, leaseEnabled: true, srihiwLeaseEnabled: false, capWriteEnabled: false });
+  const newScopesDisabled = { nnshop5719LeaseEnabled: false, ashopbythetaLeaseEnabled: false };
+  assert.deepEqual(resolveCreatorWebPolicyOptions(env, ACTIVE), { key: KEY, leaseEnabled: true, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: false });
   assert.deepEqual(resolveCreatorWebPolicyOptions({ ...env, CREATOR_WEB_POLICY_CAP_WRITE_ENABLED: "true" }, ACTIVE),
-    { key: KEY, leaseEnabled: true, srihiwLeaseEnabled: false, capWriteEnabled: true });
+    { key: KEY, leaseEnabled: true, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: true });
   assert.deepEqual(resolveCreatorWebPolicyOptions({ ...env, CREATOR_WEB_POLICY_LEASE_ENABLED: "false",
     CREATOR_WEB_SRIHIW_BUDGET_LEASE_ENABLED: "true" }, ACTIVE),
-    { key: KEY, leaseEnabled: false, srihiwLeaseEnabled: true, capWriteEnabled: false });
+    { key: KEY, leaseEnabled: false, srihiwLeaseEnabled: true, ...newScopesDisabled, capWriteEnabled: false });
+  assert.deepEqual(resolveCreatorWebPolicyOptions({ CREATOR_WEB_POLICY_BRIDGE_KEY: KEY,
+    CREATOR_WEB_NNSHOP5719_BUDGET_LEASE_ENABLED: "true", CREATOR_WEB_ASHOPBYTHETA_BUDGET_LEASE_ENABLED: "True" }, ACTIVE),
+    { key: KEY, leaseEnabled: false, srihiwLeaseEnabled: false, nnshop5719LeaseEnabled: true, ashopbythetaLeaseEnabled: false, capWriteEnabled: false });
   for (const config of [undefined, {}, { controlPlaneOnly: false, creatorReadEnabled: true }, { controlPlaneOnly: true, creatorReadEnabled: false }]) {
-    assert.deepEqual(resolveCreatorWebPolicyOptions(env, config), { key: null, leaseEnabled: false, srihiwLeaseEnabled: false, capWriteEnabled: false });
+    assert.deepEqual(resolveCreatorWebPolicyOptions(env, config), { key: null, leaseEnabled: false, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: false });
   }
   for (const name of ["ADMIN_API_KEY", "CREATOR_READ_BRIDGE_KEY", "CREATOR_BUDGET_TEST_KEY", "LINE_CHANNEL_SECRET", "LINE_CHANNEL_ACCESS_TOKEN", "TIKTOK_ACCESS_TOKEN"]) {
     assert.deepEqual(resolveCreatorWebPolicyOptions({ ...env, [name]: KEY, CREATOR_WEB_POLICY_CAP_WRITE_ENABLED: "true" }, ACTIVE),
-      { key: null, leaseEnabled: false, srihiwLeaseEnabled: false, capWriteEnabled: false });
+      { key: null, leaseEnabled: false, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: false });
   }
   assert.deepEqual(resolveCreatorWebPolicyOptions({ ...env, CREATOR_WEB_POLICY_LEASE_ENABLED: true, CREATOR_WEB_POLICY_CAP_WRITE_ENABLED: true }, ACTIVE),
-    { key: KEY, leaseEnabled: false, srihiwLeaseEnabled: false, capWriteEnabled: false });
+    { key: KEY, leaseEnabled: false, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: false });
   assert.deepEqual(resolveCreatorWebPolicyOptions({ ...env, CREATOR_WEB_POLICY_BRIDGE_KEY: `${KEY}\n` }, ACTIVE),
-    { key: null, leaseEnabled: false, srihiwLeaseEnabled: false, capWriteEnabled: false });
+    { key: null, leaseEnabled: false, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: false });
 });
 
 test("the HTTP policy reader is authenticated, fixed-scope, non-browser, no-store and does not expose owner or secret", async t => {
@@ -130,6 +137,36 @@ test("automatic lease requires a scoped LINE recipient, binds the exact increase
   assert.match(delivery.messageText, /3,000.*3,600/);
   assert.deepEqual(h.store.claimCreatorWebLineNotices({ now: NOW }), []);
   assert.equal(claim(), null);
+});
+
+test("new Creator cap and lease routes are exact, independently enabled, and have no fallback cap or LINE recipient", async t => {
+  const recipient = `U${"3".repeat(32)}`;
+  const service = { creatorWebAutoLineRecipient: id => id === "nnshop5719" ? recipient : null };
+  const h = await localHttp(t, { service, capWriteEnabled: true, nnshop5719LeaseEnabled: true });
+  pair(h.store, recipient);
+  for (const [id, root] of [["nnshop5719", NNSHOP_ROOT], ["ashopbytheta", ASHOP_ROOT]]) {
+    assert.deepEqual(await h.get(root), { status: 200, body: { schemaVersion: 1, clientId: id, configured: false,
+      readAt: NOW.toISOString(), locked: false, capWriteEnabled: true, autoLineReady: false } });
+    assert.equal((await h.get(`${root}/cap`, post({ revision: 0, capMinor: 900_000, actorUserId: 42 }, { origin: "https://wrong.test" }))).status, 403);
+  }
+  const operationId = randomUUID();
+  const autoBudget = { previousBudgetMinor: 300_000, targetBudgetMinor: 360_000 };
+  assert.equal((await h.get(`${NNSHOP_ROOT}/lease`, post({ operationId, revision: 1, autoBudget }))).status, 409);
+  const nn = await h.get(`${NNSHOP_ROOT}/cap`, post({ revision: 0, capMinor: 900_000, actorUserId: 42 }));
+  const as = await h.get(`${ASHOP_ROOT}/cap`, post({ revision: 0, capMinor: 700_000, actorUserId: 42 }));
+  assert.equal(nn.body.autoLineReady, true);
+  assert.equal(as.body.autoLineReady, false);
+  assert.equal((await h.get(ROOT)).body.campaignCapMinor, 1_000_000);
+  assert.equal((await h.get(SRIHIW_ROOT)).body.configured, false);
+  assert.equal((await h.get(NNSHOP_ROOT)).body.campaignCapMinor, 900_000);
+  assert.equal((await h.get(ASHOP_ROOT)).body.campaignCapMinor, 700_000);
+  assert.equal((await h.get(`${ASHOP_ROOT}/lease`, post({ operationId, revision: 1, autoBudget }))).body.error.code, "LEASE_DISABLED");
+  assert.equal((await h.get(`${NNSHOP_ROOT}/lease`, post({ operationId, revision: 1, autoBudget }))).status, 200);
+  assert.equal((await h.get(`${ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 409);
+  assert.equal((await h.get(`${NNSHOP_ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 200);
+  assert.equal(h.store.claimCreatorWebAutoLineDelivery({ clientId: "ashopbytheta", recipientUserId: recipient, now: NOW }), null);
+  assert.match(h.store.claimCreatorWebAutoLineDelivery({ clientId: "nnshop5719", recipientUserId: recipient, now: NOW }).messageText, /nnshop5719/);
+  assert.equal((await h.get("/internal/automation/not-approved/policy")).status, 404);
 });
 
 test("cap bridge has its own opt-in and never accepts browser or foreign target input", async t => {

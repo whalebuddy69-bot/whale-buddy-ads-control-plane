@@ -13,6 +13,12 @@ export const CREATOR_POLICY_DEFAULTS = Object.freeze({
 export const CREATOR_CAP_TTL_MS = 15 * 60_000;
 export const CREATOR_AUTOMATION_WEB_URL = 'https://report.whalebuddy69.com/automation';
 export const SRIHIW_CREATOR_POLICY_CLIENT = 'srihiw';
+export const NNSHOP5719_CREATOR_POLICY_CLIENT = 'nnshop5719';
+export const ASHOPBYTHETA_CREATOR_POLICY_CLIENT = 'ashopbytheta';
+export const EXTRA_CREATOR_WEB_POLICY_CLIENTS = Object.freeze([
+  SRIHIW_CREATOR_POLICY_CLIENT, NNSHOP5719_CREATOR_POLICY_CLIENT, ASHOPBYTHETA_CREATOR_POLICY_CLIENT,
+]);
+export const CREATOR_WEB_POLICY_CLIENTS = Object.freeze([CREATOR_POLICY_DEFAULTS.clientId, ...EXTRA_CREATOR_WEB_POLICY_CLIENTS]);
 const CHANGE_NONCE = /^cc_[a-f0-9]{32}$/;
 const ALIAS = '(Ppan|punpan_020)';
 
@@ -26,7 +32,10 @@ export function assertCreatorPolicyClient(clientId) {
 // The website policy bridge is scoped independently from Ppan-only LINE
 // control, preview, and legacy test permit.
 export function assertCreatorWebPolicyClient(clientId) {
-  return clientId === SRIHIW_CREATOR_POLICY_CLIENT ? clientId : assertCreatorPolicyClient(clientId);
+  if (!CREATOR_WEB_POLICY_CLIENTS.includes(clientId)) {
+    throw new DomainError('CREATOR_POLICY_CLIENT_NOT_ALLOWED', 'Creator policy scope is not configured');
+  }
+  return clientId;
 }
 
 export function assertCreatorCapMinor(value) {

@@ -12,6 +12,8 @@ import { SqliteStore } from '../src/store.js';
 const NOW = new Date('2026-11-08T01:00:00.000Z');
 const PPAN = 'punpan_020';
 const SRIHIW = 'srihiw';
+const NNSHOP = 'nnshop5719';
+const ASHOP = 'ashopbytheta';
 const OWNER = `U${'a'.repeat(32)}`;
 const REPLACEMENT = `U${'b'.repeat(32)}`;
 const HASH = createHash('sha256').update(OWNER).digest('hex');
@@ -37,7 +39,7 @@ function reserve(store, clientId, outcome = 'APPLIED_VERIFIED') {
   return operationId;
 }
 
-function serviceWith(store, { ownerHash = null, fail = null } = {}) {
+function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash = null, fail = null } = {}) {
   const attempts = [];
   let now = NOW;
   let error = fail;
@@ -45,6 +47,7 @@ function serviceWith(store, { ownerHash = null, fail = null } = {}) {
     lineControl: { enabled: true }, campaignSelector: { expectedTikTokAccountId: CREATOR_BINDING.tiktokAccountId } }] };
   const service = new BudgetGuardService({ config, store, creatorRead: { supports: (id) => id === PPAN },
     creatorWebLineUpdatesEnabled: true, creatorWebSrihiwLineSharedOwnerSha256: ownerHash,
+    creatorWebNnshop5719LineSharedOwnerSha256: nnOwnerHash, creatorWebAshopbythetaLineSharedOwnerSha256: asOwnerHash,
     now: () => now, logger: { info() {} }, line: { async push(to, msg, key) {
       attempts.push({ to, msg, key });
       if (error) throw error;
@@ -96,6 +99,29 @@ test('Srihiw notifications require explicit exact pairing, never spill into manu
   assert.equal(mapped.service.creatorWebAutoLineRecipient(PPAN), REPLACEMENT);
   assert.deepEqual(await mapped.service.processCreatorWebLineUpdates(), []);
   assert.equal(mapped.attempts.length, 1);
+});
+
+test('new Creators require separate exact owner mappings and preserve Creator label and operation scope', async t => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  setupStore(store);
+  for (const clientId of [NNSHOP, ASHOP]) {
+    store.updateCreatorWebCap({ clientId, revision: 0, capMinor: 900_000, actorUserId: 42, now: NOW });
+    reserve(store, clientId);
+  }
+  const nn = serviceWith(store, { nnOwnerHash: HASH, asOwnerHash: createHash('sha256').update(REPLACEMENT).digest('hex') });
+  assert.equal(nn.service.creatorWebAutoLineRecipient(NNSHOP), OWNER);
+  assert.equal(nn.service.creatorWebAutoLineRecipient(ASHOP), null);
+  assert.equal(nn.service.creatorWebAutoLineRecipient(SRIHIW), null);
+  assert.equal(nn.service.creatorWebAutoLineRecipient('toString'), null);
+  assert.deepEqual((await nn.service.processCreatorWebLineUpdates()).map(result => result.clientId), [NNSHOP]);
+  assert.match(nn.attempts[0].msg.text, /nnshop5719/);
+  assert.doesNotMatch(nn.attempts[0].msg.text, /Ppan|ashopbytheta|srihiw/);
+  const as = serviceWith(store, { asOwnerHash: HASH });
+  assert.deepEqual((await as.service.processCreatorWebLineUpdates()).map(result => result.clientId), [ASHOP]);
+  assert.match(as.attempts[0].msg.text, /ashopbytheta/);
+  assert.doesNotMatch(as.attempts[0].msg.text, /Ppan|nnshop5719|srihiw/);
+  assert.notEqual(as.attempts[0].key, nn.attempts[0].key);
 });
 
 test('claim survives a crash and expires before LINE could forget deduplication; 4xx is not retried', async t => {

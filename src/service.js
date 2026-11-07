@@ -13,11 +13,12 @@ import {
 } from "./line.js";
 import { fromMinor, toMinor } from "./money.js";
 import {
+  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, CREATOR_WEB_POLICY_CLIENTS, NNSHOP5719_CREATOR_POLICY_CLIENT,
   buildCreatorCapProposalMessage, buildCreatorCapResultMessage, buildCreatorCapWebsiteOnlyMessage,
   buildCreatorPolicyStatusMessage, creatorCapChangeNonce, CREATOR_AUTOMATION_WEB_URL as AUTOMATION_WEB,
   parseCreatorPolicyPostback, parseCreatorPolicyText, SRIHIW_CREATOR_POLICY_CLIENT
 } from "./creator-policy.js";
-import { isExplicitSrihiwSharedOwner, retryableCreatorAutoLineError, validCreatorLineRecipient } from "./creator-web-auto-line.js";
+import { isExplicitCreatorSharedOwner, retryableCreatorAutoLineError, validCreatorLineRecipient } from "./creator-web-auto-line.js";
 import { evaluateCreatorBudgetPreview } from "./creator-budget-preview.js";
 import { CREATOR_BINDING } from "./creator-read.js";
 import {
@@ -338,6 +339,8 @@ export class BudgetGuardService {
     creatorBudgetTest = null,
     creatorWebLineUpdatesEnabled = false,
     creatorWebSrihiwLineSharedOwnerSha256 = null,
+    creatorWebNnshop5719LineSharedOwnerSha256 = null,
+    creatorWebAshopbythetaLineSharedOwnerSha256 = null,
     creatorLineCapWriteDisabled = false,
     creatorLineWebsiteOnly = false,
     logger = console,
@@ -352,7 +355,11 @@ export class BudgetGuardService {
     this.creatorRead = creatorRead;
     this.creatorBudgetTest = creatorBudgetTest;
     this.creatorWebLineUpdatesEnabled = creatorWebLineUpdatesEnabled;
-    this.creatorWebSrihiwLineSharedOwnerSha256 = creatorWebSrihiwLineSharedOwnerSha256;
+    this.creatorWebSharedOwnerSha256 = Object.freeze({
+      [SRIHIW_CREATOR_POLICY_CLIENT]: creatorWebSrihiwLineSharedOwnerSha256,
+      [NNSHOP5719_CREATOR_POLICY_CLIENT]: creatorWebNnshop5719LineSharedOwnerSha256,
+      [ASHOPBYTHETA_CREATOR_POLICY_CLIENT]: creatorWebAshopbythetaLineSharedOwnerSha256,
+    });
     this.creatorLineWebsiteOnly = creatorLineWebsiteOnly === true;
     this.creatorLineCapWriteDisabled = this.creatorLineWebsiteOnly || creatorLineCapWriteDisabled === true;
     this.logger = logger;
@@ -598,7 +605,7 @@ export class BudgetGuardService {
   }
 
   creatorWebAutoLineRecipient(clientId) {
-    if (![CREATOR_PREVIEW_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT].includes(clientId) ||
+    if (!CREATOR_WEB_POLICY_CLIENTS.includes(clientId) ||
       !this.creatorWebLineUpdatesHealth().enabled || this.executionEnabled !== false || typeof this.line?.push !== "function" ||
       typeof this.store.claimCreatorWebAutoLineDelivery !== "function" || typeof this.store.finishCreatorWebAutoLineDelivery !== "function") return null;
     const ppan = this.#clientById(CREATOR_PREVIEW_CLIENT);
@@ -607,8 +614,8 @@ export class BudgetGuardService {
     const owners = this.store.listLineApprovers({ clientId: CREATOR_PREVIEW_CLIENT });
     const owner = owners.length === 1 && owners[0].active === true ? owners[0].lineUserId : null;
     if (!validCreatorLineRecipient(owner)) return null;
-    if (clientId === SRIHIW_CREATOR_POLICY_CLIENT &&
-      !isExplicitSrihiwSharedOwner(owner, this.creatorWebSrihiwLineSharedOwnerSha256)) return null;
+    if (clientId !== CREATOR_PREVIEW_CLIENT &&
+      !isExplicitCreatorSharedOwner(owner, this.creatorWebSharedOwnerSha256[clientId])) return null;
     return owner;
   }
 
@@ -616,7 +623,7 @@ export class BudgetGuardService {
     const results = [];
     // Bounded work per tick. Separate claims and exact recipient checks prevent
     // a second worker or a rotated pairing from re-routing a pending notice.
-    for (const clientId of [CREATOR_PREVIEW_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT]) {
+    for (const clientId of CREATOR_WEB_POLICY_CLIENTS) {
       const recipientUserId = this.creatorWebAutoLineRecipient(clientId);
       if (!recipientUserId) continue;
       const delivery = this.store.claimCreatorWebAutoLineDelivery({ clientId, recipientUserId, now: this.now() });
