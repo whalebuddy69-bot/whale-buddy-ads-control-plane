@@ -105,6 +105,40 @@ test("HTTP lease and finish are off by default even when read is available", asy
   assert.equal((await disabled.get()).status, 404);
 });
 
+test("private exact Auto result and Srihiw owner binding return no LINE recipient identifier", async t => {
+  const recipient = `U${"2".repeat(32)}`;
+  const digest = createHash("sha256").update(recipient).digest("hex");
+  const service = { creatorWebAutoLineRecipient: id => id === CLIENT || id === "srihiw" ? recipient : null,
+    creatorWebPpanOwnerDigest: () => digest };
+  const h = await localHttp(t, { service, capWriteEnabled: true, srihiwLeaseEnabled: true });
+  pair(h.store, recipient);
+  const operationId = randomUUID(), unrelatedId = randomUUID();
+  const path = `${ROOT}/line-result/${operationId}`;
+  const expected = status => ({ status: 200, body: { schemaVersion: 1, clientId: CLIENT, operationId, status } });
+  assert.equal((await h.get(path, { headers: { "x-creator-web-key": "B".repeat(43) } })).status, 401);
+  assert.equal((await h.get(path, { headers: { origin: "https://report.whalebuddy69.com" } })).status, 403);
+  assert.equal((await h.get(`${path}?clientId=srihiw`)).status, 400);
+  assert.equal((await h.get(path, post({}))).status, 405);
+  assert.equal((await h.get(`${SRIHIW_ROOT}/line-result/${operationId}`)).status, 404);
+  assert.deepEqual(await h.get(path), expected("UNKNOWN"));
+  const autoBudget = { previousBudgetMinor: 300_000, targetBudgetMinor: 360_000 };
+  assert.equal((await h.get(`${ROOT}/lease`, post({ operationId, revision: 1, autoBudget }))).status, 200);
+  assert.equal((await h.get(`${ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 200);
+  assert.deepEqual(await h.get(path), expected("PENDING"));
+  const claim = h.store.claimCreatorWebAutoLineDelivery({ clientId: CLIENT, recipientUserId: recipient, now: NOW });
+  h.store.finishCreatorWebAutoLineDelivery({ operationId, claimToken: claim.claimToken, result: "ACCEPTED", now: NOW });
+  assert.deepEqual(await h.get(path), expected("ACCEPTED"));
+  assert.equal((await h.get(`${SRIHIW_ROOT}/cap`, post({ revision: 0, capMinor: 900_000, actorUserId: 12 }))).status, 200);
+  assert.equal((await h.get(`${SRIHIW_ROOT}/lease`, post({ operationId: unrelatedId, revision: 1, autoBudget }))).status, 200);
+  assert.equal((await h.get(`${SRIHIW_ROOT}/finish`, post({ operationId: unrelatedId, outcome: "APPLIED_VERIFIED" }))).status, 200);
+  assert.equal((await h.get(`${ROOT}/line-result/${unrelatedId}`)).body.status, "UNKNOWN");
+  const bindingPath = `${SRIHIW_ROOT}/line-owner-binding`;
+  assert.equal((await h.get(bindingPath, { headers: { "x-creator-web-key": "B".repeat(43) } })).status, 401);
+  assert.equal((await h.get(bindingPath, post({}))).status, 405);
+  assert.deepEqual(await h.get(bindingPath), { status: 200, body: { schemaVersion: 1, clientId: "srihiw", ownerSha256: digest } });
+  assert.equal(JSON.stringify(await h.get(bindingPath)).includes(recipient), false);
+});
+
 test("automatic lease requires a scoped LINE recipient, binds the exact increase, and emits no notice before readback", async t => {
   const recipient = `U${"2".repeat(32)}`;
   const service = { creatorWebAutoLineRecipient: id => id === CLIENT ? recipient : null };

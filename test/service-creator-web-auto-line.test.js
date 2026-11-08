@@ -56,6 +56,17 @@ function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash 
   return { service, attempts, advance: (ms) => { now = at(ms); }, setError: (value) => { error = value; } };
 }
 
+test('only the sole current Ppan pairing is exposed as a digest for explicit Srihiw setup', t => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  store.ensureCreatorPolicy({ now: NOW });
+  const { service } = serviceWith(store);
+  assert.equal(service.creatorWebPpanOwnerDigest(), null);
+  pair(store, OWNER);
+  assert.equal(service.creatorWebPpanOwnerDigest(), HASH);
+  assert.equal(service.creatorWebAutoLineRecipient(SRIHIW), null);
+});
+
 test('LINE retry freezes text, recipient, and retry UUID across timeout, restart, and acceptance', async t => {
   const dir = mkdtempSync(join(tmpdir(), 'auto-line-test-'));
   const dbPath = join(dir, 'test.sqlite');

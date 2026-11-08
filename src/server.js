@@ -213,7 +213,8 @@ export function createHttpServer({
   };
   const shopCallback = createShopCallbackHandler();
   const creatorWebPolicy = createCreatorWebPolicyHandler({ ...creatorWebPolicyOptions, store, clock,
-    resolveAutoLineRecipient: (clientId) => service.creatorWebAutoLineRecipient?.(clientId) ?? null });
+    resolveAutoLineRecipient: (clientId) => service.creatorWebAutoLineRecipient?.(clientId) ?? null,
+    resolvePpanOwnerDigest: () => service.creatorWebPpanOwnerDigest?.() ?? null });
   return http.createServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
     if (url.pathname === SHOP_CALLBACK_PATH) {
@@ -741,8 +742,11 @@ export async function startFromEnvironment() {
     if (creatorReadBusy) return;
     creatorReadBusy = true;
     try {
-      const result = await service.refreshCreatorRead();
-      if (!result.ok) console.warn(JSON.stringify({ event: "creator_read_unavailable", code: result.code }));
+      // Watch is independent of TikTok snapshot success and can report a Railway outage.
+      const [snapshot, watch] = await Promise.allSettled([service.refreshCreatorRead(), service.processPpanAutoWatch()]);
+      if (watch.status === "rejected") console.warn(JSON.stringify({ event: "creator_ppan_auto_watch", status: "WORKER_UNAVAILABLE" }));
+      if (snapshot.status === "rejected") throw new Error("CREATOR_READ_UNAVAILABLE");
+      if (!snapshot.value.ok) console.warn(JSON.stringify({ event: "creator_read_unavailable", code: snapshot.value.code }));
       else await service.processCreatorBudgetPreview();
     } catch {
       console.warn(JSON.stringify({ event: "creator_budget_preview", status: "WORKER_UNAVAILABLE", mode: "dry-run" }));

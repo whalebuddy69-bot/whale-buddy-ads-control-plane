@@ -1,4 +1,5 @@
 // Read-only Ppan bridge. This module has no TikTok token or mutation endpoint.
+import { readPpanAutoWatch } from "./ppan-auto-watch.js";
 export const CREATOR_READ_URL = "https://gmv-max-report-production-3251.up.railway.app/internal/creator/punpan_020/snapshot";
 export const CREATOR_BINDING = Object.freeze({
   advertiserId: "7666005333864644624",
@@ -96,6 +97,7 @@ export class CreatorReadProvider {
     this.#clock = clock;
   }
   supports(clientId) { return clientId === CLIENT_ID; }
+  readPpanAutoWatch() { return readPpanAutoWatch({ key: this.#key, fetchImpl: this.#fetch }); }
   async refresh() {
     if (this.#inFlight) return this.#inFlight;
     this.#inFlight = Promise.resolve().then(async () => {

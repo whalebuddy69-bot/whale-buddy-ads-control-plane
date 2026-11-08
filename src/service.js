@@ -19,6 +19,7 @@ import {
   parseCreatorPolicyPostback, parseCreatorPolicyText, SRIHIW_CREATOR_POLICY_CLIENT
 } from "./creator-policy.js";
 import { isExplicitCreatorSharedOwner, retryableCreatorAutoLineError, validCreatorLineRecipient } from "./creator-web-auto-line.js";
+import { processPpanAutoWatch } from "./ppan-auto-watch.js";
 import { evaluateCreatorBudgetPreview } from "./creator-budget-preview.js";
 import { CREATOR_BINDING } from "./creator-read.js";
 import {
@@ -617,6 +618,19 @@ export class BudgetGuardService {
     if (clientId !== CREATOR_PREVIEW_CLIENT &&
       !isExplicitCreatorSharedOwner(owner, this.creatorWebSharedOwnerSha256[clientId])) return null;
     return owner;
+  }
+
+  creatorWebPpanOwnerDigest() {
+    const owner = this.creatorWebAutoLineRecipient(CREATOR_PREVIEW_CLIENT);
+    return owner === null ? null : crypto.createHash("sha256").update(owner).digest("hex");
+  }
+
+  async processPpanAutoWatch() {
+    if (!this.creatorWebLineUpdatesHealth().enabled || typeof this.creatorRead?.readPpanAutoWatch !== "function" ||
+      typeof this.store.recordPpanAutoWatchContact !== "function" || typeof this.store.getPpanAutoWatchOutage !== "function" ||
+      typeof this.store.claimPpanAutoWatchAlert !== "function" || typeof this.store.finishPpanAutoWatchAlert !== "function") return null;
+    return processPpanAutoWatch({ read: () => this.creatorRead.readPpanAutoWatch(), store: this.store, line: this.line,
+      resolveOwner: () => this.creatorWebAutoLineRecipient(CREATOR_PREVIEW_CLIENT), clock: this.now, logger: this.logger });
   }
 
   async #processCreatorWebAutoLineUpdates() {

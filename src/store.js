@@ -22,6 +22,7 @@ import {
   autoLineBackoffMs, creatorAutoLineMessage, CREATOR_AUTO_LINE_CLAIM_MS, CREATOR_AUTO_LINE_RETRY_WINDOW_MS,
   parseCreatorWebAutoBudget, validCreatorLineRecipient,
 } from './creator-web-auto-line.js';
+import { PPAN_AUTO_WATCH_RECENT_MS, PPAN_AUTO_WATCH_STALE_MS, validPpanAutoWatchAlert } from './ppan-auto-watch.js';
 
 const WEBHOOK_STATUSES = new Set(['RECEIVED', 'PROCESSING', 'PROCESSED', 'FAILED']);
 const AUTO_BOOST_TERMINAL_STATUSES = new Set([
@@ -587,6 +588,31 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS creator_web_auto_line_deliveries_pending
         ON creator_web_auto_line_deliveries(client_id, recipient_user_id, next_attempt_at) WHERE state = 'PENDING';
+
+      CREATE TABLE IF NOT EXISTS creator_ppan_auto_watch_contact (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        session_id TEXT,
+        arm_state TEXT NOT NULL CHECK(arm_state IN ('ACTIVE', 'INACTIVE')),
+        checked_at TEXT NOT NULL,
+        CHECK(arm_state <> 'ACTIVE' OR session_id IS NOT NULL)
+      ) STRICT;
+
+      CREATE TABLE IF NOT EXISTS creator_ppan_auto_watch_alerts (
+        session_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('OUTCOME_UNKNOWN','HEARTBEAT_STALE','CHECKS_FAILING','WATCH_UNAVAILABLE')),
+        incident_key TEXT NOT NULL,
+        owner_hash TEXT NOT NULL,
+        retry_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN ('PENDING','ACCEPTED','UNCONFIRMED')),
+        created_at TEXT NOT NULL,
+        next_attempt_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        claim_token TEXT,
+        claim_expires_at TEXT,
+        PRIMARY KEY(session_id,kind,incident_key),
+        CHECK((claim_token IS NULL) = (claim_expires_at IS NULL)),
+        CHECK((state = 'PENDING') = (next_attempt_at IS NOT NULL))
+      ) STRICT;
 
       CREATE TABLE IF NOT EXISTS creator_web_digest_claims (
         client_id TEXT NOT NULL,
@@ -4790,6 +4816,77 @@ export class SqliteStore {
         WHERE operation_id = ?`).run(claimToken, claimExpiresAt, row.operation_id);
       return { operationId: row.operation_id, clientId, recipientUserId, claimToken, claimExpiresAt,
         retryKey: row.retry_key, messageText: row.message_text };
+    });
+  }
+
+  getPpanCreatorAutoLineResult({ operationId } = {}) {
+    if (!validCreatorWebOperationId(operationId)) throw new DomainError('INVALID_REQUEST', 'Invalid Ppan operation');
+    const row = this.db.prepare('SELECT state FROM creator_web_auto_line_deliveries WHERE operation_id = ? AND client_id = ?')
+      .get(operationId, CREATOR_POLICY_DEFAULTS.clientId);
+    if (row?.state === 'ACCEPTED' || row?.state === 'PENDING') return row.state;
+    if (row?.state === 'UNCONFIRMED' || row?.state === 'EXPIRED') return 'UNCONFIRMED';
+    return 'UNKNOWN';
+  }
+
+  recordPpanAutoWatchContact({ armState, sessionId, now } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    if (!['ACTIVE','INACTIVE'].includes(armState) || (sessionId !== null && !validCreatorWebOperationId(sessionId)) ||
+      (armState === 'ACTIVE' && sessionId === null)) throw new DomainError('INVALID_REQUEST', 'Invalid Ppan watchdog status');
+    this.db.prepare(`INSERT INTO creator_ppan_auto_watch_contact (id,session_id,arm_state,checked_at)
+      VALUES (1,?,?,?) ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id,arm_state=excluded.arm_state,checked_at=excluded.checked_at
+      WHERE creator_ppan_auto_watch_contact.checked_at<excluded.checked_at`).run(sessionId, armState, at);
+  }
+
+  getPpanAutoWatchOutage({ now } = {}) {
+    const at = requiredIsoTime(now, 'now');
+    const row = this.db.prepare(`SELECT session_id,checked_at FROM creator_ppan_auto_watch_contact WHERE id=1 AND arm_state='ACTIVE'`).get();
+    if (!row) return null;
+    const checked = Date.parse(row.checked_at), age = Date.parse(at) - checked;
+    const alert = { kind: 'WATCH_UNAVAILABLE', sessionId: row.session_id, incidentKey: String(checked) };
+    return age >= PPAN_AUTO_WATCH_STALE_MS && age <= PPAN_AUTO_WATCH_RECENT_MS && validPpanAutoWatchAlert(alert) ? alert : null;
+  }
+
+  claimPpanAutoWatchAlert({ alert, ownerHash, now } = {}) {
+    if (!validPpanAutoWatchAlert(alert)) throw new DomainError('INVALID_REQUEST', 'Invalid Ppan watchdog alert');
+    const hash = sha256Hash(ownerHash, 'ownerHash'), at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const keys = [alert.sessionId, alert.kind, alert.incidentKey];
+      this.db.prepare(`INSERT OR IGNORE INTO creator_ppan_auto_watch_alerts
+        (session_id,kind,incident_key,owner_hash,retry_key,state,created_at,next_attempt_at) VALUES (?,?,?,?,?,'PENDING',?,?)`)
+        .run(...keys, hash, randomUUID(), at, at);
+      const row = this.db.prepare(`SELECT * FROM creator_ppan_auto_watch_alerts WHERE session_id=? AND kind=? AND incident_key=?`).get(...keys);
+      if (!row || row.owner_hash !== hash || row.state !== 'PENDING') return null;
+      if (Date.parse(at) >= Date.parse(row.created_at) + CREATOR_AUTO_LINE_RETRY_WINDOW_MS) {
+        this.db.prepare(`UPDATE creator_ppan_auto_watch_alerts SET state='UNCONFIRMED',next_attempt_at=NULL,claim_token=NULL,claim_expires_at=NULL
+          WHERE session_id=? AND kind=? AND incident_key=?`).run(...keys);
+        return null;
+      }
+      if (row.next_attempt_at > at || (row.claim_expires_at && row.claim_expires_at > at)) return null;
+      const claimToken = randomUUID(), expiresAt = new Date(Date.parse(at) + CREATOR_AUTO_LINE_CLAIM_MS).toISOString();
+      this.db.prepare(`UPDATE creator_ppan_auto_watch_alerts SET claim_token=?,claim_expires_at=?,attempts=attempts+1
+        WHERE session_id=? AND kind=? AND incident_key=?`).run(claimToken, expiresAt, ...keys);
+      return { claimToken, expiresAt, retryKey: row.retry_key };
+    });
+  }
+
+  finishPpanAutoWatchAlert({ alert, claimToken, outcome, now } = {}) {
+    if (!validPpanAutoWatchAlert(alert) || !validCreatorWebOperationId(claimToken) || !['ACCEPTED','RETRYABLE','UNCONFIRMED'].includes(outcome)) {
+      throw new DomainError('INVALID_REQUEST', 'Invalid Ppan watchdog completion');
+    }
+    const at = requiredIsoTime(now, 'now'), keys = [alert.sessionId, alert.kind, alert.incidentKey];
+    return this.#transaction(() => {
+      const row = this.db.prepare(`SELECT created_at,attempts FROM creator_ppan_auto_watch_alerts
+        WHERE session_id=? AND kind=? AND incident_key=? AND claim_token=? AND state='PENDING'`).get(...keys, claimToken);
+      if (!row || at < row.created_at) return null;
+      const retryAt = Date.parse(at) + autoLineBackoffMs(row.attempts);
+      const state = outcome === 'RETRYABLE' && retryAt < Date.parse(row.created_at) + CREATOR_AUTO_LINE_RETRY_WINDOW_MS
+        ? 'PENDING' : outcome === 'ACCEPTED' ? 'ACCEPTED' : 'UNCONFIRMED';
+      this.db.prepare(`UPDATE creator_ppan_auto_watch_alerts SET state=?,next_attempt_at=?,claim_token=NULL,claim_expires_at=NULL
+        WHERE session_id=? AND kind=? AND incident_key=? AND claim_token=?`).run(state,
+        state === 'PENDING' ? new Date(retryAt).toISOString() : null, ...keys, claimToken);
+      this.#insertAudit({ eventType: 'CREATOR_PPAN_AUTO_WATCH_LINE', actorType: 'SYSTEM', occurredAt: at,
+        details: { kind: alert.kind, status: state, attempts: row.attempts } });
+      return state;
     });
   }
 
