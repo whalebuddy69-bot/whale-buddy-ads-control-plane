@@ -168,7 +168,7 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
         if (Object.keys(input).length !== (isAuto ? 3 : 2) || !Object.hasOwn(input, "revision") || !validPositive(input.revision)) {
           return fail(response, 400, "INVALID_REQUEST");
         }
-        const autoBudget = isAuto ? parseCreatorWebAutoBudget(input.autoBudget) : undefined;
+        const autoBudget = isAuto ? parseCreatorWebAutoBudget(input.autoBudget, clientId) : undefined;
         if (isAuto && !autoBudget) return fail(response, 400, "INVALID_REQUEST");
         const lineRecipientUserId = isAuto ? autoRecipient(clientId) : undefined;
         if (isAuto && !lineRecipientUserId) return fail(response, 409, "CREATOR_WEB_AUTO_LINE_NOT_READY");

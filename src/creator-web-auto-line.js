@@ -9,13 +9,19 @@ export const CREATOR_AUTO_LINE_CLAIM_MS = 45_000;
 export const validCreatorLineRecipient = (value) => typeof value === 'string' && /^U[a-f0-9]{32}$/.test(value);
 
 const budgetInteger = (value) => Number.isSafeInteger(value) && value > 0;
-export function parseCreatorWebAutoBudget(value) {
-  if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length !== 2 ||
+export function parseCreatorWebAutoBudget(value, clientId) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
       !Object.hasOwn(value, 'previousBudgetMinor') || !Object.hasOwn(value, 'targetBudgetMinor') ||
-      !budgetInteger(value.previousBudgetMinor) || !budgetInteger(value.targetBudgetMinor)) return null;
+      !budgetInteger(value.previousBudgetMinor) || !budgetInteger(value.targetBudgetMinor) ||
+      value.targetBudgetMinor <= value.previousBudgetMinor) return null;
+  const floor = Object.hasOwn(value, 'rounding');
+  if (Object.keys(value).length !== (floor ? 3 : 2) || (floor &&
+      (clientId !== CREATOR_POLICY_DEFAULTS.clientId || value.rounding !== 'floor-satang'))) return null;
   const expected = BigInt(value.previousBudgetMinor) * BigInt(10_000 + CREATOR_POLICY_DEFAULTS.increaseBps);
-  if (BigInt(value.targetBudgetMinor) * 10_000n !== expected) return null;
-  return { previousBudgetMinor: value.previousBudgetMinor, targetBudgetMinor: value.targetBudgetMinor };
+  const target = BigInt(value.targetBudgetMinor);
+  if (floor ? target !== expected / 10_000n : target * 10_000n !== expected) return null;
+  return { previousBudgetMinor: value.previousBudgetMinor, targetBudgetMinor: value.targetBudgetMinor,
+    ...(floor ? { rounding: 'floor-satang' } : {}) };
 }
 
 export function isExplicitCreatorSharedOwner(lineUserId, configuredHash) {

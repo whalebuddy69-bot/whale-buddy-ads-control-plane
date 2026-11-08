@@ -169,6 +169,37 @@ test("new Creator cap and lease routes are exact, independently enabled, and hav
   assert.equal((await h.get("/internal/automation/not-approved/policy")).status, 404);
 });
 
+test("floor-satang Auto is Ppan-only, never rounds up, and freezes the rounding proof for an operation", async t => {
+  const recipient = `U${"4".repeat(32)}`;
+  const service = { creatorWebAutoLineRecipient: () => recipient };
+  const h = await localHttp(t, { service, capWriteEnabled: true, srihiwLeaseEnabled: true,
+    nnshop5719LeaseEnabled: true, ashopbythetaLeaseEnabled: true });
+  pair(h.store, recipient);
+  await h.get(`${ROOT}/cap`, post({ revision: 1, capMinor: 4_000_000, actorUserId: 42 }));
+  const fractional = { previousBudgetMinor: 1_617_408, targetBudgetMinor: 1_940_889 };
+  const floor = { ...fractional, rounding: "floor-satang" };
+  for (const root of [SRIHIW_ROOT, NNSHOP_ROOT, ASHOP_ROOT]) {
+    await h.get(`${root}/cap`, post({ revision: 0, capMinor: 4_000_000, actorUserId: 42 }));
+    assert.equal((await h.get(`${root}/lease`, post({ operationId: randomUUID(), revision: 1, autoBudget: floor }))).status, 400);
+  }
+  const operationId = randomUUID();
+  const lease = (autoBudget, id = operationId) => h.get(`${ROOT}/lease`, post({ operationId: id, revision: 2, autoBudget }));
+  for (const invalid of [fractional, { ...floor, targetBudgetMinor: floor.targetBudgetMinor + 1 },
+    { ...floor, rounding: "exact-satang" }, { ...floor, recipient: recipient },
+    { previousBudgetMinor: 4, targetBudgetMinor: 4, rounding: "floor-satang" }]) {
+    assert.equal((await lease(invalid)).status, 400);
+  }
+  assert.equal((await lease(floor)).status, 200);
+  assert.equal((await lease(floor)).status, 200);
+  assert.equal((await h.get(`${ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 200);
+  const delivery = h.store.claimCreatorWebAutoLineDelivery({ clientId: CLIENT, recipientUserId: recipient, now: NOW });
+  assert.match(delivery.messageText, /16,174\.08.*19,408\.89/);
+  const exactAlsoFloor = { previousBudgetMinor: 300_000, targetBudgetMinor: 360_000 };
+  const nextId = randomUUID();
+  assert.equal((await lease({ ...exactAlsoFloor, rounding: "floor-satang" }, nextId)).status, 200);
+  assert.equal((await lease(exactAlsoFloor, nextId)).status, 409);
+});
+
 test("cap bridge has its own opt-in and never accepts browser or foreign target input", async t => {
   const args = { revision: 1, capMinor: 550_000, actorUserId: 42 };
   const disabled = await localHttp(t);

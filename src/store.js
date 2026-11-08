@@ -40,6 +40,8 @@ const validCreatorWebOperationId = (value) => typeof value === 'string' && value
 const CREATOR_WEB_OUTCOMES = new Set(['NOT_SENT', 'PROVIDER_REJECTED', 'APPLIED_VERIFIED', 'OUTCOME_UNKNOWN']);
 const CREATOR_WEB_NOTICE_OUTCOMES = new Set(['APPLIED_VERIFIED', 'OUTCOME_UNKNOWN']);
 const CREATOR_WEB_DIGEST_SLOTS = new Set(['12:00', '21:00']);
+const CREATOR_WEB_AUTO_LINE_ROUNDING_SQL = `TEXT NOT NULL DEFAULT 'exact-satang'
+  CHECK(rounding = 'exact-satang' OR (rounding = 'floor-satang' AND client_id = '${CREATOR_POLICY_DEFAULTS.clientId}'))`;
 const CREATOR_PREVIEW_BANGKOK_DATE = new Intl.DateTimeFormat('en-CA', {
   timeZone: CREATOR_POLICY_DEFAULTS.timezone,
   year: 'numeric', month: '2-digit', day: '2-digit',
@@ -567,6 +569,7 @@ export class SqliteStore {
         recipient_user_id TEXT NOT NULL,
         previous_budget_minor INTEGER NOT NULL CHECK(previous_budget_minor > 0),
         target_budget_minor INTEGER NOT NULL CHECK(target_budget_minor > previous_budget_minor),
+        rounding ${CREATOR_WEB_AUTO_LINE_ROUNDING_SQL},
         retry_key TEXT NOT NULL UNIQUE,
         message_text TEXT NOT NULL,
         state TEXT NOT NULL CHECK(state IN ('RESERVED', 'PENDING', 'ACCEPTED', 'UNCONFIRMED', 'EXPIRED', 'NOT_APPLIED')),
@@ -644,6 +647,9 @@ export class SqliteStore {
     this.#ensureColumn('webhook_events', 'lease_token', 'TEXT');
     this.#ensureColumn('webhook_events', 'lease_expires_at', 'TEXT');
     this.#ensureColumn('webhook_events', 'last_attempt_at', 'TEXT');
+    // Existing pending or accepted deliveries are exact and retain their
+    // immutable contents and retry key. Lock discovery + addition together.
+    this.#transaction(() => this.#ensureColumn('creator_web_auto_line_deliveries', 'rounding', CREATOR_WEB_AUTO_LINE_ROUNDING_SQL));
     // The first LINE-controls build created coupon_schedules without its
     // control-request link. Adding a nullable referenced column is safe for
     // those intermediate databases, while fresh databases receive the same
@@ -4653,7 +4659,7 @@ export class SqliteStore {
     if (!validCreatorWebOperationId(operationId)) {
       throw new DomainError('INVALID_REQUEST', 'operationId must be a canonical UUID');
     }
-    const auto = autoBudget === undefined ? null : parseCreatorWebAutoBudget(autoBudget);
+    const auto = autoBudget === undefined ? null : parseCreatorWebAutoBudget(autoBudget, clientId);
     if ((autoBudget !== undefined && !auto) || (!auto && lineRecipientUserId !== undefined)) {
       throw new DomainError('INVALID_REQUEST', 'Invalid Creator automation notice proof');
     }
@@ -4684,7 +4690,7 @@ export class SqliteStore {
         }
         if (Boolean(delivery) !== Boolean(auto) || (auto && (delivery.client_id !== clientId || delivery.state !== 'RESERVED' ||
           delivery.recipient_user_id !== lineRecipientUserId || delivery.previous_budget_minor !== auto.previousBudgetMinor ||
-          delivery.target_budget_minor !== auto.targetBudgetMinor))) {
+          delivery.target_budget_minor !== auto.targetBudgetMinor || delivery.rounding !== (auto.rounding ?? 'exact-satang')))) {
           throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator automation proof cannot be overwritten');
         }
         if (at >= existing.expires_at) throw new DomainError('CREATOR_WEB_LEASE_EXPIRED', 'Creator web lease has expired');
@@ -4701,13 +4707,14 @@ export class SqliteStore {
       if (auto) {
         this.db.prepare(`
           INSERT INTO creator_web_auto_line_deliveries (operation_id, client_id, recipient_user_id, previous_budget_minor,
-            target_budget_minor, retry_key, message_text, state)
-          VALUES (?, ?, ?, ?, ?, ?, ?, 'RESERVED')
+            target_budget_minor, rounding, retry_key, message_text, state)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'RESERVED')
         `).run(operationId, clientId, lineRecipientUserId, auto.previousBudgetMinor, auto.targetBudgetMinor,
-          randomUUID(), creatorAutoLineMessage({ clientId, ...auto }));
+          auto.rounding ?? 'exact-satang', randomUUID(), creatorAutoLineMessage({ clientId, ...auto }));
       }
       this.#insertAudit({ eventType: 'CREATOR_WEB_POLICY_LEASE_ACQUIRED', actorType: 'SYSTEM', occurredAt: at,
-        details: { clientId, operationId, policyRevision: revision, expiresAt, ...(auto ? { source: 'AUTO_BUDGET' } : {}) } });
+        details: { clientId, operationId, policyRevision: revision, expiresAt, ...(auto ? { source: 'AUTO_BUDGET' } : {}),
+          ...(auto?.rounding ? { rounding: auto.rounding } : {}) } });
       return { policy, locked: true, operationId, expiresAt };
     });
   }

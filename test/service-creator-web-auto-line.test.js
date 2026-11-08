@@ -76,6 +76,23 @@ test('LINE retry freezes text, recipient, and retry UUID across timeout, restart
   assert.equal(second.listAuditEvents({ eventType: 'CREATOR_WEB_AUTO_LINE_DELIVERY' }).length, 2);
 });
 
+test('existing auto delivery SQLite rows migrate to exact-satang without changing retry identity or content', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'auto-line-rounding-test-'));
+  const dbPath = join(dir, 'test.sqlite');
+  let store = new SqliteStore(dbPath);
+  t.after(() => { store?.close(); rmSync(dir, { force: true, recursive: true }); });
+  setupStore(store);
+  const operationId = reserve(store, PPAN);
+  const select = 'SELECT retry_key, message_text, recipient_user_id, state FROM creator_web_auto_line_deliveries WHERE operation_id = ?';
+  const original = store.db.prepare(select).get(operationId);
+  store.db.exec('ALTER TABLE creator_web_auto_line_deliveries DROP COLUMN rounding');
+  store.close();
+  store = new SqliteStore(dbPath);
+  assert.deepEqual(store.db.prepare(select).get(operationId), original);
+  assert.equal(store.db.prepare('SELECT rounding FROM creator_web_auto_line_deliveries WHERE operation_id = ?').get(operationId).rounding,
+    'exact-satang');
+});
+
 test('Srihiw notifications require explicit exact pairing, never spill into manual or replacement LINE chats', async t => {
   const store = new SqliteStore();
   t.after(() => store.close());

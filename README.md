@@ -18,7 +18,7 @@ Ppan LINE Command Center, interactive campaign templates, multi-account latest r
 
 ## Creator: ผลเพิ่มงบอัตโนมัติใน LINE
 
-ช่องทาง server-to-server เดิมจะบอก `autoLineReady` แยกแต่ละบัญชี โดยไม่ส่ง LINE user ID ให้ Railway การจอง `/lease` สำหรับ Auto ต้องระบุ `autoBudget: { previousBudgetMinor, targetBudgetMinor }` เป็นหน่วยสตางค์และตรงกติกาเพิ่ม 20% กับเพดาน ณ ตอนจอง หากไม่มีผู้รับ LINE ที่ยืนยันไว้จะไม่จองสิทธิ์เขียนงบสำหรับ Auto ข้อมูลนี้ไม่เปิดโหมด Auto หรือเรียก TikTok เอง
+ช่องทาง server-to-server เดิมจะบอก `autoLineReady` แยกแต่ละบัญชี โดยไม่ส่ง LINE user ID ให้ Railway การจอง `/lease` สำหรับ Auto ต้องระบุ `autoBudget: { previousBudgetMinor, targetBudgetMinor }` เป็นหน่วยสตางค์และตรงกติกาเพิ่ม 20% กับเพดาน ณ ตอนจอง เฉพาะ Ppan สามารถระบุ `rounding: 'floor-satang'` เพิ่มใน `autoBudget` เพื่อปัดเศษลงถึงสตางค์โดยไม่เพิ่มเกิน 20% หากไม่มีผู้รับ LINE ที่ยืนยันไว้จะไม่จองสิทธิ์เขียนงบสำหรับ Auto ข้อมูลนี้ไม่เปิดโหมด Auto หรือเรียก TikTok เอง
 
 เมื่อ `/finish` ของรายการเดิมส่งผล `APPLIED_VERIFIED` เท่านั้น ระบบจึงเข้าคิวข้อความพร้อมงบก่อนและหลัง ผู้รับ เนื้อหา และ retry key ถูกผูกกับรายการเดิม การลองส่งใหม่เมื่อเครือข่ายหรือ LINE 5xx จะใช้คีย์เดิมภายใน 23 ชั่วโมง ตามแนวทาง [LINE retry](https://developers.line.biz/en/docs/messaging-api/retrying-api-request/) การตอบรับจาก LINE ไม่ใช่หลักฐานว่าผู้ใช้เปิดอ่านข้อความแล้ว
 
