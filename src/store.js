@@ -4819,13 +4819,18 @@ export class SqliteStore {
     });
   }
 
-  getPpanCreatorAutoLineResult({ operationId } = {}) {
-    if (!validCreatorWebOperationId(operationId)) throw new DomainError('INVALID_REQUEST', 'Invalid Ppan operation');
+  getCreatorAutoLineResult({ clientId, operationId } = {}) {
+    assertCreatorWebPolicyClient(clientId);
+    if (!validCreatorWebOperationId(operationId)) throw new DomainError('INVALID_REQUEST', 'Invalid Creator operation');
     const row = this.db.prepare('SELECT state FROM creator_web_auto_line_deliveries WHERE operation_id = ? AND client_id = ?')
-      .get(operationId, CREATOR_POLICY_DEFAULTS.clientId);
+      .get(operationId, clientId);
     if (row?.state === 'ACCEPTED' || row?.state === 'PENDING') return row.state;
     if (row?.state === 'UNCONFIRMED' || row?.state === 'EXPIRED') return 'UNCONFIRMED';
     return 'UNKNOWN';
+  }
+
+  getPpanCreatorAutoLineResult({ operationId } = {}) {
+    return this.getCreatorAutoLineResult({ clientId: CREATOR_POLICY_DEFAULTS.clientId, operationId });
   }
 
   recordPpanAutoWatchContact({ armState, sessionId, now } = {}) {

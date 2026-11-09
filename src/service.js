@@ -13,7 +13,8 @@ import {
 } from "./line.js";
 import { fromMinor, toMinor } from "./money.js";
 import {
-  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, CREATOR_WEB_POLICY_CLIENTS, NNSHOP5719_CREATOR_POLICY_CLIENT,
+  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, BUBPA_SHOP189_CREATOR_POLICY_CLIENT, CREATOR_WEB_POLICY_CLIENTS,
+  MYUSHOP4_CREATOR_POLICY_CLIENT, NNSHOP5719_CREATOR_POLICY_CLIENT,
   buildCreatorCapProposalMessage, buildCreatorCapResultMessage, buildCreatorCapWebsiteOnlyMessage,
   buildCreatorPolicyStatusMessage, creatorCapChangeNonce, CREATOR_AUTOMATION_WEB_URL as AUTOMATION_WEB,
   parseCreatorPolicyPostback, parseCreatorPolicyText, SRIHIW_CREATOR_POLICY_CLIENT
@@ -342,6 +343,11 @@ export class BudgetGuardService {
     creatorWebSrihiwLineSharedOwnerSha256 = null,
     creatorWebNnshop5719LineSharedOwnerSha256 = null,
     creatorWebAshopbythetaLineSharedOwnerSha256 = null,
+    creatorWebMyushop4LineSharedOwnerSha256 = null,
+    creatorWebBubpaShop189LineSharedOwnerSha256 = null,
+    creatorWebAshopbythetaLineUseSrihiwOwner = false,
+    creatorWebMyushop4LineUseSrihiwOwner = false,
+    creatorWebBubpaShop189LineUseSrihiwOwner = false,
     creatorLineCapWriteDisabled = false,
     creatorLineWebsiteOnly = false,
     logger = console,
@@ -360,6 +366,13 @@ export class BudgetGuardService {
       [SRIHIW_CREATOR_POLICY_CLIENT]: creatorWebSrihiwLineSharedOwnerSha256,
       [NNSHOP5719_CREATOR_POLICY_CLIENT]: creatorWebNnshop5719LineSharedOwnerSha256,
       [ASHOPBYTHETA_CREATOR_POLICY_CLIENT]: creatorWebAshopbythetaLineSharedOwnerSha256,
+      [MYUSHOP4_CREATOR_POLICY_CLIENT]: creatorWebMyushop4LineSharedOwnerSha256,
+      [BUBPA_SHOP189_CREATOR_POLICY_CLIENT]: creatorWebBubpaShop189LineSharedOwnerSha256,
+    });
+    this.creatorWebLineUseSrihiwOwner = Object.freeze({
+      [ASHOPBYTHETA_CREATOR_POLICY_CLIENT]: creatorWebAshopbythetaLineUseSrihiwOwner === true,
+      [MYUSHOP4_CREATOR_POLICY_CLIENT]: creatorWebMyushop4LineUseSrihiwOwner === true,
+      [BUBPA_SHOP189_CREATOR_POLICY_CLIENT]: creatorWebBubpaShop189LineUseSrihiwOwner === true,
     });
     this.creatorLineWebsiteOnly = creatorLineWebsiteOnly === true;
     this.creatorLineCapWriteDisabled = this.creatorLineWebsiteOnly || creatorLineCapWriteDisabled === true;
@@ -615,8 +628,15 @@ export class BudgetGuardService {
     const owners = this.store.listLineApprovers({ clientId: CREATOR_PREVIEW_CLIENT });
     const owner = owners.length === 1 && owners[0].active === true ? owners[0].lineUserId : null;
     if (!validCreatorLineRecipient(owner)) return null;
-    if (clientId !== CREATOR_PREVIEW_CLIENT &&
-      !isExplicitCreatorSharedOwner(owner, this.creatorWebSharedOwnerSha256[clientId])) return null;
+    if (clientId !== CREATOR_PREVIEW_CLIENT) {
+      const ownHash = this.creatorWebSharedOwnerSha256[clientId];
+      if (this.creatorWebLineUseSrihiwOwner[clientId] === true) {
+        // Per-Creator consent to the existing Srihiw binding, not a fallback.
+        // A missing/rotated Srihiw binding or conflicting own hash fails closed.
+        if (!isExplicitCreatorSharedOwner(owner, this.creatorWebSharedOwnerSha256[SRIHIW_CREATOR_POLICY_CLIENT]) ||
+          (ownHash !== null && !isExplicitCreatorSharedOwner(owner, ownHash))) return null;
+      } else if (!isExplicitCreatorSharedOwner(owner, ownHash)) return null;
+    }
     return owner;
   }
 

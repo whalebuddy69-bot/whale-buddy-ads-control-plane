@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
-  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, assertCreatorWebPolicyClient, CREATOR_AUTOMATION_WEB_URL, CREATOR_POLICY_DEFAULTS,
+  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, assertCreatorWebPolicyClient, BUBPA_SHOP189_CREATOR_POLICY_CLIENT,
+  CREATOR_AUTOMATION_WEB_URL, CREATOR_POLICY_DEFAULTS, MYUSHOP4_CREATOR_POLICY_CLIENT,
   NNSHOP5719_CREATOR_POLICY_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT,
 } from './creator-policy.js';
 import { formatMoney } from './line.js';
@@ -32,13 +33,15 @@ export function isExplicitCreatorSharedOwner(lineUserId, configuredHash) {
     createHash('sha256').update(lineUserId).digest('hex') === configuredHash;
 }
 
-// Display-only labels from TikTok identity/info for the four configured,
+// Display-only labels from TikTok identity/info for the explicitly configured,
 // verified bindings. Never turn an arbitrary client ID into a TikTok handle.
 const VERIFIED_LINE_HANDLES = Object.freeze({
   [CREATOR_POLICY_DEFAULTS.clientId]: '@punpanshop888',
   [SRIHIW_CREATOR_POLICY_CLIENT]: '@srihiw',
   [NNSHOP5719_CREATOR_POLICY_CLIENT]: '@nnshop5719',
   [ASHOPBYTHETA_CREATOR_POLICY_CLIENT]: '@ashopbytheta',
+  [MYUSHOP4_CREATOR_POLICY_CLIENT]: '@myushop4',
+  [BUBPA_SHOP189_CREATOR_POLICY_CLIENT]: '@bubpa_shop189',
 });
 
 export function creatorAutomationLineLabel(clientId) {

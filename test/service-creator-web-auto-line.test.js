@@ -14,14 +14,16 @@ const PPAN = 'punpan_020';
 const SRIHIW = 'srihiw';
 const NNSHOP = 'nnshop5719';
 const ASHOP = 'ashopbytheta';
+const MYU = 'myushop4';
+const BUBPA = 'bubpa_shop189';
 const OWNER = `U${'a'.repeat(32)}`;
 const REPLACEMENT = `U${'b'.repeat(32)}`;
 const HASH = createHash('sha256').update(OWNER).digest('hex');
 const at = (ms) => new Date(NOW.getTime() + ms);
 
 test('Automation labels use verified TikTok handles, never arbitrary input', () => {
-  assert.deepEqual([PPAN, SRIHIW, NNSHOP, ASHOP].map(creatorAutomationLineLabel),
-    ['@punpanshop888', '@srihiw', '@nnshop5719', '@ashopbytheta']);
+  assert.deepEqual([PPAN, SRIHIW, NNSHOP, ASHOP, MYU, BUBPA].map(creatorAutomationLineLabel),
+    ['@punpanshop888', '@srihiw', '@nnshop5719', '@ashopbytheta', '@myushop4', '@bubpa_shop189']);
   assert.throws(() => creatorAutomationLineLabel('a_new_unverified_creator'));
 });
 
@@ -45,7 +47,8 @@ function reserve(store, clientId, outcome = 'APPLIED_VERIFIED') {
   return operationId;
 }
 
-function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash = null, fail = null } = {}) {
+function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash = null, myuOwnerHash = null, bubpaOwnerHash = null,
+  asUseSrihiw = false, myuUseSrihiw = false, bubpaUseSrihiw = false, fail = null } = {}) {
   const attempts = [];
   let now = NOW;
   let error = fail;
@@ -54,6 +57,9 @@ function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash 
   const service = new BudgetGuardService({ config, store, creatorRead: { supports: (id) => id === PPAN },
     creatorWebLineUpdatesEnabled: true, creatorWebSrihiwLineSharedOwnerSha256: ownerHash,
     creatorWebNnshop5719LineSharedOwnerSha256: nnOwnerHash, creatorWebAshopbythetaLineSharedOwnerSha256: asOwnerHash,
+    creatorWebMyushop4LineSharedOwnerSha256: myuOwnerHash, creatorWebBubpaShop189LineSharedOwnerSha256: bubpaOwnerHash,
+    creatorWebAshopbythetaLineUseSrihiwOwner: asUseSrihiw,
+    creatorWebMyushop4LineUseSrihiwOwner: myuUseSrihiw, creatorWebBubpaShop189LineUseSrihiwOwner: bubpaUseSrihiw,
     now: () => now, logger: { info() {} }, line: { async push(to, msg, key) {
       attempts.push({ to, msg, key });
       if (error) throw error;
@@ -157,6 +163,62 @@ test('new Creators require separate exact owner mappings and preserve Creator la
   assert.match(as.attempts[0].msg.text, /ashopbytheta/);
   assert.doesNotMatch(as.attempts[0].msg.text, /Ppan|nnshop5719|srihiw/);
   assert.notEqual(as.attempts[0].key, nn.attempts[0].key);
+});
+
+test('myushop4 and bubpa need independent recipient consent and never fall back or cross-route', async t => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  setupStore(store);
+  for (const clientId of [MYU, BUBPA]) {
+    store.updateCreatorWebCap({ clientId, revision: 0, capMinor: 900_000, actorUserId: 42, now: NOW });
+    reserve(store, clientId);
+  }
+  const wrongHash = createHash('sha256').update(REPLACEMENT).digest('hex');
+  const onlyMyu = serviceWith(store, { asOwnerHash: HASH, myuOwnerHash: HASH, bubpaOwnerHash: wrongHash });
+  assert.equal(onlyMyu.service.creatorWebAutoLineRecipient(MYU), OWNER);
+  assert.equal(onlyMyu.service.creatorWebAutoLineRecipient(BUBPA), null);
+  assert.deepEqual((await onlyMyu.service.processCreatorWebLineUpdates()).map(result => result.clientId), [MYU]);
+  assert.equal(onlyMyu.attempts[0].to, OWNER);
+  assert.match(onlyMyu.attempts[0].msg.text, /^✅ @myushop4 — /);
+  const onlyBubpa = serviceWith(store, { bubpaOwnerHash: HASH });
+  assert.equal(onlyBubpa.service.creatorWebAutoLineRecipient(MYU), null);
+  assert.equal(onlyBubpa.service.creatorWebAutoLineRecipient(BUBPA), OWNER);
+  assert.deepEqual((await onlyBubpa.service.processCreatorWebLineUpdates()).map(result => result.clientId), [BUBPA]);
+  assert.match(onlyBubpa.attempts[0].msg.text, /^✅ @bubpa_shop189 — /);
+  assert.notEqual(onlyBubpa.attempts[0].key, onlyMyu.attempts[0].key);
+});
+
+test('explicit per-scope Srihiw recipient opt-in fails closed for missing, conflicting, or rotated binding', async t => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  setupStore(store);
+  const wrongHash = createHash('sha256').update(REPLACEMENT).digest('hex');
+  const recipient = (clientId, flags) => serviceWith(store, flags).service.creatorWebAutoLineRecipient(clientId);
+  assert.equal(recipient(ASHOP, { ownerHash: HASH }), null);
+  assert.equal(recipient(ASHOP, { ownerHash: HASH, asUseSrihiw: 'true' }), null);
+  assert.equal(recipient(ASHOP, { ownerHash: HASH, asUseSrihiw: true }), OWNER);
+  assert.equal(recipient(MYU, { ownerHash: HASH, asUseSrihiw: true }), null);
+  assert.equal(recipient(MYU, { myuUseSrihiw: true }), null);
+  assert.equal(recipient(MYU, { myuUseSrihiw: true, ownerHash: wrongHash, myuOwnerHash: HASH }), null);
+  assert.equal(recipient(MYU, { myuUseSrihiw: true, ownerHash: HASH, myuOwnerHash: wrongHash }), null);
+  assert.equal(recipient(BUBPA, { bubpaUseSrihiw: true, ownerHash: HASH, bubpaOwnerHash: '' }), null);
+  assert.equal(recipient(BUBPA, { bubpaUseSrihiw: true, ownerHash: HASH, bubpaOwnerHash: HASH }), OWNER);
+  assert.equal(recipient(BUBPA, { bubpaOwnerHash: HASH }), OWNER);
+  assert.equal(recipient(NNSHOP, { ownerHash: HASH, asUseSrihiw: true, myuUseSrihiw: true, bubpaUseSrihiw: true }), null);
+
+  store.updateCreatorWebCap({ clientId: MYU, revision: 0, capMinor: 900_000, actorUserId: 42, now: NOW });
+  reserve(store, MYU);
+  const optIn = serviceWith(store, { myuUseSrihiw: true, ownerHash: HASH });
+  assert.deepEqual((await optIn.service.processCreatorWebLineUpdates()).map(result => result.clientId), [MYU]);
+  assert.equal(optIn.attempts[0].to, OWNER);
+  assert.match(optIn.attempts[0].msg.text, /^✅ @myushop4 — /);
+  reserve(store, MYU);
+  store.revokeLineApprover({ clientId: PPAN, lineUserId: OWNER, revokedAt: at(1000) });
+  pair(store, REPLACEMENT, at(1000));
+  optIn.advance(1000);
+  assert.equal(optIn.service.creatorWebAutoLineRecipient(MYU), null);
+  assert.deepEqual(await optIn.service.processCreatorWebLineUpdates(), []);
+  assert.equal(optIn.attempts.length, 1);
 });
 
 test('claim survives a crash and expires before LINE could forget deduplication; 4xx is not retried', async t => {

@@ -1,7 +1,7 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
-  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, CREATOR_POLICY_DEFAULTS, EXTRA_CREATOR_WEB_POLICY_CLIENTS,
-  NNSHOP5719_CREATOR_POLICY_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT,
+  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, BUBPA_SHOP189_CREATOR_POLICY_CLIENT, CREATOR_POLICY_DEFAULTS,
+  EXTRA_CREATOR_WEB_POLICY_CLIENTS, MYUSHOP4_CREATOR_POLICY_CLIENT, NNSHOP5719_CREATOR_POLICY_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT,
 } from "./creator-policy.js";
 import { parseCreatorWebAutoBudget, validCreatorLineRecipient } from "./creator-web-auto-line.js";
 
@@ -15,7 +15,9 @@ const PATHS = new Map([["ppan", CLIENT_ID], ...EXTRA_CREATOR_WEB_POLICY_CLIENTS.
   }));
 const KEY = /^[A-Za-z0-9_-]{43,128}$/;
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const PPAN_LINE_RESULT_PREFIX = "/internal/automation/ppan/policy/line-result/";
+const LINE_RESULT_PATH = /^\/internal\/automation\/([a-z0-9_]+)\/policy\/line-result\/([^/]+)$/;
+const LINE_RESULT_SCOPES = new Map([["ppan", CLIENT_ID], [ASHOPBYTHETA_CREATOR_POLICY_CLIENT, ASHOPBYTHETA_CREATOR_POLICY_CLIENT],
+  [MYUSHOP4_CREATOR_POLICY_CLIENT, MYUSHOP4_CREATOR_POLICY_CLIENT], [BUBPA_SHOP189_CREATOR_POLICY_CLIENT, BUBPA_SHOP189_CREATOR_POLICY_CLIENT]]);
 const SRIHIW_LINE_OWNER_PATH = "/internal/automation/srihiw/policy/line-owner-binding";
 const AUTO_LINE_RESULT_STATUSES = new Set(["PENDING", "ACCEPTED", "UNCONFIRMED", "UNKNOWN"]);
 const OUTCOMES = new Set(["NOT_SENT", "PROVIDER_REJECTED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN"]);
@@ -30,9 +32,10 @@ const validKey = (value) => typeof value === "string" && value === value.trim() 
 function scopeFor(pathname) {
   if (typeof pathname !== "string") return undefined;
   if (pathname === SRIHIW_LINE_OWNER_PATH) return { clientId: SRIHIW_CREATOR_POLICY_CLIENT, action: "line-owner-binding" };
-  if (pathname.startsWith(PPAN_LINE_RESULT_PREFIX)) {
-    const operationId = pathname.slice(PPAN_LINE_RESULT_PREFIX.length);
-    if (OPERATION_ID.test(operationId)) return { clientId: CLIENT_ID, action: "line-result", operationId };
+  const result = LINE_RESULT_PATH.exec(pathname);
+  if (result && OPERATION_ID.test(result[2])) {
+    const clientId = LINE_RESULT_SCOPES.get(result[1]);
+    if (clientId) return { clientId, action: "line-result", operationId: result[2] };
   }
   return PATHS.get(pathname);
 }
@@ -49,6 +52,8 @@ export function resolveCreatorWebPolicyOptions(env, { controlPlaneOnly, creatorR
     srihiwLeaseEnabled: key !== null && env?.CREATOR_WEB_SRIHIW_BUDGET_LEASE_ENABLED === "true",
     nnshop5719LeaseEnabled: key !== null && env?.CREATOR_WEB_NNSHOP5719_BUDGET_LEASE_ENABLED === "true",
     ashopbythetaLeaseEnabled: key !== null && env?.CREATOR_WEB_ASHOPBYTHETA_BUDGET_LEASE_ENABLED === "true",
+    myushop4LeaseEnabled: key !== null && env?.CREATOR_WEB_MYUSHOP4_BUDGET_LEASE_ENABLED === "true",
+    bubpaShop189LeaseEnabled: key !== null && env?.CREATOR_WEB_BUBPA_SHOP189_BUDGET_LEASE_ENABLED === "true",
     capWriteEnabled: key !== null && env?.CREATOR_WEB_POLICY_CAP_WRITE_ENABLED === "true" };
 }
 
@@ -110,11 +115,12 @@ function payloadOf(result, now, clientId = CLIENT_ID) {
 
 /** Only the Railway peer may read, edit the cap, or hold this policy. No path calls TikTok. */
 export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false, srihiwLeaseEnabled = false,
-  nnshop5719LeaseEnabled = false, ashopbythetaLeaseEnabled = false,
+  nnshop5719LeaseEnabled = false, ashopbythetaLeaseEnabled = false, myushop4LeaseEnabled = false, bubpaShop189LeaseEnabled = false,
   capWriteEnabled = false, resolveAutoLineRecipient = () => null, resolvePpanOwnerDigest = () => null, clock = () => new Date() } = {}) {
   const expected = validKey(key) ? digest(key) : null;
   const leaseByClient = new Map([[CLIENT_ID, leaseEnabled], [SRIHIW_CREATOR_POLICY_CLIENT, srihiwLeaseEnabled],
-    [NNSHOP5719_CREATOR_POLICY_CLIENT, nnshop5719LeaseEnabled], [ASHOPBYTHETA_CREATOR_POLICY_CLIENT, ashopbythetaLeaseEnabled]]);
+    [NNSHOP5719_CREATOR_POLICY_CLIENT, nnshop5719LeaseEnabled], [ASHOPBYTHETA_CREATOR_POLICY_CLIENT, ashopbythetaLeaseEnabled],
+    [MYUSHOP4_CREATOR_POLICY_CLIENT, myushop4LeaseEnabled], [BUBPA_SHOP189_CREATOR_POLICY_CLIENT, bubpaShop189LeaseEnabled]]);
   function autoRecipient(clientId) {
     try {
       const result = resolveAutoLineRecipient(clientId);
@@ -147,7 +153,7 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
           return fail(response, 400, "INVALID_REQUEST");
         }
         if (action === "line-result") {
-          const status = store.getPpanCreatorAutoLineResult({ operationId: scope.operationId });
+          const status = store.getCreatorAutoLineResult({ clientId, operationId: scope.operationId });
           return AUTO_LINE_RESULT_STATUSES.has(status)
             ? write(response, 200, { schemaVersion: 1, clientId, operationId: scope.operationId, status })
             : fail(response, 503, "LINE_RESULT_UNAVAILABLE");
