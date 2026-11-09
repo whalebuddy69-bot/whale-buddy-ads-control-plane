@@ -18,7 +18,7 @@ import {
   buildCreatorPolicyStatusMessage, creatorCapChangeNonce, CREATOR_AUTOMATION_WEB_URL as AUTOMATION_WEB,
   parseCreatorPolicyPostback, parseCreatorPolicyText, SRIHIW_CREATOR_POLICY_CLIENT
 } from "./creator-policy.js";
-import { isExplicitCreatorSharedOwner, retryableCreatorAutoLineError, validCreatorLineRecipient } from "./creator-web-auto-line.js";
+import { creatorAutomationLineLabel, isExplicitCreatorSharedOwner, retryableCreatorAutoLineError, validCreatorLineRecipient } from "./creator-web-auto-line.js";
 import { processPpanAutoWatch } from "./ppan-auto-watch.js";
 import { evaluateCreatorBudgetPreview } from "./creator-budget-preview.js";
 import { CREATOR_BINDING } from "./creator-read.js";
@@ -670,6 +670,7 @@ export class BudgetGuardService {
     const owners = this.store.listLineApprovers({ clientId: client.id });
     if (owners.length !== 1 || owners[0].active !== true) return [];
     const ownerId = owners[0].lineUserId;
+    const creatorName = creatorAutomationLineLabel(client.id);
     const authorized = () => {
       const current = this.store.listLineApprovers({ clientId: client.id });
       return current.length === 1 && current[0].active === true && current[0].lineUserId === ownerId;
@@ -687,8 +688,8 @@ export class BudgetGuardService {
     for (const notice of this.store.claimCreatorWebLineNotices({ now: this.now(), limit: 2 })) {
       if (!["APPLIED_VERIFIED", "OUTCOME_UNKNOWN"].includes(notice.outcome)) continue;
       await push("WEB_BUDGET_RESULT", notice.operationId, notice.outcome === "APPLIED_VERIFIED"
-        ? "✅ Ppan — ปรับงบผ่านเว็บสำเร็จ และอ่านผลกลับจาก TikTok แล้ว"
-        : "⚠️ Ppan — ยังยืนยันผลการปรับงบจาก TikTok ไม่ได้ ระบบระงับรายการใหม่และจะไม่ส่งคำสั่งซ้ำ");
+        ? `✅ ${creatorName} — ปรับงบผ่านเว็บสำเร็จ และอ่านผลกลับจาก TikTok แล้ว`
+        : `⚠️ ${creatorName} — ยังยืนยันผลการปรับงบจาก TikTok ไม่ได้ ระบบระงับรายการใหม่และจะไม่ส่งคำสั่งซ้ำ`);
     }
     results.push(...await this.#processCreatorWebAutoLineUpdates());
 
@@ -704,7 +705,7 @@ export class BudgetGuardService {
     const thb = (value) => Number.isSafeInteger(value) && value >= 0 ? formatMoney(fromMinor(value, "THB"), "THB") : "ไม่มีข้อมูล";
     const body = data.noActiveCampaign ? "ไม่พบแคมเปญ Creator ที่เปิดใช้งานจากข้อมูลล่าสุด"
       : `งบ ${thb(data.dailyBudgetMinor)} · ใช้ไปประมาณ ${thb(data.costMinor)}\nROI Target: ${Number.isFinite(data.targetRoi) ? data.targetRoi : "ไม่มีข้อมูล"}`;
-    await push("WEB_BUDGET_DIGEST", `${date}/${slot}`, `📊 สรุป Automation Ppan — รอบ ${slot} น. (เวลาไทย)\n${body}`);
+    await push("WEB_BUDGET_DIGEST", `${date}/${slot}`, `📊 สรุป Automation ${creatorName} — รอบ ${slot} น. (เวลาไทย)\n${body}`);
     return results;
   }
 
@@ -739,7 +740,7 @@ export class BudgetGuardService {
       timeZone: "Asia/Bangkok", hour: "2-digit", minute: "2-digit", hourCycle: "h23"
     }).format(new Date(proposal.observedAt));
     const message = { type: "text", text: [
-      "🧪 Ppan — จำลองการเพิ่มงบ (ไม่ได้เปลี่ยนงบจริง)",
+      `🧪 ${creatorAutomationLineLabel(client.id)} — จำลองการเพิ่มงบ (ไม่ได้เปลี่ยนงบจริง)`,
       `แคมเปญ: ${proposal.campaignName || `••••${proposal.campaignId.slice(-4)}`}`,
       `ใช้ไปประมาณ ${thb(proposal.spendMinor)} (${percent}%) ถึงเกณฑ์ ${proposal.thresholdBps / 100}%`,
       `ข้อเสนอ +${proposal.increaseBps / 100}%: ${thb(proposal.currentBudgetMinor)} → ${thb(proposal.proposedBudgetMinor)}`,

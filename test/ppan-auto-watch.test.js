@@ -55,7 +55,7 @@ test("only a recently confirmed armed Ppan alerts for an API outage; repeat and 
   assert.equal(await h.tick(), null);
   h.time(3 * 60_000);
   assert.deepEqual(await h.tick(), { event: "creator_ppan_auto_watch", kind: "WATCH_UNAVAILABLE", status: "LINE_ACCEPTED" });
-  assert.match(h.deliveries[0][1].text, /Ppan.*ติดต่อระบบตรวจ Auto ไม่ได้/);
+  assert.match(h.deliveries[0][1].text, /^⚠️ @punpanshop888 — ติดต่อระบบตรวจ Auto ไม่ได้/);
   assert.equal(h.deliveries[0][0], OWNER);
   h.time(4 * 60_000);
   assert.equal(await h.tick(), null);

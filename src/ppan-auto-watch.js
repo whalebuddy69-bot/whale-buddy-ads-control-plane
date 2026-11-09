@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { CREATOR_AUTOMATION_WEB_URL } from "./creator-policy.js";
-import { retryableCreatorAutoLineError, validCreatorLineRecipient } from "./creator-web-auto-line.js";
+import { creatorAutomationLineLabel, retryableCreatorAutoLineError, validCreatorLineRecipient } from "./creator-web-auto-line.js";
 
 const CLIENT = "punpan_020";
 export const PPAN_AUTO_WATCH_URL = "https://gmv-max-report-production-3251.up.railway.app/internal/creator/punpan_020/auto-watch";
@@ -55,10 +55,10 @@ export async function readPpanAutoWatch({ key, fetchImpl = globalThis.fetch }) {
 }
 
 const ALERT_COPY = Object.freeze({
-  OUTCOME_UNKNOWN: "⚠️ Ppan — ยังยืนยันผลคำสั่ง Auto จาก TikTok ไม่ได้ ระบบระงับรายการใหม่และจะไม่ส่งซ้ำ",
-  HEARTBEAT_STALE: "⚠️ Ppan — ไม่เห็นรอบตรวจ Auto สำเร็จเกิน 3 นาที โปรดตรวจสถานะก่อนใช้ Auto ต่อ",
-  CHECKS_FAILING: "⚠️ Ppan — ระบบยังอ่านหรือยืนยันข้อมูลสำหรับ Auto ไม่ได้ต่อเนื่อง โปรดตรวจสถานะ",
-  WATCH_UNAVAILABLE: "⚠️ Ppan — ติดต่อระบบตรวจ Auto ไม่ได้เกิน 3 นาที สถานะที่ตรวจได้ครั้งล่าสุดคือเปิด Auto อยู่",
+  OUTCOME_UNKNOWN: "ยังยืนยันผลคำสั่ง Auto จาก TikTok ไม่ได้ ระบบระงับรายการใหม่และจะไม่ส่งซ้ำ",
+  HEARTBEAT_STALE: "ไม่เห็นรอบตรวจ Auto สำเร็จเกิน 3 นาที โปรดตรวจสถานะก่อนใช้ Auto ต่อ",
+  CHECKS_FAILING: "ระบบยังอ่านหรือยืนยันข้อมูลสำหรับ Auto ไม่ได้ต่อเนื่อง โปรดตรวจสถานะ",
+  WATCH_UNAVAILABLE: "ติดต่อระบบตรวจ Auto ไม่ได้เกิน 3 นาที สถานะที่ตรวจได้ครั้งล่าสุดคือเปิด Auto อยู่",
 });
 
 /** Independent Render notification only. No budget/approval or TikTok API calls. */
@@ -77,7 +77,7 @@ export async function processPpanAutoWatch({ read, store, line, resolveOwner, cl
   const claim = store.claimPpanAutoWatchAlert({ alert, ownerHash, now: clock() });
   if (!claim || resolveOwner() !== owner || Date.parse(claim.expiresAt) <= clock().getTime()) return null;
   let outcome = "ACCEPTED";
-  try { await line.push(owner, { type: "text", text: `${ALERT_COPY[alert.kind]}\nดูรายละเอียด: ${CREATOR_AUTOMATION_WEB_URL}` }, claim.retryKey); }
+  try { await line.push(owner, { type: "text", text: `⚠️ ${creatorAutomationLineLabel(CLIENT)} — ${ALERT_COPY[alert.kind]}\nดูรายละเอียด: ${CREATOR_AUTOMATION_WEB_URL}` }, claim.retryKey); }
   catch (error) { outcome = retryableCreatorAutoLineError(error) ? "RETRYABLE" : "UNCONFIRMED"; }
   const result = store.finishPpanAutoWatchAlert({ alert, claimToken: claim.claimToken, outcome, now: clock() });
   if (!result) return null;

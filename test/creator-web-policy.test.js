@@ -167,7 +167,7 @@ test("automatic lease requires a scoped LINE recipient, binds the exact increase
   assert.equal((await h.get(`${ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 200);
   const delivery = claim();
   assert.equal(delivery.operationId, operationId);
-  assert.match(delivery.messageText, /Ppan.*เพิ่มงบอัตโนมัติสำเร็จ/);
+  assert.match(delivery.messageText, /^✅ @punpanshop888 — เพิ่มงบอัตโนมัติสำเร็จ/);
   assert.match(delivery.messageText, /3,000.*3,600/);
   assert.deepEqual(h.store.claimCreatorWebLineNotices({ now: NOW }), []);
   assert.equal(claim(), null);

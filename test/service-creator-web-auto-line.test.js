@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import { CREATOR_BINDING } from '../src/creator-read.js';
-import { CREATOR_AUTO_LINE_RETRY_WINDOW_MS } from '../src/creator-web-auto-line.js';
+import { creatorAutomationLineLabel, CREATOR_AUTO_LINE_RETRY_WINDOW_MS } from '../src/creator-web-auto-line.js';
 import { BudgetGuardService } from '../src/service.js';
 import { SqliteStore } from '../src/store.js';
 
@@ -18,6 +18,12 @@ const OWNER = `U${'a'.repeat(32)}`;
 const REPLACEMENT = `U${'b'.repeat(32)}`;
 const HASH = createHash('sha256').update(OWNER).digest('hex');
 const at = (ms) => new Date(NOW.getTime() + ms);
+
+test('Automation labels use verified TikTok handles, never arbitrary input', () => {
+  assert.deepEqual([PPAN, SRIHIW, NNSHOP, ASHOP].map(creatorAutomationLineLabel),
+    ['@punpanshop888', '@srihiw', '@nnshop5719', '@ashopbytheta']);
+  assert.throws(() => creatorAutomationLineLabel('a_new_unverified_creator'));
+});
 
 function pair(store, owner, now = NOW) {
   const codeHash = createHash('sha256').update(owner).digest('hex');
@@ -84,6 +90,7 @@ test('LINE retry freezes text, recipient, and retry UUID across timeout, restart
   assert.equal((await restarted.service.processCreatorWebLineUpdates())[0].status, 'LINE_ACCEPTED');
   assert.equal((await restarted.service.processCreatorWebLineUpdates()).length, 0);
   assert.deepEqual(original.attempts, restarted.attempts);
+  assert.match(original.attempts[0].msg.text, /^✅ @punpanshop888 — เพิ่มงบอัตโนมัติสำเร็จ/);
   assert.equal(second.listAuditEvents({ eventType: 'CREATOR_WEB_AUTO_LINE_DELIVERY' }).length, 2);
 });
 
@@ -117,8 +124,8 @@ test('Srihiw notifications require explicit exact pairing, never spill into manu
   const mapped = serviceWith(store, { ownerHash: HASH });
   assert.equal(mapped.service.creatorWebAutoLineRecipient(SRIHIW), OWNER);
   assert.equal((await mapped.service.processCreatorWebLineUpdates())[0].clientId, SRIHIW);
-  assert.match(mapped.attempts[0].msg.text, /srihiw.*เพิ่มงบอัตโนมัติสำเร็จ/);
-  assert.doesNotMatch(mapped.attempts[0].msg.text, /Ppan/);
+  assert.match(mapped.attempts[0].msg.text, /@srihiw.*เพิ่มงบอัตโนมัติสำเร็จ/);
+  assert.doesNotMatch(mapped.attempts[0].msg.text, /Ppan|@punpanshop888/);
   reserve(store, SRIHIW);
   store.revokeLineApprover({ clientId: PPAN, lineUserId: OWNER, revokedAt: at(1000) });
   pair(store, REPLACEMENT, at(1000));

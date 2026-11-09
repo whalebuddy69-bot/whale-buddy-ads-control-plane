@@ -41,6 +41,7 @@ test("digest is owner-only, twice daily Bangkok, tagged with the dashboard link,
   assert.equal(h.state.pushes.length, 2);
   for (const { to, msg } of h.state.pushes) {
     assert.equal(to, "U-fixture-0");
+    assert.match(msg.text, /^📊 สรุป Automation @punpanshop888 — รอบ/);
     assert.match(msg.text, /1,738\.15/);
     assert.match(msg.text, /ROI Target: 12/);
     assert.match(msg.text, /https:\/\/report\.whalebuddy69\.com\/automation/);
@@ -64,6 +65,14 @@ test("unknown web outcome is never reported as success; a failed delivery is not
   assert.equal((await h.service.processCreatorWebLineUpdates())[0].status, "LINE_UNCONFIRMED");
   assert.deepEqual(await h.service.processCreatorWebLineUpdates(), []);
   assert.equal(h.state.pushes.length, 1);
-  assert.match(h.state.pushes[0].msg.text, /ยังยืนยันผล/);
+  assert.match(h.state.pushes[0].msg.text, /^⚠️ @punpanshop888 — ยังยืนยันผล/);
   assert.doesNotMatch(h.state.pushes[0].msg.text, /สำเร็จ/);
+});
+
+test("confirmed web budget result uses the verified Creator username", async () => {
+  const h = harness({ now: new Date("2025-03-15T06:00:00.000Z"),
+    notice: { operationId: "5035df00-1801-4d02-8051-01affbbefdc9", outcome: "APPLIED_VERIFIED" } });
+  assert.equal((await h.service.processCreatorWebLineUpdates())[0].status, "LINE_ACCEPTED");
+  assert.equal(h.state.pushes.length, 1);
+  assert.match(h.state.pushes[0].msg.text, /^✅ @punpanshop888 — ปรับงบผ่านเว็บสำเร็จ/);
 });

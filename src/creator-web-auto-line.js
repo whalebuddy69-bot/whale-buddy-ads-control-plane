@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import { assertCreatorWebPolicyClient, CREATOR_AUTOMATION_WEB_URL, CREATOR_POLICY_DEFAULTS } from './creator-policy.js';
+import {
+  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, assertCreatorWebPolicyClient, CREATOR_AUTOMATION_WEB_URL, CREATOR_POLICY_DEFAULTS,
+  NNSHOP5719_CREATOR_POLICY_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT,
+} from './creator-policy.js';
 import { formatMoney } from './line.js';
 import { fromMinor } from './money.js';
 
@@ -29,9 +32,22 @@ export function isExplicitCreatorSharedOwner(lineUserId, configuredHash) {
     createHash('sha256').update(lineUserId).digest('hex') === configuredHash;
 }
 
-export function creatorAutoLineMessage({ clientId, previousBudgetMinor, targetBudgetMinor }) {
+// Display-only labels from TikTok identity/info for the four configured,
+// verified bindings. Never turn an arbitrary client ID into a TikTok handle.
+const VERIFIED_LINE_HANDLES = Object.freeze({
+  [CREATOR_POLICY_DEFAULTS.clientId]: '@punpanshop888',
+  [SRIHIW_CREATOR_POLICY_CLIENT]: '@srihiw',
+  [NNSHOP5719_CREATOR_POLICY_CLIENT]: '@nnshop5719',
+  [ASHOPBYTHETA_CREATOR_POLICY_CLIENT]: '@ashopbytheta',
+});
+
+export function creatorAutomationLineLabel(clientId) {
   assertCreatorWebPolicyClient(clientId);
-  const name = clientId === CREATOR_POLICY_DEFAULTS.clientId ? 'Ppan' : clientId;
+  return VERIFIED_LINE_HANDLES[clientId] ?? clientId;
+}
+
+export function creatorAutoLineMessage({ clientId, previousBudgetMinor, targetBudgetMinor }) {
+  const name = creatorAutomationLineLabel(clientId);
   const money = (minor) => formatMoney(fromMinor(minor, 'THB'), 'THB');
   return `✅ ${name} — เพิ่มงบอัตโนมัติสำเร็จ และอ่านผลกลับจาก TikTok แล้ว\nงบ ${money(previousBudgetMinor)} → ${money(targetBudgetMinor)}\nดูรายละเอียด: ${CREATOR_AUTOMATION_WEB_URL}`;
 }

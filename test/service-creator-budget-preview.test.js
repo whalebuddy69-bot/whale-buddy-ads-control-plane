@@ -67,7 +67,7 @@ test("fresh Creator read sends one informational LINE proposal to the sole paire
   assert.equal(to, "U-owner");
   assert.match(retryKey, /^[0-9a-f-]{36}$/);
   assert.equal(message.type, "text");
-  assert.match(message.text, /ไม่ได้เปลี่ยนงบจริง/);
+  assert.match(message.text, /^🧪 @punpanshop888 — จำลองการเพิ่มงบ \(ไม่ได้เปลี่ยนงบจริง\)/);
   assert.match(message.text, /7,800.*→.*9,360/);
   assert.match(message.text, /9,360\.75.*10,000/);
   assert.match(message.text, /2025-03-15 14:06/);
