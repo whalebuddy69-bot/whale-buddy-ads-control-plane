@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { CREATOR_BINDING } from '../src/creator-read.js';
 import { creatorAutomationLineLabel, CREATOR_AUTO_LINE_RETRY_WINDOW_MS } from '../src/creator-web-auto-line.js';
+import { parseCreatorPolicyText } from '../src/creator-policy.js';
 import { BudgetGuardService } from '../src/service.js';
 import { SqliteStore } from '../src/store.js';
 
@@ -16,15 +17,17 @@ const NNSHOP = 'nnshop5719';
 const ASHOP = 'ashopbytheta';
 const MYU = 'myushop4';
 const BUBPA = 'bubpa_shop189';
+const KOOL = 'koolkool888';
 const OWNER = `U${'a'.repeat(32)}`;
 const REPLACEMENT = `U${'b'.repeat(32)}`;
 const HASH = createHash('sha256').update(OWNER).digest('hex');
 const at = (ms) => new Date(NOW.getTime() + ms);
 
 test('Automation labels use verified TikTok handles, never arbitrary input', () => {
-  assert.deepEqual([PPAN, SRIHIW, NNSHOP, ASHOP, MYU, BUBPA].map(creatorAutomationLineLabel),
-    ['@punpanshop888', '@srihiw', '@nnshop5719', '@ashopbytheta', '@myushop4', '@bubpa_shop189']);
+  assert.deepEqual([PPAN, SRIHIW, NNSHOP, ASHOP, MYU, BUBPA, KOOL].map(creatorAutomationLineLabel),
+    ['@punpanshop888', '@srihiw', '@nnshop5719', '@ashopbytheta', '@myushop4', '@bubpa_shop189', '@koolkool888']);
   assert.throws(() => creatorAutomationLineLabel('a_new_unverified_creator'));
+  assert.equal(parseCreatorPolicyText('ตั้งเพดาน koolkool888 5000'), null);
 });
 
 function pair(store, owner, now = NOW) {
@@ -48,7 +51,7 @@ function reserve(store, clientId, outcome = 'APPLIED_VERIFIED') {
 }
 
 function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash = null, myuOwnerHash = null, bubpaOwnerHash = null,
-  asUseSrihiw = false, myuUseSrihiw = false, bubpaUseSrihiw = false, fail = null } = {}) {
+  koolOwnerHash = null, asUseSrihiw = false, myuUseSrihiw = false, bubpaUseSrihiw = false, koolUseSrihiw = false, fail = null } = {}) {
   const attempts = [];
   let now = NOW;
   let error = fail;
@@ -58,6 +61,7 @@ function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash 
     creatorWebLineUpdatesEnabled: true, creatorWebSrihiwLineSharedOwnerSha256: ownerHash,
     creatorWebNnshop5719LineSharedOwnerSha256: nnOwnerHash, creatorWebAshopbythetaLineSharedOwnerSha256: asOwnerHash,
     creatorWebMyushop4LineSharedOwnerSha256: myuOwnerHash, creatorWebBubpaShop189LineSharedOwnerSha256: bubpaOwnerHash,
+    creatorWebKoolkool888LineSharedOwnerSha256: koolOwnerHash, creatorWebKoolkool888LineUseSrihiwOwner: koolUseSrihiw,
     creatorWebAshopbythetaLineUseSrihiwOwner: asUseSrihiw,
     creatorWebMyushop4LineUseSrihiwOwner: myuUseSrihiw, creatorWebBubpaShop189LineUseSrihiwOwner: bubpaUseSrihiw,
     now: () => now, logger: { info() {} }, line: { async push(to, msg, key) {
@@ -219,6 +223,31 @@ test('explicit per-scope Srihiw recipient opt-in fails closed for missing, confl
   assert.equal(optIn.service.creatorWebAutoLineRecipient(MYU), null);
   assert.deepEqual(await optIn.service.processCreatorWebLineUpdates(), []);
   assert.equal(optIn.attempts.length, 1);
+});
+
+test('koolkool888 opts into the same private recipient only by exact verified consent', async t => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  setupStore(store);
+  store.updateCreatorWebCap({ clientId: KOOL, revision: 0, capMinor: 900_000, actorUserId: 42, now: NOW });
+  const operationId = reserve(store, KOOL);
+  const wrongHash = createHash('sha256').update(REPLACEMENT).digest('hex');
+  for (const flags of [{ ownerHash: HASH, myuUseSrihiw: true }, { koolUseSrihiw: true },
+    { koolUseSrihiw: true, ownerHash: wrongHash, koolOwnerHash: HASH },
+    { koolUseSrihiw: true, ownerHash: HASH, koolOwnerHash: wrongHash },
+    { koolUseSrihiw: true, ownerHash: HASH, koolOwnerHash: '' }]) {
+    const denied = serviceWith(store, flags);
+    assert.equal(denied.service.creatorWebAutoLineRecipient(KOOL), null);
+    assert.deepEqual(await denied.service.processCreatorWebLineUpdates(), []);
+  }
+  assert.equal(serviceWith(store, { koolOwnerHash: HASH }).service.creatorWebAutoLineRecipient(KOOL), OWNER);
+  const allowed = serviceWith(store, { ownerHash: HASH, koolUseSrihiw: true });
+  assert.equal(allowed.service.creatorWebAutoLineRecipient(KOOL), OWNER);
+  assert.equal(allowed.service.creatorWebAutoLineRecipient(MYU), null);
+  assert.deepEqual((await allowed.service.processCreatorWebLineUpdates()).map(result => result.clientId), [KOOL]);
+  assert.equal(allowed.attempts[0].to, OWNER);
+  assert.match(allowed.attempts[0].msg.text, /^✅ @koolkool888 — /);
+  assert.equal(store.getCreatorAutoLineResult({ clientId: KOOL, operationId }), 'ACCEPTED');
 });
 
 test('claim survives a crash and expires before LINE could forget deduplication; 4xx is not retried', async t => {

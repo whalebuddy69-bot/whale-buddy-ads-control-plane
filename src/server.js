@@ -643,9 +643,11 @@ export async function startFromEnvironment() {
     creatorWebAshopbythetaLineSharedOwnerSha256: process.env.CREATOR_WEB_ASHOPBYTHETA_LINE_SHARED_OWNER_SHA256,
     creatorWebMyushop4LineSharedOwnerSha256: process.env.CREATOR_WEB_MYUSHOP4_LINE_SHARED_OWNER_SHA256,
     creatorWebBubpaShop189LineSharedOwnerSha256: process.env.CREATOR_WEB_BUBPA_SHOP189_LINE_SHARED_OWNER_SHA256,
+    creatorWebKoolkool888LineSharedOwnerSha256: process.env.CREATOR_WEB_KOOLKOOL888_LINE_SHARED_OWNER_SHA256,
     creatorWebAshopbythetaLineUseSrihiwOwner: process.env.CREATOR_WEB_ASHOPBYTHETA_LINE_USE_SRIHIW_OWNER === "true",
     creatorWebMyushop4LineUseSrihiwOwner: process.env.CREATOR_WEB_MYUSHOP4_LINE_USE_SRIHIW_OWNER === "true",
     creatorWebBubpaShop189LineUseSrihiwOwner: process.env.CREATOR_WEB_BUBPA_SHOP189_LINE_USE_SRIHIW_OWNER === "true",
+    creatorWebKoolkool888LineUseSrihiwOwner: process.env.CREATOR_WEB_KOOLKOOL888_LINE_USE_SRIHIW_OWNER === "true",
     creatorLineCapWriteDisabled: process.env.CREATOR_LINE_CAP_WRITE_DISABLED === "true",
     creatorLineWebsiteOnly: process.env.CREATOR_LINE_WEBSITE_ONLY === "true"
   });

@@ -14,7 +14,7 @@ import {
 import { fromMinor, toMinor } from "./money.js";
 import {
   ASHOPBYTHETA_CREATOR_POLICY_CLIENT, BUBPA_SHOP189_CREATOR_POLICY_CLIENT, CREATOR_WEB_POLICY_CLIENTS,
-  MYUSHOP4_CREATOR_POLICY_CLIENT, NNSHOP5719_CREATOR_POLICY_CLIENT,
+  KOOLKOOL888_CREATOR_POLICY_CLIENT, MYUSHOP4_CREATOR_POLICY_CLIENT, NNSHOP5719_CREATOR_POLICY_CLIENT,
   buildCreatorCapProposalMessage, buildCreatorCapResultMessage, buildCreatorCapWebsiteOnlyMessage,
   buildCreatorPolicyStatusMessage, creatorCapChangeNonce, CREATOR_AUTOMATION_WEB_URL as AUTOMATION_WEB,
   parseCreatorPolicyPostback, parseCreatorPolicyText, SRIHIW_CREATOR_POLICY_CLIENT
@@ -345,9 +345,11 @@ export class BudgetGuardService {
     creatorWebAshopbythetaLineSharedOwnerSha256 = null,
     creatorWebMyushop4LineSharedOwnerSha256 = null,
     creatorWebBubpaShop189LineSharedOwnerSha256 = null,
+    creatorWebKoolkool888LineSharedOwnerSha256 = null,
     creatorWebAshopbythetaLineUseSrihiwOwner = false,
     creatorWebMyushop4LineUseSrihiwOwner = false,
     creatorWebBubpaShop189LineUseSrihiwOwner = false,
+    creatorWebKoolkool888LineUseSrihiwOwner = false,
     creatorLineCapWriteDisabled = false,
     creatorLineWebsiteOnly = false,
     logger = console,
@@ -368,11 +370,13 @@ export class BudgetGuardService {
       [ASHOPBYTHETA_CREATOR_POLICY_CLIENT]: creatorWebAshopbythetaLineSharedOwnerSha256,
       [MYUSHOP4_CREATOR_POLICY_CLIENT]: creatorWebMyushop4LineSharedOwnerSha256,
       [BUBPA_SHOP189_CREATOR_POLICY_CLIENT]: creatorWebBubpaShop189LineSharedOwnerSha256,
+      [KOOLKOOL888_CREATOR_POLICY_CLIENT]: creatorWebKoolkool888LineSharedOwnerSha256,
     });
     this.creatorWebLineUseSrihiwOwner = Object.freeze({
       [ASHOPBYTHETA_CREATOR_POLICY_CLIENT]: creatorWebAshopbythetaLineUseSrihiwOwner === true,
       [MYUSHOP4_CREATOR_POLICY_CLIENT]: creatorWebMyushop4LineUseSrihiwOwner === true,
       [BUBPA_SHOP189_CREATOR_POLICY_CLIENT]: creatorWebBubpaShop189LineUseSrihiwOwner === true,
+      [KOOLKOOL888_CREATOR_POLICY_CLIENT]: creatorWebKoolkool888LineUseSrihiwOwner === true,
     });
     this.creatorLineWebsiteOnly = creatorLineWebsiteOnly === true;
     this.creatorLineCapWriteDisabled = this.creatorLineWebsiteOnly || creatorLineCapWriteDisabled === true;
