@@ -121,6 +121,38 @@ test('existing auto delivery SQLite rows migrate to exact-satang without changin
     'exact-satang');
 });
 
+test('ceil-baht SQLite migration preserves active floor and exact delivery proofs with their existing keys and claims', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'auto-line-rounding-v2-'));
+  const filename = join(dir, 'fixture.sqlite');
+  let store = new SqliteStore(filename);
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
+  setupStore(store);
+  const floorOp = randomUUID();
+  const floorProof = { previousBudgetMinor: 40_001, targetBudgetMinor: 48_001, rounding: 'floor-satang' };
+  store.acquireCreatorWebPolicyLease({ clientId: PPAN, revision: 1, operationId: floorOp, now: NOW, lineRecipientUserId: OWNER, autoBudget: floorProof });
+  const exactOp = reserve(store, SRIHIW);
+  assert.ok(store.claimCreatorWebAutoLineDelivery({ clientId: SRIHIW, recipientUserId: OWNER, now: NOW }));
+  const table = 'creator_web_auto_line_deliveries';
+  const read = () => store.db.prepare(`SELECT * FROM ${table} ORDER BY operation_id`).all();
+  const before = read();
+  const v2 = store.db.prepare('SELECT sql FROM sqlite_schema WHERE type=? AND name=?').get('table', table).sql;
+  const v1 = v2.replace(/^CREATE TABLE [^(]+/, 'CREATE TABLE outbox_v1 ')
+    .replace(/rounding TEXT NOT NULL DEFAULT 'exact-satang'[\s\S]*?(?=,\s+retry_key)/,
+      "rounding TEXT NOT NULL DEFAULT 'exact-satang'\n  CHECK(rounding = 'exact-satang' OR (rounding = 'floor-satang' AND client_id = 'punpan_020'))");
+  assert.ok(!v1.includes('ceil-baht'));
+  store.db.exec(`${v1}; INSERT INTO outbox_v1 SELECT * FROM ${table}; DROP TABLE ${table}; ALTER TABLE outbox_v1 RENAME TO ${table};`);
+  store.close();
+  store = new SqliteStore(filename);
+  assert.deepEqual(read(), before);
+  assert.equal(store.db.prepare('PRAGMA foreign_key_check').all().length, 0);
+  assert.equal(store.getCreatorWebPolicyState({ clientId: PPAN }).locked, true);
+  assert.equal(store.getCreatorAutoLineResult({ clientId: SRIHIW, operationId: exactOp }), 'PENDING');
+  assert.ok(store.acquireCreatorWebPolicyLease({ clientId: PPAN, revision: 1, operationId: floorOp, now: NOW, lineRecipientUserId: OWNER, autoBudget: floorProof }));
+  store.close();
+  store = new SqliteStore(filename);
+  assert.deepEqual(read(), before);
+});
+
 test('Srihiw notifications require explicit exact pairing, never spill into manual or replacement LINE chats', async t => {
   const store = new SqliteStore();
   t.after(() => store.close());

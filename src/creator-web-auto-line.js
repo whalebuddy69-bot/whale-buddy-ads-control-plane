@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
   ASHOPBYTHETA_CREATOR_POLICY_CLIENT, assertCreatorWebPolicyClient, BUBPA_SHOP189_CREATOR_POLICY_CLIENT,
-  CREATOR_AUTOMATION_WEB_URL, CREATOR_POLICY_DEFAULTS, KOOLKOOL888_CREATOR_POLICY_CLIENT, MYUSHOP4_CREATOR_POLICY_CLIENT,
+  CREATOR_AUTOMATION_WEB_URL, CREATOR_POLICY_DEFAULTS, CREATOR_WEB_POLICY_CLIENTS, KOOLKOOL888_CREATOR_POLICY_CLIENT, MYUSHOP4_CREATOR_POLICY_CLIENT,
   NNSHOP5719_CREATOR_POLICY_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT,
 } from './creator-policy.js';
 import { formatMoney } from './line.js';
@@ -18,14 +18,21 @@ export function parseCreatorWebAutoBudget(value, clientId) {
       !Object.hasOwn(value, 'previousBudgetMinor') || !Object.hasOwn(value, 'targetBudgetMinor') ||
       !budgetInteger(value.previousBudgetMinor) || !budgetInteger(value.targetBudgetMinor) ||
       value.targetBudgetMinor <= value.previousBudgetMinor) return null;
-  const floor = Object.hasOwn(value, 'rounding');
-  if (Object.keys(value).length !== (floor ? 3 : 2) || (floor &&
-      (clientId !== CREATOR_POLICY_DEFAULTS.clientId || value.rounding !== 'floor-satang'))) return null;
+  const hasRounding = Object.hasOwn(value, 'rounding');
+  if (Object.keys(value).length !== (hasRounding ? 3 : 2)) return null;
   const expected = BigInt(value.previousBudgetMinor) * BigInt(10_000 + CREATOR_POLICY_DEFAULTS.increaseBps);
   const target = BigInt(value.targetBudgetMinor);
-  if (floor ? target !== expected / 10_000n : target * 10_000n !== expected) return null;
+  if (!hasRounding) {
+    if (target * 10_000n !== expected) return null;
+  } else if (value.rounding === 'floor-satang') {
+    if (clientId !== CREATOR_POLICY_DEFAULTS.clientId || target !== expected / 10_000n) return null;
+  } else if (value.rounding === 'ceil-baht') {
+    // The 20% target is scaled by 10,000; one baht is 100 satang.
+    const oneBahtScaled = 100n * 10_000n;
+    if (!CREATOR_WEB_POLICY_CLIENTS.includes(clientId) || target !== (expected + oneBahtScaled - 1n) / oneBahtScaled * 100n) return null;
+  } else return null;
   return { previousBudgetMinor: value.previousBudgetMinor, targetBudgetMinor: value.targetBudgetMinor,
-    ...(floor ? { rounding: 'floor-satang' } : {}) };
+    ...(hasRounding ? { rounding: value.rounding } : {}) };
 }
 
 export function isExplicitCreatorSharedOwner(lineUserId, configuredHash) {

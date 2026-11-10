@@ -342,6 +342,37 @@ test("floor-satang Auto is Ppan-only, never rounds up, and freezes the rounding 
   assert.equal((await lease(exactAlsoFloor, nextId)).status, 409);
 });
 
+test("ceil-baht Auto rounds the exact 20% result up once, enforces the cap, and scopes proof to Auto", async t => {
+  const recipient = `U${"5".repeat(32)}`;
+  const h = await localHttp(t, { service: { creatorWebAutoLineRecipient: () => recipient }, capWriteEnabled: true,
+    srihiwLeaseEnabled: true, nnshop5719LeaseEnabled: true, ashopbythetaLeaseEnabled: true,
+    myushop4LeaseEnabled: true, bubpaShop189LeaseEnabled: true, koolkool888LeaseEnabled: true });
+  pair(h.store, recipient);
+  const proof = { previousBudgetMinor: 40_001, targetBudgetMinor: 48_100, rounding: "ceil-baht" };
+  for (const root of [ROOT, SRIHIW_ROOT, NNSHOP_ROOT, ASHOP_ROOT, MYU_ROOT, BUBPA_ROOT, KOOL_ROOT]) {
+    const revision = root === ROOT ? 1 : 0, op = randomUUID();
+    assert.equal((await h.get(`${root}/cap`, post({ revision, capMinor: 48_099, actorUserId: 42 }))).status, 200);
+    const lease = (autoBudget, currentRevision = revision + 2) => h.get(`${root}/lease`, post({ operationId: op, revision: currentRevision, autoBudget }));
+    assert.equal((await lease(proof, revision + 1)).body.error.code, "CREATOR_WEB_POLICY_CHANGED");
+    assert.equal((await h.get(`${root}/cap`, post({ revision: revision + 1, capMinor: 48_100, actorUserId: 42 }))).status, 200);
+    for (const bad of [{ ...proof, targetBudgetMinor: 48_000 }, { ...proof, targetBudgetMinor: 48_001 },
+      { ...proof, targetBudgetMinor: 48_200 }, { ...proof, rounding: "round-baht" }, { ...proof, clientId: "other" },
+      { previousBudgetMinor: 40_001, targetBudgetMinor: 48_100 }]) assert.equal((await lease(bad)).status, 400);
+    assert.equal((await h.get(`${root}/lease`, post({ operationId: op, revision: revision + 2, rounding: "ceil-baht" }))).status, 400);
+    assert.equal((await lease(proof)).status, 200);
+    assert.equal((await lease(proof)).status, 200);
+    assert.equal(h.store.db.prepare("SELECT rounding FROM creator_web_auto_line_deliveries WHERE operation_id = ?").get(op).rounding, "ceil-baht");
+    assert.throws(() => h.store.db.prepare("UPDATE creator_web_auto_line_deliveries SET target_budget_minor = ? WHERE operation_id = ?")
+      .run(48_000, op), /CHECK constraint failed/);
+    assert.equal((await h.get(`${root}/finish`, post({ operationId: op, outcome: "NOT_SENT" }))).status, 200);
+  }
+  const op = randomUUID(), exact = { previousBudgetMinor: 40_000, targetBudgetMinor: 48_000 };
+  assert.equal((await h.get(`${ROOT}/lease`, post({ operationId: op, revision: 3, autoBudget: { ...exact, rounding: "ceil-baht" } }))).status, 200);
+  for (const alternate of [exact, { ...exact, rounding: "floor-satang" }]) {
+    assert.equal((await h.get(`${ROOT}/lease`, post({ operationId: op, revision: 3, autoBudget: alternate }))).body.error.code, "CREATOR_WEB_LEASE_CONFLICT");
+  }
+});
+
 test("cap bridge has its own opt-in and never accepts browser or foreign target input", async t => {
   const args = { revision: 1, capMinor: 550_000, actorUserId: 42 };
   const disabled = await localHttp(t);

@@ -42,8 +42,44 @@ const validCreatorWebOperationId = (value) => typeof value === 'string' && value
 const CREATOR_WEB_OUTCOMES = new Set(['NOT_SENT', 'PROVIDER_REJECTED', 'APPLIED_VERIFIED', 'OUTCOME_UNKNOWN']);
 const CREATOR_WEB_NOTICE_OUTCOMES = new Set(['APPLIED_VERIFIED', 'OUTCOME_UNKNOWN']);
 const CREATOR_WEB_DIGEST_SLOTS = new Set(['12:00', '21:00']);
-const CREATOR_WEB_AUTO_LINE_ROUNDING_SQL = `TEXT NOT NULL DEFAULT 'exact-satang'
+const CREATOR_WEB_AUTO_LINE_ROUNDING_V1_SQL = `TEXT NOT NULL DEFAULT 'exact-satang'
   CHECK(rounding = 'exact-satang' OR (rounding = 'floor-satang' AND client_id = '${CREATOR_POLICY_DEFAULTS.clientId}'))`;
+const CREATOR_WEB_AUTO_LINE_ROUNDING_V2_SQL = `TEXT NOT NULL DEFAULT 'exact-satang'
+  CONSTRAINT creator_web_auto_line_rounding_v2 CHECK(rounding = 'exact-satang'
+    OR (rounding = 'floor-satang' AND client_id = '${CREATOR_POLICY_DEFAULTS.clientId}')
+    OR (rounding = 'ceil-baht' AND previous_budget_minor <= ${Number.MAX_SAFE_INTEGER}
+      AND target_budget_minor <= ${Number.MAX_SAFE_INTEGER}
+      AND target_budget_minor = ((previous_budget_minor * 6 + 499) / 500) * 100))`;
+const CREATOR_WEB_AUTO_LINE_TABLE = 'creator_web_auto_line_deliveries';
+const CREATOR_WEB_AUTO_LINE_MIGRATION_TABLE = 'creator_web_auto_line_deliveries_v2_migrate';
+const CREATOR_WEB_AUTO_LINE_PENDING_INDEX = 'creator_web_auto_line_deliveries_pending';
+const CREATOR_WEB_AUTO_LINE_COLUMNS = ['operation_id','client_id','recipient_user_id','previous_budget_minor','target_budget_minor',
+  'rounding','retry_key','message_text','state','verified_at','next_attempt_at','attempts','claim_token','claim_expires_at'];
+const CREATOR_WEB_AUTO_LINE_PENDING_SQL = `CREATE INDEX IF NOT EXISTS ${CREATOR_WEB_AUTO_LINE_PENDING_INDEX}
+  ON ${CREATOR_WEB_AUTO_LINE_TABLE}(client_id, recipient_user_id, next_attempt_at) WHERE state = 'PENDING';`;
+function creatorWebAutoLineTableSql(table) {
+  return `CREATE TABLE IF NOT EXISTS ${table} (
+    operation_id TEXT PRIMARY KEY,
+    client_id TEXT NOT NULL,
+    recipient_user_id TEXT NOT NULL,
+    previous_budget_minor INTEGER NOT NULL CHECK(previous_budget_minor > 0),
+    target_budget_minor INTEGER NOT NULL CHECK(target_budget_minor > previous_budget_minor),
+    rounding ${CREATOR_WEB_AUTO_LINE_ROUNDING_V2_SQL},
+    retry_key TEXT NOT NULL UNIQUE,
+    message_text TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('RESERVED', 'PENDING', 'ACCEPTED', 'UNCONFIRMED', 'EXPIRED', 'NOT_APPLIED')),
+    verified_at TEXT,
+    next_attempt_at TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+    claim_token TEXT,
+    claim_expires_at TEXT,
+    CHECK((claim_token IS NULL) = (claim_expires_at IS NULL)),
+    CHECK((state = 'PENDING') = (next_attempt_at IS NOT NULL)),
+    CHECK((state IN ('RESERVED', 'NOT_APPLIED')) = (verified_at IS NULL)),
+    FOREIGN KEY(operation_id) REFERENCES creator_web_policy_leases(operation_id),
+    FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
+  ) STRICT;`;
+}
 const CREATOR_PREVIEW_BANGKOK_DATE = new Intl.DateTimeFormat('en-CA', {
   timeZone: CREATOR_POLICY_DEFAULTS.timezone,
   year: 'numeric', month: '2-digit', day: '2-digit',
@@ -565,30 +601,8 @@ export class SqliteStore {
 
       -- Automation notifications bind to a real policy lease and an explicitly
       -- verified recipient before dispatch. Only a proven apply queues a push.
-      CREATE TABLE IF NOT EXISTS creator_web_auto_line_deliveries (
-        operation_id TEXT PRIMARY KEY,
-        client_id TEXT NOT NULL,
-        recipient_user_id TEXT NOT NULL,
-        previous_budget_minor INTEGER NOT NULL CHECK(previous_budget_minor > 0),
-        target_budget_minor INTEGER NOT NULL CHECK(target_budget_minor > previous_budget_minor),
-        rounding ${CREATOR_WEB_AUTO_LINE_ROUNDING_SQL},
-        retry_key TEXT NOT NULL UNIQUE,
-        message_text TEXT NOT NULL,
-        state TEXT NOT NULL CHECK(state IN ('RESERVED', 'PENDING', 'ACCEPTED', 'UNCONFIRMED', 'EXPIRED', 'NOT_APPLIED')),
-        verified_at TEXT,
-        next_attempt_at TEXT,
-        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
-        claim_token TEXT,
-        claim_expires_at TEXT,
-        CHECK((claim_token IS NULL) = (claim_expires_at IS NULL)),
-        CHECK((state = 'PENDING') = (next_attempt_at IS NOT NULL)),
-        CHECK((state IN ('RESERVED', 'NOT_APPLIED')) = (verified_at IS NULL)),
-        FOREIGN KEY(operation_id) REFERENCES creator_web_policy_leases(operation_id),
-        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
-      ) STRICT;
-
-      CREATE INDEX IF NOT EXISTS creator_web_auto_line_deliveries_pending
-        ON creator_web_auto_line_deliveries(client_id, recipient_user_id, next_attempt_at) WHERE state = 'PENDING';
+      ${creatorWebAutoLineTableSql(CREATOR_WEB_AUTO_LINE_TABLE)}
+      ${CREATOR_WEB_AUTO_LINE_PENDING_SQL}
 
       -- Check failures are independent of budget leases. Retain the incident
       -- key after completion so an old bridge retry cannot generate a new push.
@@ -699,7 +713,7 @@ export class SqliteStore {
     this.#ensureColumn('webhook_events', 'last_attempt_at', 'TEXT');
     // Existing pending or accepted deliveries are exact and retain their
     // immutable contents and retry key. Lock discovery + addition together.
-    this.#transaction(() => this.#ensureColumn('creator_web_auto_line_deliveries', 'rounding', CREATOR_WEB_AUTO_LINE_ROUNDING_SQL));
+    this.#migrateCreatorWebAutoLineRounding();
     // The first LINE-controls build created coupon_schedules without its
     // control-request link. Adding a nullable referenced column is safe for
     // those intermediate databases, while fresh databases receive the same
@@ -772,6 +786,41 @@ export class SqliteStore {
       CREATE INDEX IF NOT EXISTS audit_events_request_idx
         ON audit_events(request_id, sequence);
     `);
+  }
+
+  #migrateCreatorWebAutoLineRounding() {
+    this.#transaction(() => {
+      const getTable = this.db.prepare('SELECT sql FROM sqlite_schema WHERE type = ? AND name = ?');
+      const current = getTable.get('table', CREATOR_WEB_AUTO_LINE_TABLE)?.sql;
+      if (current?.includes(CREATOR_WEB_AUTO_LINE_ROUNDING_V2_SQL)) return;
+
+      // Pre-rounding SQLite files first acquire the original exact default.
+      this.#ensureColumn(CREATOR_WEB_AUTO_LINE_TABLE, 'rounding', CREATOR_WEB_AUTO_LINE_ROUNDING_V1_SQL);
+      const legacy = getTable.get('table', CREATOR_WEB_AUTO_LINE_TABLE)?.sql;
+      const columns = this.db.prepare(`PRAGMA table_info(${CREATOR_WEB_AUTO_LINE_TABLE})`).all().map(row => row.name);
+      const extraObjects = this.db.prepare(`SELECT name FROM sqlite_schema WHERE tbl_name = ? AND
+        (type = 'trigger' OR (type = 'index' AND sql IS NOT NULL AND name <> ?))`).all(CREATOR_WEB_AUTO_LINE_TABLE, CREATOR_WEB_AUTO_LINE_PENDING_INDEX);
+      const incomingKeys = this.db.prepare(`SELECT m.name FROM sqlite_schema m, pragma_foreign_key_list(m.name) fk
+        WHERE m.type = 'table' AND fk."table" = ? LIMIT 1`).get(CREATOR_WEB_AUTO_LINE_TABLE);
+      if (!legacy?.includes(CREATOR_WEB_AUTO_LINE_ROUNDING_V1_SQL) || columns.length !== CREATOR_WEB_AUTO_LINE_COLUMNS.length ||
+        !CREATOR_WEB_AUTO_LINE_COLUMNS.every(column => columns.includes(column)) || extraObjects.length || incomingKeys ||
+        getTable.get('table', CREATOR_WEB_AUTO_LINE_MIGRATION_TABLE)) throw new Error('Unrecognized Creator Auto LINE delivery schema');
+
+      // Keep the original rounding column authoritative even across binary
+      // rollback. Copy and verify every existing row before the atomic swap.
+      const fields = CREATOR_WEB_AUTO_LINE_COLUMNS.join(',');
+      this.db.exec(creatorWebAutoLineTableSql(CREATOR_WEB_AUTO_LINE_MIGRATION_TABLE));
+      const oldCount = this.db.prepare(`SELECT count(*) AS total FROM ${CREATOR_WEB_AUTO_LINE_TABLE}`).get().total;
+      const copied = this.db.prepare(`INSERT INTO ${CREATOR_WEB_AUTO_LINE_MIGRATION_TABLE} (${fields})
+        SELECT ${fields} FROM ${CREATOR_WEB_AUTO_LINE_TABLE}`).run();
+      const mismatch = this.db.prepare(`SELECT 1 FROM (SELECT ${fields} FROM ${CREATOR_WEB_AUTO_LINE_TABLE}
+        EXCEPT SELECT ${fields} FROM ${CREATOR_WEB_AUTO_LINE_MIGRATION_TABLE}) LIMIT 1`).get();
+      const foreignKeyViolation = this.db.prepare(`PRAGMA foreign_key_check(${CREATOR_WEB_AUTO_LINE_MIGRATION_TABLE})`).get();
+      if (copied.changes !== oldCount || mismatch || foreignKeyViolation) throw new Error('Creator Auto LINE delivery migration proof failed');
+      this.db.exec(`DROP TABLE ${CREATOR_WEB_AUTO_LINE_TABLE};
+        ALTER TABLE ${CREATOR_WEB_AUTO_LINE_MIGRATION_TABLE} RENAME TO ${CREATOR_WEB_AUTO_LINE_TABLE};
+        ${CREATOR_WEB_AUTO_LINE_PENDING_SQL}`);
+    });
   }
 
   #ensureColumn(table, column, declaration) {
