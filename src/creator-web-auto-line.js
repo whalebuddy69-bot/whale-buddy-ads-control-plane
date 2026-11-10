@@ -56,6 +56,32 @@ export function creatorAutoLineMessage({ clientId, previousBudgetMinor, targetBu
   return `✅ ${name} — เพิ่มงบอัตโนมัติสำเร็จ และอ่านผลกลับจาก TikTok แล้ว\nงบ ${money(previousBudgetMinor)} → ${money(targetBudgetMinor)}\nดูรายละเอียด: ${CREATOR_AUTOMATION_WEB_URL}`;
 }
 
+const CHECK_FAILURE_INCIDENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+export const validCreatorCheckFailureIncidentId = (value) => typeof value === 'string' && CHECK_FAILURE_INCIDENT_ID.test(value);
+
+export function parseCreatorCheckFailureAlert(input, clientId) {
+  const expected = ['incidentId', 'advertiserName', 'tiktokUsername', 'failedChecks'];
+  if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== expected.length ||
+      !expected.every(field => Object.hasOwn(input, field)) || !validCreatorCheckFailureIncidentId(input.incidentId) ||
+      typeof input.advertiserName !== 'string' || input.advertiserName.length < 1 || input.advertiserName.length > 120 ||
+      input.advertiserName.trim() !== input.advertiserName || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(input.advertiserName) ||
+      input.failedChecks !== 10 || typeof input.tiktokUsername !== 'string' ||
+      `@${input.tiktokUsername}` !== VERIFIED_LINE_HANDLES[clientId]) return null;
+  return { incidentId: input.incidentId, advertiserName: input.advertiserName, tiktokUsername: input.tiktokUsername, failedChecks: 10 };
+}
+
+export function creatorCheckFailureLineMessage({ clientId, advertiserName }) {
+  return `⚠️ Auto Budget Increase ตรวจไม่สำเร็จ 10 รอบติดกัน (ตรวจประมาณทุก 1 นาที)\nบัญชีโฆษณา: ${advertiserName}\nTikTok: ${creatorAutomationLineLabel(clientId)}\nตรวจสถานะบนเว็บ: ${CREATOR_AUTOMATION_WEB_URL}`;
+}
+
+export function creatorCheckFailureRetryKey(clientId, incidentId) {
+  const bytes = createHash('sha256').update(JSON.stringify(['creator-check-failure-v1', clientId, incidentId])).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export function autoLineBackoffMs(attemptCount) {
   return Math.min(2 ** Math.min(Math.max(attemptCount - 1, 0), 6), 60) * 60_000;
 }

@@ -4,7 +4,7 @@ import {
   EXTRA_CREATOR_WEB_POLICY_CLIENTS, KOOLKOOL888_CREATOR_POLICY_CLIENT, MYUSHOP4_CREATOR_POLICY_CLIENT,
   NNSHOP5719_CREATOR_POLICY_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT,
 } from "./creator-policy.js";
-import { parseCreatorWebAutoBudget, validCreatorLineRecipient } from "./creator-web-auto-line.js";
+import { parseCreatorCheckFailureAlert, parseCreatorWebAutoBudget, validCreatorLineRecipient } from "./creator-web-auto-line.js";
 
 const CLIENT_ID = CREATOR_POLICY_DEFAULTS.clientId;
 // No arbitrary caller-provided slug resolves to a policy. The legacy Ppan URL
@@ -12,7 +12,7 @@ const CLIENT_ID = CREATOR_POLICY_DEFAULTS.clientId;
 const PATHS = new Map([["ppan", CLIENT_ID], ...EXTRA_CREATOR_WEB_POLICY_CLIENTS.map(clientId => [clientId, clientId])]
   .flatMap(([slug, clientId]) => {
     const root = `/internal/automation/${slug}/policy`;
-    return [[root, { clientId, action: "read" }], ...["cap", "lease", "finish"].map(action => [`${root}/${action}`, { clientId, action }])];
+    return [[root, { clientId, action: "read" }], ...["cap", "lease", "finish", "check-failure-alert"].map(action => [`${root}/${action}`, { clientId, action }])];
   }));
 const KEY = /^[A-Za-z0-9_-]{43,128}$/;
 const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -22,10 +22,12 @@ const LINE_RESULT_SCOPES = new Map([["ppan", CLIENT_ID], [ASHOPBYTHETA_CREATOR_P
   [KOOLKOOL888_CREATOR_POLICY_CLIENT, KOOLKOOL888_CREATOR_POLICY_CLIENT]]);
 const SRIHIW_LINE_OWNER_PATH = "/internal/automation/srihiw/policy/line-owner-binding";
 const AUTO_LINE_RESULT_STATUSES = new Set(["PENDING", "ACCEPTED", "UNCONFIRMED", "UNKNOWN"]);
+const CHECK_FAILURE_STATES = new Set(["PENDING", "ACCEPTED", "UNCONFIRMED", "EXPIRED"]);
 const OUTCOMES = new Set(["NOT_SENT", "PROVIDER_REJECTED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN"]);
 const CONFLICTS = new Set([
   "CREATOR_WEB_POLICY_CHANGED", "CREATOR_WEB_POLICY_LOCKED", "CREATOR_WEB_LEASE_EXPIRED",
-  "CREATOR_WEB_LEASE_CONFLICT", "CREATOR_WEB_LEASE_NOT_FOUND", "CREATOR_WEB_AUTO_LINE_NOT_READY", "POLICY_CHANGED", "POLICY_LOCKED"
+  "CREATOR_WEB_LEASE_CONFLICT", "CREATOR_WEB_LEASE_NOT_FOUND", "CREATOR_WEB_AUTO_LINE_NOT_READY", "POLICY_CHANGED", "POLICY_LOCKED",
+  "CREATOR_WEB_CHECK_FAILURE_CONFLICT"
 ]);
 const MAX_BODY_BYTES = 512;
 const digest = (value) => createHash("sha256").update(value).digest();
@@ -144,11 +146,12 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
     const { clientId, action } = scope;
     const extra = clientId !== CLIENT_ID;
     const capPath = action === "cap";
+    const checkFailurePath = action === "check-failure-alert";
     const scopeLeaseEnabled = leaseByClient.get(clientId) === true;
     const method = ["read", "line-result", "line-owner-binding"].includes(action) ? "GET" : "POST";
     if (request.method !== method) return fail(response, 405, "METHOD_NOT_ALLOWED", { allow: method });
     if (capPath && capWriteEnabled !== true) return fail(response, 503, "CAP_WRITE_DISABLED");
-    if (method === "POST" && !capPath && !scopeLeaseEnabled) {
+    if (method === "POST" && !capPath && !checkFailurePath && !scopeLeaseEnabled) {
       return fail(response, 503, "LEASE_DISABLED");
     }
 
@@ -184,6 +187,16 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
       if (!parsed.payload) return fail(response, parsed.status, parsed.code, parsed.status === 413 ? { connection: "close" } : {});
       const input = parsed.payload;
       const now = new Date(clock());
+      if (checkFailurePath) {
+        const alert = parseCreatorCheckFailureAlert(input, clientId);
+        if (!alert) return fail(response, 400, "INVALID_REQUEST");
+        const recipientUserId = autoRecipient(clientId);
+        if (!recipientUserId) return fail(response, 409, "CREATOR_WEB_AUTO_LINE_NOT_READY");
+        const status = store.enqueueCreatorCheckFailureAlert({ clientId, alert, recipientUserId, now });
+        return CHECK_FAILURE_STATES.has(status)
+          ? write(response, 200, { schemaVersion: 1, clientId, incidentId: alert.incidentId, status })
+          : fail(response, 503, "CHECK_FAILURE_ALERT_UNAVAILABLE");
+      }
       if (capPath) {
         const fields = ["revision", "capMinor", "actorUserId"];
         if (Object.keys(input).length !== fields.length || !fields.every(field => Object.hasOwn(input, field)

@@ -250,6 +250,42 @@ test('koolkool888 opts into the same private recipient only by exact verified co
   assert.equal(store.getCreatorAutoLineResult({ clientId: KOOL, operationId }), 'ACCEPTED');
 });
 
+test('check-failure LINE retries use the same key and a rotated recipient never inherits the incident', async t => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  setupStore(store);
+  const incident = { incidentId: randomUUID(), advertiserName: 'Kool แอด · LIVE', tiktokUsername: KOOL, failedChecks: 10 };
+  const enqueue = (alert = incident, recipientUserId = OWNER, now = NOW) => store.enqueueCreatorCheckFailureAlert({ clientId: KOOL, alert, recipientUserId, now });
+  assert.equal(enqueue(), 'PENDING');
+  assert.equal(enqueue(), 'PENDING');
+  const noConsent = serviceWith(store, { ownerHash: HASH, myuUseSrihiw: true });
+  assert.deepEqual(await noConsent.service.processCreatorWebLineUpdates(), []);
+  const flaky = serviceWith(store, { koolOwnerHash: HASH, fail: Object.assign(new Error('mock transport'), { code: 'LINE_TRANSPORT_ERROR' }) });
+  assert.deepEqual(await flaky.service.processCreatorWebLineUpdates(), [
+    { event: 'creator_web_line_update', type: 'AUTO_CHECK_FAILURES', clientId: KOOL, status: 'LINE_RETRY_PENDING' },
+  ]);
+  assert.equal(flaky.attempts[0].to, OWNER);
+  assert.match(flaky.attempts[0].msg.text, /ตรวจไม่สำเร็จ 10 รอบติดกัน \(ตรวจประมาณทุก 1 นาที\)\nบัญชีโฆษณา: Kool แอด · LIVE\nTikTok: @koolkool888\nตรวจสถานะบนเว็บ: https:\/\/report\.whalebuddy69\.com\/automation$/);
+  assert.notEqual(flaky.attempts[0].key, incident.incidentId);
+  assert.deepEqual(await flaky.service.processCreatorWebLineUpdates(), []);
+  flaky.advance(60_000); flaky.setError(null);
+  assert.equal((await flaky.service.processCreatorWebLineUpdates())[0].status, 'LINE_ACCEPTED');
+  assert.equal(flaky.attempts[1].key, flaky.attempts[0].key);
+  assert.equal(enqueue(incident, OWNER, at(60_000)), 'ACCEPTED');
+  assert.deepEqual(await flaky.service.processCreatorWebLineUpdates(), []);
+
+  const retained = { ...incident, incidentId: randomUUID() };
+  assert.equal(enqueue(retained, OWNER, at(60_000)), 'PENDING');
+  store.revokeLineApprover({ clientId: PPAN, lineUserId: OWNER, revokedAt: at(61_000) });
+  pair(store, REPLACEMENT, at(61_000));
+  const replacementHash = createHash('sha256').update(REPLACEMENT).digest('hex');
+  const replacement = serviceWith(store, { koolOwnerHash: replacementHash });
+  replacement.advance(62_000);
+  assert.deepEqual(await replacement.service.processCreatorWebLineUpdates(), []);
+  assert.throws(() => enqueue(retained, REPLACEMENT, at(62_000)), { code: 'CREATOR_WEB_CHECK_FAILURE_CONFLICT' });
+  assert.deepEqual(replacement.attempts, []);
+});
+
 test('claim survives a crash and expires before LINE could forget deduplication; 4xx is not retried', async t => {
   const store = new SqliteStore();
   t.after(() => store.close());

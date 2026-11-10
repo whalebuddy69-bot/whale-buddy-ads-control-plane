@@ -277,6 +277,40 @@ test("koolkool888 has no default cap, requires its own lease and LINE recipient,
   assert.match(h.store.claimCreatorWebAutoLineDelivery({ clientId: "koolkool888", recipientUserId: recipient, now: NOW }).messageText, /^✅ @koolkool888 — /);
 });
 
+test("check-failure alerts accept ten exact scoped checks and idempotently enqueue without touching policy", async t => {
+  const recipient = `U${"6".repeat(32)}`;
+  const h = await localHttp(t, { leaseEnabled: false, service: {
+    creatorWebAutoLineRecipient: id => ["punpan_020", "koolkool888"].includes(id) ? recipient : null,
+  } });
+  pair(h.store, recipient);
+  const path = `${ROOT}/check-failure-alert`, koolPath = `${KOOL_ROOT}/check-failure-alert`;
+  const incident = { incidentId: randomUUID(), advertiserName: "Punpan Ads · บัญชีหลัก", tiktokUsername: "punpanshop888", failedChecks: 10 };
+  assert.equal((await h.get(path)).status, 405);
+  assert.equal((await h.get(path, post(incident, { origin: "https://report.whalebuddy69.com" }))).status, 403);
+  assert.equal((await h.get(path, post(incident, { "x-creator-web-key": "B".repeat(43) }))).status, 401);
+  for (const bad of [{ failedChecks: 9 }, { failedChecks: 11 }, { failedChecks: "10" }, { tiktokUsername: "@punpanshop888" },
+    { tiktokUsername: "koolkool888" }, { advertiserName: "x\nTikTok: @other" }, { advertiserName: "x\u202e" }, { extra: true }]) {
+    assert.equal((await h.get(path, post({ ...incident, ...bad }))).status, 400);
+  }
+  assert.equal((await h.get(`${MYU_ROOT}/check-failure-alert`, post({ ...incident, tiktokUsername: "myushop4" }))).body.error.code,
+    "CREATOR_WEB_AUTO_LINE_NOT_READY");
+  const queued = { status: 200, body: { schemaVersion: 1, clientId: CLIENT, incidentId: incident.incidentId, status: "PENDING" } };
+  assert.deepEqual(await h.get(path, post(incident)), queued);
+  assert.deepEqual(await h.get(path, post(incident)), queued);
+  assert.equal((await h.get(path, post({ ...incident, advertiserName: "Different Account" }))).body.error.code,
+    "CREATOR_WEB_CHECK_FAILURE_CONFLICT");
+  assert.equal((await h.get(koolPath, post({ ...incident, tiktokUsername: "koolkool888" }))).body.error.code,
+    "CREATOR_WEB_CHECK_FAILURE_CONFLICT");
+  assert.equal((await h.get(`/internal/automation/unknown/policy/check-failure-alert`, post(incident))).status, 404);
+  assert.deepEqual((await h.get(ROOT)).body, { schemaVersion: 1, clientId: CLIENT, revision: 1,
+    campaignCapMinor: 1_000_000, clientDailyCapMinor: 1_000_000, readAt: NOW.toISOString(), locked: false, capWriteEnabled: false, autoLineReady: false });
+  const claim = h.store.claimCreatorCheckFailureAlert({ clientId: CLIENT, recipientUserId: recipient, now: NOW });
+  assert.ok(claim);
+  assert.equal(h.store.finishCreatorCheckFailureAlert({ clientId: CLIENT, incidentId: incident.incidentId, claimToken: claim.claimToken, result: "ACCEPTED", now: NOW }), "ACCEPTED");
+  assert.deepEqual(await h.get(path, post(incident)), { ...queued, body: { ...queued.body, status: "ACCEPTED" } });
+  assert.equal(h.store.claimCreatorCheckFailureAlert({ clientId: CLIENT, recipientUserId: recipient, now: NOW }), null);
+});
+
 test("floor-satang Auto is Ppan-only, never rounds up, and freezes the rounding proof for an operation", async t => {
   const recipient = `U${"4".repeat(32)}`;
   const service = { creatorWebAutoLineRecipient: () => recipient };

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import {
   DomainError,
@@ -20,7 +20,8 @@ import {
 } from './creator-policy.js';
 import {
   autoLineBackoffMs, creatorAutoLineMessage, CREATOR_AUTO_LINE_CLAIM_MS, CREATOR_AUTO_LINE_RETRY_WINDOW_MS,
-  parseCreatorWebAutoBudget, validCreatorLineRecipient,
+  creatorCheckFailureLineMessage, creatorCheckFailureRetryKey, parseCreatorCheckFailureAlert, parseCreatorWebAutoBudget,
+  validCreatorCheckFailureIncidentId, validCreatorLineRecipient,
 } from './creator-web-auto-line.js';
 import { PPAN_AUTO_WATCH_RECENT_MS, PPAN_AUTO_WATCH_STALE_MS, validPpanAutoWatchAlert } from './ppan-auto-watch.js';
 
@@ -588,6 +589,29 @@ export class SqliteStore {
 
       CREATE INDEX IF NOT EXISTS creator_web_auto_line_deliveries_pending
         ON creator_web_auto_line_deliveries(client_id, recipient_user_id, next_attempt_at) WHERE state = 'PENDING';
+
+      -- Check failures are independent of budget leases. Retain the incident
+      -- key after completion so an old bridge retry cannot generate a new push.
+      CREATE TABLE IF NOT EXISTS creator_web_check_failure_alerts (
+        incident_id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL,
+        recipient_sha256 TEXT NOT NULL CHECK(length(recipient_sha256)=64),
+        advertiser_name TEXT NOT NULL,
+        tiktok_username TEXT NOT NULL,
+        failed_checks INTEGER NOT NULL CHECK(failed_checks=10),
+        created_at TEXT NOT NULL,
+        retry_key TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL CHECK(state IN ('PENDING','ACCEPTED','UNCONFIRMED','EXPIRED')),
+        next_attempt_at TEXT,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        claim_token TEXT,
+        claim_expires_at TEXT,
+        CHECK((claim_token IS NULL) = (claim_expires_at IS NULL)),
+        CHECK((state = 'PENDING') = (next_attempt_at IS NOT NULL))
+      ) STRICT;
+
+      CREATE INDEX IF NOT EXISTS creator_web_check_failure_alerts_pending
+        ON creator_web_check_failure_alerts(client_id, recipient_sha256, next_attempt_at) WHERE state='PENDING';
 
       CREATE TABLE IF NOT EXISTS creator_ppan_auto_watch_contact (
         id INTEGER PRIMARY KEY CHECK(id=1),
@@ -4831,6 +4855,79 @@ export class SqliteStore {
 
   getPpanCreatorAutoLineResult({ operationId } = {}) {
     return this.getCreatorAutoLineResult({ clientId: CREATOR_POLICY_DEFAULTS.clientId, operationId });
+  }
+
+  enqueueCreatorCheckFailureAlert({ clientId, alert, recipientUserId, now } = {}) {
+    assertCreatorWebPolicyClient(clientId);
+    const input = parseCreatorCheckFailureAlert(alert, clientId);
+    if (!input || !validCreatorLineRecipient(recipientUserId)) throw new DomainError('INVALID_REQUEST', 'Invalid Creator check alert');
+    const at = requiredIsoTime(now, 'now');
+    const recipientHash = createHash('sha256').update(recipientUserId).digest('hex');
+    return this.#transaction(() => {
+      const owners = this.listLineApprovers({ clientId: CREATOR_POLICY_DEFAULTS.clientId });
+      if (owners.length !== 1 || owners[0].active !== true || owners[0].lineUserId !== recipientUserId) {
+        throw new DomainError('CREATOR_WEB_AUTO_LINE_NOT_READY', 'Creator notification recipient is unavailable');
+      }
+      const previous = this.db.prepare('SELECT * FROM creator_web_check_failure_alerts WHERE incident_id=?').get(input.incidentId);
+      if (previous) {
+        if (previous.client_id !== clientId || previous.recipient_sha256 !== recipientHash || previous.advertiser_name !== input.advertiserName ||
+          previous.tiktok_username !== input.tiktokUsername || previous.failed_checks !== input.failedChecks) {
+          throw new DomainError('CREATOR_WEB_CHECK_FAILURE_CONFLICT', 'Creator check incident was already registered');
+        }
+        return previous.state;
+      }
+      this.db.prepare(`INSERT INTO creator_web_check_failure_alerts
+        (incident_id,client_id,recipient_sha256,advertiser_name,tiktok_username,failed_checks,created_at,retry_key,state,next_attempt_at)
+        VALUES (?,?,?,?,?,?,?,?,'PENDING',?)`).run(input.incidentId, clientId, recipientHash, input.advertiserName, input.tiktokUsername,
+        input.failedChecks, at, creatorCheckFailureRetryKey(clientId, input.incidentId), at);
+      return 'PENDING';
+    });
+  }
+
+  claimCreatorCheckFailureAlert({ clientId, recipientUserId, now } = {}) {
+    assertCreatorWebPolicyClient(clientId);
+    if (!validCreatorLineRecipient(recipientUserId)) return null;
+    const at = requiredIsoTime(now, 'now');
+    const oldest = new Date(Date.parse(at) - CREATOR_AUTO_LINE_RETRY_WINDOW_MS).toISOString();
+    const recipientHash = createHash('sha256').update(recipientUserId).digest('hex');
+    return this.#transaction(() => {
+      this.db.prepare(`UPDATE creator_web_check_failure_alerts SET state='EXPIRED',next_attempt_at=NULL,claim_token=NULL,claim_expires_at=NULL
+        WHERE client_id=? AND state='PENDING' AND created_at<=? AND (claim_expires_at IS NULL OR claim_expires_at<=?)`).run(clientId, oldest, at);
+      const owners = this.listLineApprovers({ clientId: CREATOR_POLICY_DEFAULTS.clientId });
+      if (owners.length !== 1 || owners[0].active !== true || owners[0].lineUserId !== recipientUserId) return null;
+      const row = this.db.prepare(`SELECT * FROM creator_web_check_failure_alerts WHERE client_id=? AND recipient_sha256=? AND state='PENDING'
+        AND next_attempt_at<=? AND created_at>? AND (claim_expires_at IS NULL OR claim_expires_at<=?)
+        ORDER BY next_attempt_at,created_at,incident_id LIMIT 1`).get(clientId, recipientHash, at, oldest, at);
+      if (!row) return null;
+      const alert = parseCreatorCheckFailureAlert({ incidentId: row.incident_id, advertiserName: row.advertiser_name,
+        tiktokUsername: row.tiktok_username, failedChecks: row.failed_checks }, clientId);
+      if (!alert || row.retry_key !== creatorCheckFailureRetryKey(clientId, row.incident_id)) return null;
+      const claimToken = randomUUID();
+      const claimExpiresAt = new Date(Math.min(Date.parse(row.created_at) + CREATOR_AUTO_LINE_RETRY_WINDOW_MS,
+        Date.parse(at) + CREATOR_AUTO_LINE_CLAIM_MS)).toISOString();
+      this.db.prepare(`UPDATE creator_web_check_failure_alerts SET claim_token=?,claim_expires_at=?,attempts=attempts+1 WHERE incident_id=?`)
+        .run(claimToken, claimExpiresAt, alert.incidentId);
+      return { clientId, incidentId: alert.incidentId, claimToken, claimExpiresAt, retryKey: row.retry_key,
+        messageText: creatorCheckFailureLineMessage({ clientId, advertiserName: alert.advertiserName }) };
+    });
+  }
+
+  finishCreatorCheckFailureAlert({ clientId, incidentId, claimToken, result, now } = {}) {
+    assertCreatorWebPolicyClient(clientId);
+    if (!validCreatorCheckFailureIncidentId(incidentId) || !validCreatorWebOperationId(claimToken) ||
+      !['ACCEPTED','RETRYABLE','UNCONFIRMED'].includes(result)) throw new DomainError('INVALID_REQUEST', 'Invalid Creator check alert result');
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const row = this.db.prepare(`SELECT * FROM creator_web_check_failure_alerts
+        WHERE incident_id=? AND client_id=? AND claim_token=? AND state='PENDING'`).get(incidentId, clientId, claimToken);
+      if (!row || at < row.created_at) return false;
+      const nextAttemptMs = Date.parse(at) + autoLineBackoffMs(row.attempts);
+      const retry = result === 'RETRYABLE' && nextAttemptMs < Date.parse(row.created_at) + CREATOR_AUTO_LINE_RETRY_WINDOW_MS;
+      const state = retry ? 'PENDING' : result === 'ACCEPTED' ? 'ACCEPTED' : 'UNCONFIRMED';
+      this.db.prepare(`UPDATE creator_web_check_failure_alerts SET state=?,next_attempt_at=?,claim_token=NULL,claim_expires_at=NULL
+        WHERE incident_id=? AND client_id=? AND claim_token=?`).run(state, retry ? new Date(nextAttemptMs).toISOString() : null, incidentId, clientId, claimToken);
+      return state;
+    });
   }
 
   recordPpanAutoWatchContact({ armState, sessionId, now } = {}) {

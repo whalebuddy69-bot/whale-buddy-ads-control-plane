@@ -685,6 +685,29 @@ export class BudgetGuardService {
     return results;
   }
 
+  async #processCreatorCheckFailureLineUpdates() {
+    if (typeof this.store.claimCreatorCheckFailureAlert !== "function" || typeof this.store.finishCreatorCheckFailureAlert !== "function") return [];
+    const results = [];
+    for (const clientId of CREATOR_WEB_POLICY_CLIENTS) {
+      const owner = this.creatorWebAutoLineRecipient(clientId);
+      if (!owner) continue;
+      const alert = this.store.claimCreatorCheckFailureAlert({ clientId, recipientUserId: owner, now: this.now() });
+      if (!alert || alert.clientId !== clientId || this.creatorWebAutoLineRecipient(clientId) !== owner ||
+        Date.parse(alert.claimExpiresAt) <= this.now().getTime()) continue;
+      let result = "ACCEPTED";
+      try { await this.line.push(owner, { type: "text", text: alert.messageText }, alert.retryKey); }
+      catch (error) { result = retryableCreatorAutoLineError(error) ? "RETRYABLE" : "UNCONFIRMED"; }
+      const state = this.store.finishCreatorCheckFailureAlert({ clientId, incidentId: alert.incidentId, claimToken: alert.claimToken,
+        result, now: this.now() });
+      if (!state) continue;
+      const event = { event: "creator_web_line_update", type: "AUTO_CHECK_FAILURES", clientId,
+        status: state === "ACCEPTED" ? "LINE_ACCEPTED" : state === "PENDING" ? "LINE_RETRY_PENDING" : "LINE_UNCONFIRMED" };
+      this.logger.info?.(JSON.stringify(event));
+      results.push(event);
+    }
+    return results;
+  }
+
   // Alert-only channel. Never accepts a budget or approval from LINE.
   async processCreatorWebLineUpdates() {
     if (!this.creatorWebLineUpdatesHealth().enabled) return [];
@@ -716,6 +739,7 @@ export class BudgetGuardService {
         : `⚠️ ${creatorName} — ยังยืนยันผลการปรับงบจาก TikTok ไม่ได้ ระบบระงับรายการใหม่และจะไม่ส่งคำสั่งซ้ำ`);
     }
     results.push(...await this.#processCreatorWebAutoLineUpdates());
+    results.push(...await this.#processCreatorCheckFailureLineUpdates());
 
     const now = this.now(), slot = creatorWebDigestSlot(now);
     if (!slot || !authorized() || this.store.getReportSubscription({ clientId: client.id, lineUserId: ownerId })?.enabled === true) return results;
