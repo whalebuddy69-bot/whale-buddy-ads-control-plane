@@ -17,6 +17,7 @@ const ASHOP_ROOT = "/internal/automation/ashopbytheta/policy";
 const MYU_ROOT = "/internal/automation/myushop4/policy";
 const BUBPA_ROOT = "/internal/automation/bubpa_shop189/policy";
 const KOOL_ROOT = "/internal/automation/koolkool888/policy";
+const BOOM_ROOT = "/internal/automation/boomkan/policy";
 const CLIENT = "punpan_020";
 const OWNER = "U-fixture-ppan-owner";
 const LATER = (ms, at = NOW) => new Date(at.getTime() + ms);
@@ -37,11 +38,11 @@ function policyStore(t) {
 
 async function localHttp(t, { leaseEnabled = true, srihiwLeaseEnabled = false,
   nnshop5719LeaseEnabled = false, ashopbythetaLeaseEnabled = false, myushop4LeaseEnabled = false, bubpaShop189LeaseEnabled = false,
-  koolkool888LeaseEnabled = false, capWriteEnabled = false, key = KEY, store = policyStore(t), service = {} } = {}) {
+  koolkool888LeaseEnabled = false, boomkanLeaseEnabled = false, capWriteEnabled = false, key = KEY, store = policyStore(t), service = {} } = {}) {
   let clock = NOW;
   const server = createHttpServer({ service, store, clock: () => clock,
     creatorWebPolicyOptions: { key, leaseEnabled, srihiwLeaseEnabled, nnshop5719LeaseEnabled, ashopbythetaLeaseEnabled,
-      myushop4LeaseEnabled, bubpaShop189LeaseEnabled, koolkool888LeaseEnabled, capWriteEnabled } });
+      myushop4LeaseEnabled, bubpaShop189LeaseEnabled, koolkool888LeaseEnabled, boomkanLeaseEnabled, capWriteEnabled } });
   await new Promise((resolve, reject) => server.listen(0, "127.0.0.1", resolve).once("error", reject));
   t.after(() => new Promise(resolve => server.close(resolve)));
   const url = `http://127.0.0.1:${server.address().port}`;
@@ -61,7 +62,7 @@ function post(body, headers = {}) {
 test("policy bridge is opt-in and never reuses credentials or enables leases on a truthy flag", () => {
   const env = { CREATOR_WEB_POLICY_BRIDGE_KEY: KEY, CREATOR_WEB_POLICY_LEASE_ENABLED: "true" };
   const newScopesDisabled = { nnshop5719LeaseEnabled: false, ashopbythetaLeaseEnabled: false, myushop4LeaseEnabled: false,
-    bubpaShop189LeaseEnabled: false, koolkool888LeaseEnabled: false };
+    bubpaShop189LeaseEnabled: false, koolkool888LeaseEnabled: false, boomkanLeaseEnabled: false };
   assert.deepEqual(resolveCreatorWebPolicyOptions(env, ACTIVE), { key: KEY, leaseEnabled: true, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: false });
   assert.deepEqual(resolveCreatorWebPolicyOptions({ ...env, CREATOR_WEB_POLICY_CAP_WRITE_ENABLED: "true" }, ACTIVE),
     { key: KEY, leaseEnabled: true, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: true });
@@ -71,7 +72,8 @@ test("policy bridge is opt-in and never reuses credentials or enables leases on 
   assert.deepEqual(resolveCreatorWebPolicyOptions({ CREATOR_WEB_POLICY_BRIDGE_KEY: KEY,
     CREATOR_WEB_NNSHOP5719_BUDGET_LEASE_ENABLED: "true", CREATOR_WEB_ASHOPBYTHETA_BUDGET_LEASE_ENABLED: "True" }, ACTIVE),
     { key: KEY, leaseEnabled: false, srihiwLeaseEnabled: false, ...newScopesDisabled, nnshop5719LeaseEnabled: true, capWriteEnabled: false });
-  for (const [key, flag] of [["MYUSHOP4", "myushop4LeaseEnabled"], ["BUBPA_SHOP189", "bubpaShop189LeaseEnabled"], ["KOOLKOOL888", "koolkool888LeaseEnabled"]]) {
+  for (const [key, flag] of [["MYUSHOP4", "myushop4LeaseEnabled"], ["BUBPA_SHOP189", "bubpaShop189LeaseEnabled"], ["KOOLKOOL888", "koolkool888LeaseEnabled"],
+    ["BOOMKAN", "boomkanLeaseEnabled"]]) {
     assert.deepEqual(resolveCreatorWebPolicyOptions({ CREATOR_WEB_POLICY_BRIDGE_KEY: KEY, [`CREATOR_WEB_${key}_BUDGET_LEASE_ENABLED`]: "true" }, ACTIVE),
       { key: KEY, leaseEnabled: false, srihiwLeaseEnabled: false, ...newScopesDisabled, [flag]: true, capWriteEnabled: false });
   }
@@ -277,6 +279,58 @@ test("koolkool888 has no default cap, requires its own lease and LINE recipient,
   assert.match(h.store.claimCreatorWebAutoLineDelivery({ clientId: "koolkool888", recipientUserId: recipient, now: NOW }).messageText, /^✅ @koolkool888 — /);
 });
 
+test("boomkan has an independent unset cap, explicit lease opt-in and exact private notification receipts", async t => {
+  const recipient = `U${"8".repeat(32)}`;
+  let consent = false;
+  const service = { creatorWebAutoLineRecipient: id => consent && id === "boomkan" ? recipient : null };
+  const disabled = await localHttp(t, { service, capWriteEnabled: true, koolkool888LeaseEnabled: true });
+  pair(disabled.store, recipient);
+  assert.deepEqual(await disabled.get(BOOM_ROOT), { status: 200, body: { schemaVersion: 1, clientId: "boomkan", configured: false,
+    readAt: NOW.toISOString(), locked: false, capWriteEnabled: true, autoLineReady: false } });
+  assert.equal(disabled.store.getCreatorWebPolicyState({ clientId: "boomkan" }), null);
+  const operationId = randomUUID(), autoBudget = { previousBudgetMinor: 40_001, targetBudgetMinor: 48_100, rounding: "ceil-baht" };
+  const lease = post({ operationId, revision: 1, autoBudget });
+  assert.equal((await disabled.get(`${BOOM_ROOT}/lease`, lease)).body.error.code, "LEASE_DISABLED");
+  const h = await localHttp(t, { store: disabled.store, service, capWriteEnabled: true, boomkanLeaseEnabled: true });
+  consent = true;
+  assert.equal((await h.get(`${BOOM_ROOT}/lease`, lease)).body.error.code, "CREATOR_WEB_POLICY_CHANGED");
+  consent = false;
+  const saved = await h.get(`${BOOM_ROOT}/cap`, post({ revision: 0, capMinor: 48_100, actorUserId: 42 }));
+  assert.equal(saved.status, 200);
+  assert.equal(saved.body.autoLineReady, false);
+  assert.equal(h.store.getCreatorWebPolicyState({ clientId: "boomkan" }).policy.executionEnabled, false);
+  assert.equal((await h.get(`${BOOM_ROOT}/lease`, lease)).body.error.code, "CREATOR_WEB_AUTO_LINE_NOT_READY");
+  const incident = { incidentId: randomUUID(), advertiserName: "Boomkan Live", tiktokUsername: "boomkan", failedChecks: 10 };
+  assert.equal((await h.get(`${BOOM_ROOT}/check-failure-alert`, post(incident))).body.error.code, "CREATOR_WEB_AUTO_LINE_NOT_READY");
+  consent = true;
+  assert.equal((await h.get(BOOM_ROOT)).body.autoLineReady, true);
+  assert.equal((await h.get(`${BOOM_ROOT}/lease`, lease)).status, 200);
+  assert.equal((await h.get(BOOM_ROOT)).body.locked, true);
+  assert.equal((await h.get(ROOT)).body.locked, false);
+  assert.equal((await h.get(KOOL_ROOT)).body.configured, false);
+  assert.equal((await h.get(`${KOOL_ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 503);
+  assert.equal((await h.get(`${ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 409);
+  assert.equal((await h.get(`${BOOM_ROOT}/finish`, post({ operationId, outcome: "APPLIED_VERIFIED" }))).status, 200);
+  assert.deepEqual(await h.get(`${BOOM_ROOT}/line-result/${operationId}`), { status: 200,
+    body: { schemaVersion: 1, clientId: "boomkan", operationId, status: "PENDING" } });
+  assert.equal((await h.get(`${KOOL_ROOT}/line-result/${operationId}`)).body.status, "UNKNOWN");
+  for (const path of [`${BOOM_ROOT}/line-result/${operationId}`, `${BOOM_ROOT}/check-failure-alert`]) {
+    assert.equal((await h.get(path, { headers: { origin: "https://report.whalebuddy69.com" } })).status, 403);
+    assert.equal((await h.get(path, { headers: { "x-creator-web-key": "B".repeat(43) } })).status, 401);
+  }
+  assert.equal((await h.get("/internal/automation/BOOMKAN/policy")).status, 404);
+  assert.equal((await h.get(`${BOOM_ROOT}/cap`, post({ revision: 1, capMinor: 50_000, actorUserId: 42, clientId: "koolkool888" }))).status, 400);
+  assert.equal((await h.get(`${BOOM_ROOT}/check-failure-alert`, post({ ...incident, tiktokUsername: "koolkool888" }))).status, 400);
+  const queued = await h.get(`${BOOM_ROOT}/check-failure-alert`, post(incident));
+  assert.equal(queued.body.status, "PENDING");
+  assert.deepEqual(await h.get(`${BOOM_ROOT}/check-failure-alert`, post(incident)), queued);
+  assert.match(h.store.claimCreatorCheckFailureAlert({ clientId: "boomkan", recipientUserId: recipient, now: NOW }).messageText, /TikTok: @boomkan\n/);
+  assert.match(h.store.claimCreatorWebAutoLineDelivery({ clientId: "boomkan", recipientUserId: recipient, now: NOW }).messageText, /^✅ @boomkan — /);
+  for (const flag of [true, "True", "1", "false"]) assert.equal(resolveCreatorWebPolicyOptions({
+    CREATOR_WEB_POLICY_BRIDGE_KEY: KEY, CREATOR_WEB_BOOMKAN_BUDGET_LEASE_ENABLED: flag,
+  }, ACTIVE).boomkanLeaseEnabled, false);
+});
+
 test("check-failure alerts accept ten exact scoped checks and idempotently enqueue without touching policy", async t => {
   const recipient = `U${"6".repeat(32)}`;
   const h = await localHttp(t, { leaseEnabled: false, service: {
@@ -346,10 +400,10 @@ test("ceil-baht Auto rounds the exact 20% result up once, enforces the cap, and 
   const recipient = `U${"5".repeat(32)}`;
   const h = await localHttp(t, { service: { creatorWebAutoLineRecipient: () => recipient }, capWriteEnabled: true,
     srihiwLeaseEnabled: true, nnshop5719LeaseEnabled: true, ashopbythetaLeaseEnabled: true,
-    myushop4LeaseEnabled: true, bubpaShop189LeaseEnabled: true, koolkool888LeaseEnabled: true });
+    myushop4LeaseEnabled: true, bubpaShop189LeaseEnabled: true, koolkool888LeaseEnabled: true, boomkanLeaseEnabled: true });
   pair(h.store, recipient);
   const proof = { previousBudgetMinor: 40_001, targetBudgetMinor: 48_100, rounding: "ceil-baht" };
-  for (const root of [ROOT, SRIHIW_ROOT, NNSHOP_ROOT, ASHOP_ROOT, MYU_ROOT, BUBPA_ROOT, KOOL_ROOT]) {
+  for (const root of [ROOT, SRIHIW_ROOT, NNSHOP_ROOT, ASHOP_ROOT, MYU_ROOT, BUBPA_ROOT, KOOL_ROOT, BOOM_ROOT]) {
     const revision = root === ROOT ? 1 : 0, op = randomUUID();
     assert.equal((await h.get(`${root}/cap`, post({ revision, capMinor: 48_099, actorUserId: 42 }))).status, 200);
     const lease = (autoBudget, currentRevision = revision + 2) => h.get(`${root}/lease`, post({ operationId: op, revision: currentRevision, autoBudget }));

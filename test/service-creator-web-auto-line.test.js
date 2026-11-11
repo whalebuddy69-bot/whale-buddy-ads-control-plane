@@ -18,16 +18,18 @@ const ASHOP = 'ashopbytheta';
 const MYU = 'myushop4';
 const BUBPA = 'bubpa_shop189';
 const KOOL = 'koolkool888';
+const BOOM = 'boomkan';
 const OWNER = `U${'a'.repeat(32)}`;
 const REPLACEMENT = `U${'b'.repeat(32)}`;
 const HASH = createHash('sha256').update(OWNER).digest('hex');
 const at = (ms) => new Date(NOW.getTime() + ms);
 
 test('Automation labels use verified TikTok handles, never arbitrary input', () => {
-  assert.deepEqual([PPAN, SRIHIW, NNSHOP, ASHOP, MYU, BUBPA, KOOL].map(creatorAutomationLineLabel),
-    ['@punpanshop888', '@srihiw', '@nnshop5719', '@ashopbytheta', '@myushop4', '@bubpa_shop189', '@koolkool888']);
+  assert.deepEqual([PPAN, SRIHIW, NNSHOP, ASHOP, MYU, BUBPA, KOOL, BOOM].map(creatorAutomationLineLabel),
+    ['@punpanshop888', '@srihiw', '@nnshop5719', '@ashopbytheta', '@myushop4', '@bubpa_shop189', '@koolkool888', '@boomkan']);
   assert.throws(() => creatorAutomationLineLabel('a_new_unverified_creator'));
   assert.equal(parseCreatorPolicyText('ตั้งเพดาน koolkool888 5000'), null);
+  assert.equal(parseCreatorPolicyText('ตั้งเพดาน boomkan 5000'), null);
 });
 
 function pair(store, owner, now = NOW) {
@@ -51,7 +53,8 @@ function reserve(store, clientId, outcome = 'APPLIED_VERIFIED') {
 }
 
 function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash = null, myuOwnerHash = null, bubpaOwnerHash = null,
-  koolOwnerHash = null, asUseSrihiw = false, myuUseSrihiw = false, bubpaUseSrihiw = false, koolUseSrihiw = false, fail = null } = {}) {
+  koolOwnerHash = null, boomOwnerHash = null, asUseSrihiw = false, myuUseSrihiw = false, bubpaUseSrihiw = false,
+  koolUseSrihiw = false, boomUseSrihiw = false, fail = null } = {}) {
   const attempts = [];
   let now = NOW;
   let error = fail;
@@ -62,6 +65,7 @@ function serviceWith(store, { ownerHash = null, nnOwnerHash = null, asOwnerHash 
     creatorWebNnshop5719LineSharedOwnerSha256: nnOwnerHash, creatorWebAshopbythetaLineSharedOwnerSha256: asOwnerHash,
     creatorWebMyushop4LineSharedOwnerSha256: myuOwnerHash, creatorWebBubpaShop189LineSharedOwnerSha256: bubpaOwnerHash,
     creatorWebKoolkool888LineSharedOwnerSha256: koolOwnerHash, creatorWebKoolkool888LineUseSrihiwOwner: koolUseSrihiw,
+    creatorWebBoomkanLineSharedOwnerSha256: boomOwnerHash, creatorWebBoomkanLineUseSrihiwOwner: boomUseSrihiw,
     creatorWebAshopbythetaLineUseSrihiwOwner: asUseSrihiw,
     creatorWebMyushop4LineUseSrihiwOwner: myuUseSrihiw, creatorWebBubpaShop189LineUseSrihiwOwner: bubpaUseSrihiw,
     now: () => now, logger: { info() {} }, line: { async push(to, msg, key) {
@@ -280,6 +284,102 @@ test('koolkool888 opts into the same private recipient only by exact verified co
   assert.equal(allowed.attempts[0].to, OWNER);
   assert.match(allowed.attempts[0].msg.text, /^✅ @koolkool888 — /);
   assert.equal(store.getCreatorAutoLineResult({ clientId: KOOL, operationId }), 'ACCEPTED');
+});
+
+test('boomkan opt-in never inherits another scope consent, rejects conflicting bindings, and preserves exact result and incident labels', async t => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  setupStore(store);
+  store.updateCreatorWebCap({ clientId: BOOM, revision: 0, capMinor: 900_000, actorUserId: 42, now: NOW });
+  const operationId = reserve(store, BOOM);
+  const incident = { incidentId: randomUUID(), advertiserName: 'Boomkan Ads', tiktokUsername: BOOM, failedChecks: 10 };
+  assert.equal(store.enqueueCreatorCheckFailureAlert({ clientId: BOOM, alert: incident, recipientUserId: OWNER, now: NOW }), 'PENDING');
+  const wrongHash = createHash('sha256').update(REPLACEMENT).digest('hex');
+  for (const flags of [{ ownerHash: HASH, koolUseSrihiw: true }, { ownerHash: HASH, boomUseSrihiw: 'true' }, { boomUseSrihiw: true },
+    { ownerHash: wrongHash, boomUseSrihiw: true, boomOwnerHash: HASH },
+    { ownerHash: HASH, boomUseSrihiw: true, boomOwnerHash: wrongHash },
+    { ownerHash: HASH, boomUseSrihiw: true, boomOwnerHash: '' },
+    { ownerHash: HASH, boomUseSrihiw: true, boomOwnerHash: 'bad-hash' }]) {
+    const denied = serviceWith(store, flags);
+    assert.equal(denied.service.creatorWebAutoLineRecipient(BOOM), null);
+    assert.deepEqual(await denied.service.processCreatorWebLineUpdates(), []);
+    assert.deepEqual(denied.attempts, []);
+  }
+  assert.equal(serviceWith(store, { boomOwnerHash: HASH }).service.creatorWebAutoLineRecipient(BOOM), OWNER);
+  const allowed = serviceWith(store, { ownerHash: HASH, boomUseSrihiw: true });
+  assert.equal(allowed.service.creatorWebAutoLineRecipient(BOOM), OWNER);
+  assert.equal(allowed.service.creatorWebAutoLineRecipient(KOOL), null);
+  const result = await allowed.service.processCreatorWebLineUpdates();
+  assert.deepEqual(result.map(r => [r.clientId, r.type, r.status]), [[BOOM, 'AUTO_BUDGET_RESULT', 'LINE_ACCEPTED'], [BOOM, 'AUTO_CHECK_FAILURES', 'LINE_ACCEPTED']]);
+  assert.equal(allowed.attempts.length, 2);
+  assert.equal(allowed.attempts[0].to, OWNER);
+  assert.match(allowed.attempts[0].msg.text, /^✅ @boomkan — /);
+  assert.match(allowed.attempts[1].msg.text, /บัญชีโฆษณา: Boomkan Ads\nTikTok: @boomkan\n/);
+  assert.equal(store.getCreatorAutoLineResult({ clientId: BOOM, operationId }), 'ACCEPTED');
+  assert.equal(store.getCreatorAutoLineResult({ clientId: KOOL, operationId }), 'UNKNOWN');
+  assert.deepEqual(await allowed.service.processCreatorWebLineUpdates(), []);
+  reserve(store, BOOM);
+  store.revokeLineApprover({ clientId: PPAN, lineUserId: OWNER, revokedAt: at(1000) });
+  pair(store, REPLACEMENT, at(1000));
+  allowed.advance(1000);
+  assert.equal(allowed.service.creatorWebAutoLineRecipient(BOOM), null);
+  assert.deepEqual(await allowed.service.processCreatorWebLineUpdates(), []);
+  assert.equal(allowed.attempts.length, 2);
+});
+
+test('adding boomkan to an existing SQLite file preserves every old policy, lease fence, delivery proof and claim', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'boomkan-additive-test-'));
+  const filename = join(dir, 'fixture.sqlite');
+  let store = new SqliteStore(filename);
+  t.after(() => { store.close(); rmSync(dir, { recursive: true, force: true }); });
+  setupStore(store);
+  for (const clientId of [NNSHOP, ASHOP, MYU, BUBPA, KOOL]) {
+    store.updateCreatorWebCap({ clientId, revision: 0, capMinor: 900_000, actorUserId: 42, now: NOW });
+  }
+  const ppanOp = randomUUID(), ppanProof = { previousBudgetMinor: 40_001, targetBudgetMinor: 48_001, rounding: 'floor-satang' };
+  store.acquireCreatorWebPolicyLease({ clientId: PPAN, revision: 1, operationId: ppanOp, now: NOW, lineRecipientUserId: OWNER, autoBudget: ppanProof });
+  reserve(store, SRIHIW, 'OUTCOME_UNKNOWN');
+  reserve(store, NNSHOP, null);
+  const pending = reserve(store, ASHOP);
+  assert.ok(store.claimCreatorWebAutoLineDelivery({ clientId: ASHOP, recipientUserId: OWNER, now: NOW }));
+  const accepted = reserve(store, MYU);
+  const claim = store.claimCreatorWebAutoLineDelivery({ clientId: MYU, recipientUserId: OWNER, now: NOW });
+  store.finishCreatorWebAutoLineDelivery({ operationId: accepted, claimToken: claim.claimToken, result: 'ACCEPTED', now: NOW });
+  reserve(store, BUBPA, 'NOT_SENT');
+  const koolProof = { previousBudgetMinor: 40_001, targetBudgetMinor: 48_100, rounding: 'ceil-baht' }, koolOp = randomUUID();
+  store.acquireCreatorWebPolicyLease({ clientId: KOOL, revision: 1, operationId: koolOp, now: NOW, lineRecipientUserId: OWNER, autoBudget: koolProof });
+  store.finishCreatorWebPolicyLease({ clientId: KOOL, operationId: koolOp, outcome: 'APPLIED_VERIFIED', now: NOW });
+  const tables = ['creator_auto_policies', 'creator_web_policy_leases', 'creator_web_auto_line_deliveries', 'creator_web_check_failure_alerts'];
+  const priorRows = () => Object.fromEntries(tables.map(table => [table,
+    store.db.prepare(`SELECT * FROM ${table} WHERE client_id <> ? ORDER BY rowid`).all(BOOM)]));
+  const schema = () => store.db.prepare("SELECT type,name,sql FROM sqlite_schema WHERE name LIKE 'creator_%' ORDER BY type,name").all();
+  const rows = priorRows(), ddl = schema(), audit = store.listAuditEvents();
+  store.close();
+  store = new SqliteStore(filename);
+  assert.equal(store.getCreatorWebPolicyState({ clientId: BOOM }), null);
+  assert.deepEqual(priorRows(), rows);
+  assert.deepEqual(schema(), ddl);
+  store.updateCreatorWebCap({ clientId: BOOM, revision: 0, capMinor: 48_100, actorUserId: 42, now: NOW });
+  const boomOp = randomUUID();
+  store.acquireCreatorWebPolicyLease({ clientId: BOOM, revision: 1, operationId: boomOp, now: NOW, lineRecipientUserId: OWNER, autoBudget: koolProof });
+  assert.equal(store.getCreatorWebPolicyState({ clientId: BOOM }).locked, true);
+  for (const clientId of [PPAN, SRIHIW, NNSHOP, BOOM]) {
+    assert.equal(store.getCreatorWebPolicyState({ clientId }).locked, true);
+    assert.throws(() => store.acquireCreatorWebPolicyLease({ clientId, revision: 1, operationId: randomUUID(), now: at(120_000) }),
+      { code: 'CREATOR_WEB_POLICY_LOCKED' });
+  }
+  store.finishCreatorWebPolicyLease({ clientId: BOOM, operationId: boomOp, outcome: 'APPLIED_VERIFIED', now: NOW });
+  assert.equal(store.getCreatorAutoLineResult({ clientId: BOOM, operationId: pending }), 'UNKNOWN');
+  assert.equal(store.getCreatorAutoLineResult({ clientId: ASHOP, operationId: boomOp }), 'UNKNOWN');
+  assert.equal(store.getCreatorAutoLineResult({ clientId: BOOM, operationId: boomOp }), 'PENDING');
+  assert.deepEqual(priorRows(), rows);
+  assert.deepEqual(schema(), ddl);
+  assert.deepEqual(store.listAuditEvents().slice(0, audit.length), audit);
+  assert.equal(store.db.prepare('PRAGMA foreign_key_check').all().length, 0);
+  store.close();
+  store = new SqliteStore(filename);
+  assert.deepEqual(priorRows(), rows);
+  assert.deepEqual(schema(), ddl);
 });
 
 test('check-failure LINE retries use the same key and a rotated recipient never inherits the incident', async t => {

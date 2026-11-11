@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import {
-  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, BUBPA_SHOP189_CREATOR_POLICY_CLIENT, CREATOR_POLICY_DEFAULTS,
+  ASHOPBYTHETA_CREATOR_POLICY_CLIENT, BOOMKAN_CREATOR_POLICY_CLIENT, BUBPA_SHOP189_CREATOR_POLICY_CLIENT, CREATOR_POLICY_DEFAULTS,
   EXTRA_CREATOR_WEB_POLICY_CLIENTS, KOOLKOOL888_CREATOR_POLICY_CLIENT, MYUSHOP4_CREATOR_POLICY_CLIENT,
   NNSHOP5719_CREATOR_POLICY_CLIENT, SRIHIW_CREATOR_POLICY_CLIENT,
 } from "./creator-policy.js";
@@ -19,7 +19,7 @@ const OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 const LINE_RESULT_PATH = /^\/internal\/automation\/([a-z0-9_]+)\/policy\/line-result\/([^/]+)$/;
 const LINE_RESULT_SCOPES = new Map([["ppan", CLIENT_ID], [ASHOPBYTHETA_CREATOR_POLICY_CLIENT, ASHOPBYTHETA_CREATOR_POLICY_CLIENT],
   [MYUSHOP4_CREATOR_POLICY_CLIENT, MYUSHOP4_CREATOR_POLICY_CLIENT], [BUBPA_SHOP189_CREATOR_POLICY_CLIENT, BUBPA_SHOP189_CREATOR_POLICY_CLIENT],
-  [KOOLKOOL888_CREATOR_POLICY_CLIENT, KOOLKOOL888_CREATOR_POLICY_CLIENT]]);
+  [KOOLKOOL888_CREATOR_POLICY_CLIENT, KOOLKOOL888_CREATOR_POLICY_CLIENT], [BOOMKAN_CREATOR_POLICY_CLIENT, BOOMKAN_CREATOR_POLICY_CLIENT]]);
 const SRIHIW_LINE_OWNER_PATH = "/internal/automation/srihiw/policy/line-owner-binding";
 const AUTO_LINE_RESULT_STATUSES = new Set(["PENDING", "ACCEPTED", "UNCONFIRMED", "UNKNOWN"]);
 const CHECK_FAILURE_STATES = new Set(["PENDING", "ACCEPTED", "UNCONFIRMED", "EXPIRED"]);
@@ -59,6 +59,7 @@ export function resolveCreatorWebPolicyOptions(env, { controlPlaneOnly, creatorR
     myushop4LeaseEnabled: key !== null && env?.CREATOR_WEB_MYUSHOP4_BUDGET_LEASE_ENABLED === "true",
     bubpaShop189LeaseEnabled: key !== null && env?.CREATOR_WEB_BUBPA_SHOP189_BUDGET_LEASE_ENABLED === "true",
     koolkool888LeaseEnabled: key !== null && env?.CREATOR_WEB_KOOLKOOL888_BUDGET_LEASE_ENABLED === "true",
+    boomkanLeaseEnabled: key !== null && env?.CREATOR_WEB_BOOMKAN_BUDGET_LEASE_ENABLED === "true",
     capWriteEnabled: key !== null && env?.CREATOR_WEB_POLICY_CAP_WRITE_ENABLED === "true" };
 }
 
@@ -121,13 +122,13 @@ function payloadOf(result, now, clientId = CLIENT_ID) {
 /** Only the Railway peer may read, edit the cap, or hold this policy. No path calls TikTok. */
 export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false, srihiwLeaseEnabled = false,
   nnshop5719LeaseEnabled = false, ashopbythetaLeaseEnabled = false, myushop4LeaseEnabled = false, bubpaShop189LeaseEnabled = false,
-  koolkool888LeaseEnabled = false,
+  koolkool888LeaseEnabled = false, boomkanLeaseEnabled = false,
   capWriteEnabled = false, resolveAutoLineRecipient = () => null, resolvePpanOwnerDigest = () => null, clock = () => new Date() } = {}) {
   const expected = validKey(key) ? digest(key) : null;
   const leaseByClient = new Map([[CLIENT_ID, leaseEnabled], [SRIHIW_CREATOR_POLICY_CLIENT, srihiwLeaseEnabled],
     [NNSHOP5719_CREATOR_POLICY_CLIENT, nnshop5719LeaseEnabled], [ASHOPBYTHETA_CREATOR_POLICY_CLIENT, ashopbythetaLeaseEnabled],
     [MYUSHOP4_CREATOR_POLICY_CLIENT, myushop4LeaseEnabled], [BUBPA_SHOP189_CREATOR_POLICY_CLIENT, bubpaShop189LeaseEnabled],
-    [KOOLKOOL888_CREATOR_POLICY_CLIENT, koolkool888LeaseEnabled]]);
+    [KOOLKOOL888_CREATOR_POLICY_CLIENT, koolkool888LeaseEnabled], [BOOMKAN_CREATOR_POLICY_CLIENT, boomkanLeaseEnabled]]);
   function autoRecipient(clientId) {
     try {
       const result = resolveAutoLineRecipient(clientId);
