@@ -117,6 +117,8 @@ test('existing auto delivery SQLite rows migrate to exact-satang without changin
   const operationId = reserve(store, PPAN);
   const select = 'SELECT retry_key, message_text, recipient_user_id, state FROM creator_web_auto_line_deliveries WHERE operation_id = ?';
   const original = store.db.prepare(select).get(operationId);
+  // These guards postdate rounding and were absent from a pre-rounding file.
+  store.db.exec('DROP TRIGGER creator_web_quarantine_outbox_update; DROP TRIGGER creator_web_quarantine_outbox_delete');
   store.db.exec('ALTER TABLE creator_web_auto_line_deliveries DROP COLUMN rounding');
   store.close();
   store = new SqliteStore(dbPath);

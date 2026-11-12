@@ -62,7 +62,7 @@ function post(body, headers = {}) {
 test("policy bridge is opt-in and never reuses credentials or enables leases on a truthy flag", () => {
   const env = { CREATOR_WEB_POLICY_BRIDGE_KEY: KEY, CREATOR_WEB_POLICY_LEASE_ENABLED: "true" };
   const newScopesDisabled = { nnshop5719LeaseEnabled: false, ashopbythetaLeaseEnabled: false, myushop4LeaseEnabled: false,
-    bubpaShop189LeaseEnabled: false, koolkool888LeaseEnabled: false, boomkanLeaseEnabled: false };
+    bubpaShop189LeaseEnabled: false, koolkool888LeaseEnabled: false, boomkanLeaseEnabled: false, bubpaShop189RecoveryEnabled: false };
   assert.deepEqual(resolveCreatorWebPolicyOptions(env, ACTIVE), { key: KEY, leaseEnabled: true, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: false });
   assert.deepEqual(resolveCreatorWebPolicyOptions({ ...env, CREATOR_WEB_POLICY_CAP_WRITE_ENABLED: "true" }, ACTIVE),
     { key: KEY, leaseEnabled: true, srihiwLeaseEnabled: false, ...newScopesDisabled, capWriteEnabled: true });

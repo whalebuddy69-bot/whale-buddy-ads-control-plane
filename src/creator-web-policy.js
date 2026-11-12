@@ -21,13 +21,15 @@ const LINE_RESULT_SCOPES = new Map([["ppan", CLIENT_ID], [ASHOPBYTHETA_CREATOR_P
   [MYUSHOP4_CREATOR_POLICY_CLIENT, MYUSHOP4_CREATOR_POLICY_CLIENT], [BUBPA_SHOP189_CREATOR_POLICY_CLIENT, BUBPA_SHOP189_CREATOR_POLICY_CLIENT],
   [KOOLKOOL888_CREATOR_POLICY_CLIENT, KOOLKOOL888_CREATOR_POLICY_CLIENT], [BOOMKAN_CREATOR_POLICY_CLIENT, BOOMKAN_CREATOR_POLICY_CLIENT]]);
 const SRIHIW_LINE_OWNER_PATH = "/internal/automation/srihiw/policy/line-owner-binding";
+const BUBPA_RECOVERY_PATH = "/internal/automation/bubpa_shop189/policy/recover-unknown";
+const CAMPAIGN_ID = /^[1-9][0-9]{9,24}$/;
 const AUTO_LINE_RESULT_STATUSES = new Set(["PENDING", "ACCEPTED", "UNCONFIRMED", "UNKNOWN"]);
 const CHECK_FAILURE_STATES = new Set(["PENDING", "ACCEPTED", "UNCONFIRMED", "EXPIRED"]);
 const OUTCOMES = new Set(["NOT_SENT", "PROVIDER_REJECTED", "APPLIED_VERIFIED", "OUTCOME_UNKNOWN"]);
 const CONFLICTS = new Set([
   "CREATOR_WEB_POLICY_CHANGED", "CREATOR_WEB_POLICY_LOCKED", "CREATOR_WEB_LEASE_EXPIRED",
   "CREATOR_WEB_LEASE_CONFLICT", "CREATOR_WEB_LEASE_NOT_FOUND", "CREATOR_WEB_AUTO_LINE_NOT_READY", "POLICY_CHANGED", "POLICY_LOCKED",
-  "CREATOR_WEB_CHECK_FAILURE_CONFLICT"
+  "CREATOR_WEB_CHECK_FAILURE_CONFLICT", "CREATOR_WEB_RECOVERY_CONFLICT", "CREATOR_WEB_LEASE_QUARANTINED", "CREATOR_WEB_CAMPAIGN_RESTRICTED"
 ]);
 const MAX_BODY_BYTES = 512;
 const digest = (value) => createHash("sha256").update(value).digest();
@@ -35,6 +37,7 @@ const validKey = (value) => typeof value === "string" && value === value.trim() 
 
 function scopeFor(pathname) {
   if (typeof pathname !== "string") return undefined;
+  if (pathname === BUBPA_RECOVERY_PATH) return { clientId: BUBPA_SHOP189_CREATOR_POLICY_CLIENT, action: "recover-unknown" };
   if (pathname === SRIHIW_LINE_OWNER_PATH) return { clientId: SRIHIW_CREATOR_POLICY_CLIENT, action: "line-owner-binding" };
   const result = LINE_RESULT_PATH.exec(pathname);
   if (result && OPERATION_ID.test(result[2])) {
@@ -60,6 +63,7 @@ export function resolveCreatorWebPolicyOptions(env, { controlPlaneOnly, creatorR
     bubpaShop189LeaseEnabled: key !== null && env?.CREATOR_WEB_BUBPA_SHOP189_BUDGET_LEASE_ENABLED === "true",
     koolkool888LeaseEnabled: key !== null && env?.CREATOR_WEB_KOOLKOOL888_BUDGET_LEASE_ENABLED === "true",
     boomkanLeaseEnabled: key !== null && env?.CREATOR_WEB_BOOMKAN_BUDGET_LEASE_ENABLED === "true",
+    bubpaShop189RecoveryEnabled: key !== null && env?.CREATOR_WEB_BUBPA_SHOP189_RECOVERY_ENABLED === "true",
     capWriteEnabled: key !== null && env?.CREATOR_WEB_POLICY_CAP_WRITE_ENABLED === "true" };
 }
 
@@ -116,13 +120,14 @@ function payloadOf(result, now, clientId = CLIENT_ID) {
     || !validPositive(p.clientDailyCapMinor) || typeof result.locked !== "boolean") return null;
   return { schemaVersion: 1, clientId, revision: p.revision,
     campaignCapMinor: p.campaignCapMinor, clientDailyCapMinor: p.clientDailyCapMinor,
-    readAt: now.toISOString(), locked: result.locked };
+    readAt: now.toISOString(), locked: result.locked,
+    ...(result.writeCampaignId ? { writeCampaignId: result.writeCampaignId, recoveryId: result.recoveryId } : {}) };
 }
 
 /** Only the Railway peer may read, edit the cap, or hold this policy. No path calls TikTok. */
 export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false, srihiwLeaseEnabled = false,
   nnshop5719LeaseEnabled = false, ashopbythetaLeaseEnabled = false, myushop4LeaseEnabled = false, bubpaShop189LeaseEnabled = false,
-  koolkool888LeaseEnabled = false, boomkanLeaseEnabled = false,
+  koolkool888LeaseEnabled = false, boomkanLeaseEnabled = false, bubpaShop189RecoveryEnabled = false,
   capWriteEnabled = false, resolveAutoLineRecipient = () => null, resolvePpanOwnerDigest = () => null, clock = () => new Date() } = {}) {
   const expected = validKey(key) ? digest(key) : null;
   const leaseByClient = new Map([[CLIENT_ID, leaseEnabled], [SRIHIW_CREATOR_POLICY_CLIENT, srihiwLeaseEnabled],
@@ -152,6 +157,7 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
     const method = ["read", "line-result", "line-owner-binding"].includes(action) ? "GET" : "POST";
     if (request.method !== method) return fail(response, 405, "METHOD_NOT_ALLOWED", { allow: method });
     if (capPath && capWriteEnabled !== true) return fail(response, 503, "CAP_WRITE_DISABLED");
+    if (action === "recover-unknown" && bubpaShop189RecoveryEnabled !== true) return fail(response, 503, "RECOVERY_DISABLED");
     if (method === "POST" && !capPath && !checkFailurePath && !scopeLeaseEnabled) {
       return fail(response, 503, "LEASE_DISABLED");
     }
@@ -188,6 +194,16 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
       if (!parsed.payload) return fail(response, parsed.status, parsed.code, parsed.status === 413 ? { connection: "close" } : {});
       const input = parsed.payload;
       const now = new Date(clock());
+      if (action === "recover-unknown") {
+        const fields = ["recoveryId", "operatorUserId", "oldOperationId", "oldCampaignId", "newCampaignId", "revision", "acknowledgedUnknown"];
+        if (Object.keys(input).length !== fields.length || !fields.every(field => Object.hasOwn(input, field)) ||
+          !OPERATION_ID.test(input.recoveryId ?? "") || !OPERATION_ID.test(input.oldOperationId ?? "") ||
+          typeof input.oldCampaignId !== "string" || !CAMPAIGN_ID.test(input.oldCampaignId) || typeof input.newCampaignId !== "string" ||
+          !CAMPAIGN_ID.test(input.newCampaignId) || input.oldCampaignId === input.newCampaignId || !validPositive(input.operatorUserId) ||
+          !validPositive(input.revision) || input.acknowledgedUnknown !== true) return fail(response, 400, "INVALID_REQUEST");
+        const result = store.recoverCreatorWebUnknownLease({ clientId, ...input, now });
+        return write(response, 200, { schemaVersion: 1, ...result });
+      }
       if (checkFailurePath) {
         const alert = parseCreatorCheckFailureAlert(input, clientId);
         if (!alert) return fail(response, 400, "INVALID_REQUEST");
@@ -214,7 +230,9 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
         || input.operationId.length !== 36 || !OPERATION_ID.test(input.operationId)) return fail(response, 400, "INVALID_REQUEST");
       if (action === "lease") {
         const isAuto = Object.hasOwn(input, "autoBudget");
-        if (Object.keys(input).length !== (isAuto ? 3 : 2) || !Object.hasOwn(input, "revision") || !validPositive(input.revision)) {
+        const hasCampaign = Object.hasOwn(input, "campaignId");
+        if (Object.keys(input).length !== (isAuto ? 3 : 2) + (hasCampaign ? 1 : 0) || !Object.hasOwn(input, "revision") || !validPositive(input.revision) ||
+          (hasCampaign && (typeof input.campaignId !== "string" || !CAMPAIGN_ID.test(input.campaignId)))) {
           return fail(response, 400, "INVALID_REQUEST");
         }
         const autoBudget = isAuto ? parseCreatorWebAutoBudget(input.autoBudget, clientId) : undefined;
@@ -222,6 +240,7 @@ export function createCreatorWebPolicyHandler({ store, key, leaseEnabled = false
         const lineRecipientUserId = isAuto ? autoRecipient(clientId) : undefined;
         if (isAuto && !lineRecipientUserId) return fail(response, 409, "CREATOR_WEB_AUTO_LINE_NOT_READY");
         const result = store.acquireCreatorWebPolicyLease({ clientId, operationId: input.operationId, revision: input.revision, now,
+          ...(hasCampaign ? { campaignId: input.campaignId } : {}),
           ...(isAuto ? { autoBudget, lineRecipientUserId } : {}) });
         const policy = payloadOf(result, now, clientId);
         if (!policy) return fail(response, 503, "POLICY_UNAVAILABLE");

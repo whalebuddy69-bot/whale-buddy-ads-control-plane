@@ -14,6 +14,7 @@ import {
   assertCreatorCapMinor,
   assertCreatorPolicyClient,
   assertCreatorWebPolicyClient,
+  BUBPA_SHOP189_CREATOR_POLICY_CLIENT,
   CREATOR_CAP_TTL_MS,
   CREATOR_POLICY_DEFAULTS,
   creatorCapChangeNonce,
@@ -37,6 +38,12 @@ const MAX_WEBHOOK_LEASE_MS = 15 * 60_000;
 const CREATOR_PREVIEW_KEY = /^cbp_[a-f0-9]{64}$/;
 const CREATOR_PREVIEW_RETENTION_MS = 7 * 24 * 60 * 60_000;
 const CREATOR_WEB_LEASE_MS = 60_000;
+const CREATOR_WEB_CAMPAIGN_ID = /^[1-9][0-9]{9,24}$/;
+const CREATOR_WEB_HELD_INDEX = 'creator_web_policy_one_held_lease';
+const CREATOR_WEB_HELD_INDEX_V1 = `CREATE UNIQUE INDEX ${CREATOR_WEB_HELD_INDEX}
+  ON creator_web_policy_leases(client_id) WHERE outcome IS NULL OR outcome = 'OUTCOME_UNKNOWN'`;
+const CREATOR_WEB_HELD_INDEX_V2 = `CREATE UNIQUE INDEX ${CREATOR_WEB_HELD_INDEX}
+  ON creator_web_policy_leases(client_id) WHERE (outcome IS NULL OR outcome = 'OUTCOME_UNKNOWN') AND quarantined_by_recovery_id IS NULL`;
 const CREATOR_WEB_OPERATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 const validCreatorWebOperationId = (value) => typeof value === 'string' && value.length === 36 && CREATOR_WEB_OPERATION_ID.test(value);
 const CREATOR_WEB_OUTCOMES = new Set(['NOT_SENT', 'PROVIDER_REJECTED', 'APPLIED_VERIFIED', 'OUTCOME_UNKNOWN']);
@@ -583,9 +590,6 @@ export class SqliteStore {
         FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
       ) STRICT;
 
-      CREATE UNIQUE INDEX IF NOT EXISTS creator_web_policy_one_held_lease
-        ON creator_web_policy_leases(client_id) WHERE outcome IS NULL OR outcome = 'OUTCOME_UNKNOWN';
-
       CREATE TABLE IF NOT EXISTS creator_web_line_notices (
         operation_id TEXT PRIMARY KEY,
         client_id TEXT NOT NULL,
@@ -714,6 +718,7 @@ export class SqliteStore {
     // Existing pending or accepted deliveries are exact and retain their
     // immutable contents and retry key. Lock discovery + addition together.
     this.#migrateCreatorWebAutoLineRounding();
+    this.#migrateCreatorWebUnknownRecovery();
     // The first LINE-controls build created coupon_schedules without its
     // control-request link. Adding a nullable referenced column is safe for
     // those intermediate databases, while fresh databases receive the same
@@ -820,6 +825,97 @@ export class SqliteStore {
       this.db.exec(`DROP TABLE ${CREATOR_WEB_AUTO_LINE_TABLE};
         ALTER TABLE ${CREATOR_WEB_AUTO_LINE_MIGRATION_TABLE} RENAME TO ${CREATOR_WEB_AUTO_LINE_TABLE};
         ${CREATOR_WEB_AUTO_LINE_PENDING_SQL}`);
+    });
+  }
+
+  #migrateCreatorWebUnknownRecovery() {
+    this.#transaction(() => {
+      const normalize = value => value.replace(/\bIF NOT EXISTS\s+/ig, '').replace(/\s+/g, ' ').trim();
+      const index = this.db.prepare('SELECT tbl_name,sql FROM sqlite_schema WHERE type=? AND name=?').get('index', CREATOR_WEB_HELD_INDEX);
+      if (index && (index.tbl_name !== 'creator_web_policy_leases' || ![CREATOR_WEB_HELD_INDEX_V1, CREATOR_WEB_HELD_INDEX_V2]
+        .some(sql => normalize(sql) === normalize(index.sql)))) throw new Error('Unrecognized Creator policy lease fence schema');
+      this.db.exec(`CREATE TABLE IF NOT EXISTS creator_web_unknown_recoveries (
+        recovery_id TEXT PRIMARY KEY,
+        client_id TEXT NOT NULL CHECK(client_id='${BUBPA_SHOP189_CREATOR_POLICY_CLIENT}'),
+        old_operation_id TEXT NOT NULL UNIQUE,
+        old_campaign_id TEXT NOT NULL,
+        new_campaign_id TEXT NOT NULL CHECK(new_campaign_id<>old_campaign_id),
+        policy_revision INTEGER NOT NULL CHECK(policy_revision>0),
+        operator_user_id INTEGER NOT NULL CHECK(operator_user_id>0),
+        acknowledged_unknown INTEGER NOT NULL CHECK(acknowledged_unknown=1),
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(old_operation_id) REFERENCES creator_web_policy_leases(operation_id),
+        FOREIGN KEY(client_id) REFERENCES creator_auto_policies(client_id)
+      ) STRICT;`);
+      this.#ensureColumn('creator_web_policy_leases', 'quarantined_by_recovery_id', 'TEXT REFERENCES creator_web_unknown_recoveries(recovery_id)');
+      this.#ensureColumn('creator_web_policy_leases', 'campaign_id', 'TEXT');
+      const columns = this.db.prepare('PRAGMA table_info(creator_web_policy_leases)').all();
+      const references = this.db.prepare('PRAGMA foreign_key_list(creator_web_policy_leases)').all();
+      if (!['quarantined_by_recovery_id', 'campaign_id'].every(name => columns.some(column => column.name === name && column.type === 'TEXT'
+        && column.notnull === 0 && column.dflt_value === null)) || !references.some(key => key.from === 'quarantined_by_recovery_id'
+          && key.table === 'creator_web_unknown_recoveries' && key.to === 'recovery_id')) throw new Error('Unrecognized Creator UNKNOWN annotation schema');
+      if (!index || normalize(index.sql) !== normalize(CREATOR_WEB_HELD_INDEX_V2)) {
+        this.db.exec(`DROP INDEX IF EXISTS ${CREATOR_WEB_HELD_INDEX}; ${CREATOR_WEB_HELD_INDEX_V2};`);
+      }
+      this.db.exec(`
+        CREATE TRIGGER IF NOT EXISTS creator_web_recovery_valid_insert BEFORE INSERT ON creator_web_unknown_recoveries BEGIN
+          SELECT CASE WHEN NOT EXISTS(SELECT 1 FROM creator_web_policy_leases l JOIN creator_auto_policies p ON p.client_id=l.client_id
+            WHERE l.operation_id=NEW.old_operation_id AND l.client_id=NEW.client_id AND l.outcome='OUTCOME_UNKNOWN'
+              AND l.quarantined_by_recovery_id IS NULL AND l.policy_revision=NEW.policy_revision AND p.revision=NEW.policy_revision
+              AND NEW.created_at>=l.outcome_at AND NEW.created_at>=p.updated_at)
+            THEN RAISE(ABORT,'Invalid Creator UNKNOWN quarantine proof') END;
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_recovery_immutable_update BEFORE UPDATE ON creator_web_unknown_recoveries BEGIN
+          SELECT RAISE(ABORT,'Creator UNKNOWN recovery audit is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_recovery_immutable_delete BEFORE DELETE ON creator_web_unknown_recoveries BEGIN
+          SELECT RAISE(ABORT,'Creator UNKNOWN recovery audit is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_quarantine_valid_annotation BEFORE UPDATE OF quarantined_by_recovery_id ON creator_web_policy_leases
+        WHEN NEW.quarantined_by_recovery_id IS NOT NULL BEGIN
+          SELECT CASE WHEN OLD.quarantined_by_recovery_id IS NOT NULL OR OLD.outcome<>'OUTCOME_UNKNOWN'
+            OR NEW.operation_id<>OLD.operation_id OR NEW.client_id<>OLD.client_id OR NEW.outcome IS NOT OLD.outcome
+            OR NEW.policy_revision<>OLD.policy_revision OR NEW.acquired_at<>OLD.acquired_at OR NEW.expires_at<>OLD.expires_at
+            OR NEW.outcome_at IS NOT OLD.outcome_at OR NEW.campaign_id IS NOT OLD.campaign_id
+            OR NOT EXISTS(SELECT 1 FROM creator_web_unknown_recoveries r WHERE r.recovery_id=NEW.quarantined_by_recovery_id
+              AND r.old_operation_id=OLD.operation_id AND r.client_id=OLD.client_id AND r.policy_revision=OLD.policy_revision)
+            THEN RAISE(ABORT,'Invalid Creator UNKNOWN quarantine annotation') END;
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_quarantine_no_insert BEFORE INSERT ON creator_web_policy_leases
+        WHEN NEW.quarantined_by_recovery_id IS NOT NULL BEGIN
+          SELECT RAISE(ABORT,'Creator UNKNOWN quarantine requires an existing lease');
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_lease_identity_immutable BEFORE UPDATE ON creator_web_policy_leases
+        WHEN NEW.operation_id IS NOT OLD.operation_id OR NEW.client_id IS NOT OLD.client_id OR NEW.policy_revision IS NOT OLD.policy_revision
+          OR NEW.acquired_at IS NOT OLD.acquired_at OR NEW.expires_at IS NOT OLD.expires_at OR NEW.campaign_id IS NOT OLD.campaign_id BEGIN
+          SELECT RAISE(ABORT,'Creator policy lease identity is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_quarantine_lease_update BEFORE UPDATE ON creator_web_policy_leases
+        WHEN OLD.quarantined_by_recovery_id IS NOT NULL BEGIN
+          SELECT RAISE(ABORT,'Quarantined Creator lease is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_quarantine_lease_delete BEFORE DELETE ON creator_web_policy_leases
+        WHEN OLD.quarantined_by_recovery_id IS NOT NULL BEGIN
+          SELECT RAISE(ABORT,'Quarantined Creator lease is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_quarantine_outbox_update BEFORE UPDATE ON creator_web_auto_line_deliveries
+        WHEN EXISTS(SELECT 1 FROM creator_web_policy_leases l WHERE l.operation_id=OLD.operation_id AND l.quarantined_by_recovery_id IS NOT NULL) BEGIN
+          SELECT RAISE(ABORT,'Quarantined Creator Auto proof is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_quarantine_outbox_delete BEFORE DELETE ON creator_web_auto_line_deliveries
+        WHEN EXISTS(SELECT 1 FROM creator_web_policy_leases l WHERE l.operation_id=OLD.operation_id AND l.quarantined_by_recovery_id IS NOT NULL) BEGIN
+          SELECT RAISE(ABORT,'Quarantined Creator Auto proof is immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS creator_web_recovery_campaign_insert BEFORE INSERT ON creator_web_policy_leases
+        WHEN EXISTS(SELECT 1 FROM creator_web_unknown_recoveries r JOIN creator_web_policy_leases l ON l.quarantined_by_recovery_id=r.recovery_id
+          WHERE r.client_id=NEW.client_id) BEGIN
+          SELECT CASE WHEN NEW.campaign_id IS NOT (SELECT r.new_campaign_id FROM creator_web_unknown_recoveries r
+            JOIN creator_web_policy_leases l ON l.quarantined_by_recovery_id=r.recovery_id WHERE r.client_id=NEW.client_id
+            ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1) THEN RAISE(ABORT,'Creator recovery campaign is restricted') END;
+        END;
+      `);
+      if (this.db.prepare('PRAGMA foreign_key_check(creator_web_unknown_recoveries)').get() ||
+        this.db.prepare('PRAGMA foreign_key_check(creator_web_policy_leases)').get()) throw new Error('Creator UNKNOWN recovery foreign key proof failed');
     });
   }
 
@@ -4690,7 +4786,7 @@ export class SqliteStore {
   #getHeldCreatorWebLease(clientId) {
     return this.db.prepare(`
       SELECT operation_id FROM creator_web_policy_leases
-      WHERE client_id = ? AND (outcome IS NULL OR outcome = 'OUTCOME_UNKNOWN')
+      WHERE client_id = ? AND quarantined_by_recovery_id IS NULL AND (outcome IS NULL OR outcome = 'OUTCOME_UNKNOWN')
     `).get(clientId);
   }
 
@@ -4699,11 +4795,66 @@ export class SqliteStore {
     const row = this.db.prepare(`
       SELECT p.*,
         (EXISTS(SELECT 1 FROM creator_web_policy_leases l
-          WHERE l.client_id = p.client_id AND (l.outcome IS NULL OR l.outcome = 'OUTCOME_UNKNOWN'))
+          WHERE l.client_id = p.client_id AND l.quarantined_by_recovery_id IS NULL AND (l.outcome IS NULL OR l.outcome = 'OUTCOME_UNKNOWN'))
          OR EXISTS(SELECT 1 FROM creator_budget_tests t WHERE t.client_id = p.client_id AND t.lock_held = 1)) AS policy_locked
       FROM creator_auto_policies p WHERE p.client_id = ?
     `).get(clientId);
-    return row ? { policy: this.#mapCreatorPolicy(row), locked: row.policy_locked === 1 } : null;
+    if (!row) return null;
+    const recovery = this.db.prepare(`SELECT r.recovery_id,r.new_campaign_id FROM creator_web_unknown_recoveries r
+      JOIN creator_web_policy_leases l ON l.quarantined_by_recovery_id=r.recovery_id WHERE r.client_id=?
+      ORDER BY r.created_at DESC,r.rowid DESC LIMIT 1`).get(clientId);
+    return { policy: this.#mapCreatorPolicy(row), locked: row.policy_locked === 1,
+      ...(recovery ? { writeCampaignId: recovery.new_campaign_id, recoveryId: recovery.recovery_id } : {}) };
+  }
+
+  recoverCreatorWebUnknownLease({ clientId, recoveryId, operatorUserId, oldOperationId, oldCampaignId, newCampaignId,
+    revision, acknowledgedUnknown, now } = {}) {
+    if (clientId !== BUBPA_SHOP189_CREATOR_POLICY_CLIENT || !validCreatorWebOperationId(recoveryId) ||
+      !validCreatorWebOperationId(oldOperationId) || typeof oldCampaignId !== 'string' || typeof newCampaignId !== 'string' ||
+      !CREATOR_WEB_CAMPAIGN_ID.test(oldCampaignId) || !CREATOR_WEB_CAMPAIGN_ID.test(newCampaignId) ||
+      oldCampaignId === newCampaignId || acknowledgedUnknown !== true) throw new DomainError('INVALID_REQUEST', 'Invalid Creator UNKNOWN recovery proof');
+    positiveInteger(operatorUserId, 'operatorUserId');
+    positiveInteger(revision, 'revision');
+    const at = requiredIsoTime(now, 'now');
+    return this.#transaction(() => {
+      const existing = this.db.prepare('SELECT * FROM creator_web_unknown_recoveries WHERE recovery_id=? OR old_operation_id=?')
+        .all(recoveryId, oldOperationId);
+      const receipt = () => ({ clientId, recoveryId, oldOperationId, oldCampaignId, newCampaignId, status: 'QUARANTINED',
+        historicalOutcome: 'OUTCOME_UNKNOWN', locked: this.getCreatorWebPolicyState({ clientId }).locked });
+      if (existing.length) {
+        const row = existing[0];
+        const lease = this.db.prepare('SELECT quarantined_by_recovery_id FROM creator_web_policy_leases WHERE operation_id=?').get(oldOperationId);
+        if (existing.length !== 1 || row.recovery_id !== recoveryId || row.client_id !== clientId || row.old_operation_id !== oldOperationId ||
+          row.old_campaign_id !== oldCampaignId || row.new_campaign_id !== newCampaignId || row.policy_revision !== revision ||
+          row.operator_user_id !== operatorUserId || row.acknowledged_unknown !== 1 || lease?.quarantined_by_recovery_id !== recoveryId) {
+          throw new DomainError('CREATOR_WEB_RECOVERY_CONFLICT', 'Creator UNKNOWN recovery cannot be overwritten');
+        }
+        return receipt();
+      }
+      const state = this.getCreatorWebPolicyState({ clientId });
+      const lease = this.db.prepare('SELECT * FROM creator_web_policy_leases WHERE operation_id=? AND client_id=?').get(oldOperationId, clientId);
+      const proof = this.db.prepare('SELECT state FROM creator_web_auto_line_deliveries WHERE operation_id=? AND client_id=?').get(oldOperationId, clientId);
+      const held = this.#getHeldCreatorWebLease(clientId);
+      const priorRecovery = state?.recoveryId ? this.db.prepare('SELECT created_at FROM creator_web_unknown_recoveries WHERE recovery_id=?').get(state.recoveryId) : null;
+      if (!state || state.policy.revision !== revision || !lease || lease.policy_revision !== revision || lease.outcome !== 'OUTCOME_UNKNOWN' ||
+        lease.quarantined_by_recovery_id !== null || proof?.state !== 'RESERVED' || held?.operation_id !== oldOperationId ||
+        this.db.prepare('SELECT 1 FROM creator_budget_tests WHERE client_id=? AND lock_held=1').get(clientId) ||
+        at < lease.outcome_at || at < state.policy.updatedAt ||
+        (state.writeCampaignId && (state.writeCampaignId !== oldCampaignId || lease.campaign_id !== oldCampaignId || !priorRecovery || at < priorRecovery.created_at))) {
+        throw new DomainError('CREATOR_WEB_RECOVERY_CONFLICT', 'Creator UNKNOWN recovery evidence is stale or unavailable');
+      }
+      this.db.prepare(`INSERT INTO creator_web_unknown_recoveries
+        (recovery_id,client_id,old_operation_id,old_campaign_id,new_campaign_id,policy_revision,operator_user_id,acknowledged_unknown,created_at)
+        VALUES (?,?,?,?,?,?,?,1,?)`).run(recoveryId, clientId, oldOperationId, oldCampaignId, newCampaignId, revision, operatorUserId, at);
+      const changed = this.db.prepare(`UPDATE creator_web_policy_leases SET quarantined_by_recovery_id=?
+        WHERE operation_id=? AND client_id=? AND policy_revision=? AND outcome='OUTCOME_UNKNOWN' AND quarantined_by_recovery_id IS NULL`)
+        .run(recoveryId, oldOperationId, clientId, revision);
+      if (changed.changes !== 1) throw new DomainError('CREATOR_WEB_RECOVERY_CONFLICT', 'Creator UNKNOWN recovery changed concurrently');
+      this.#insertAudit({ eventType: 'CREATOR_WEB_UNKNOWN_QUARANTINED', actorType: 'WEB_USER', actorId: String(operatorUserId), occurredAt: at,
+        details: { clientId, recoveryId, oldOperationId, oldCampaignId, newCampaignId, policyRevision: revision, historicalOutcome: 'OUTCOME_UNKNOWN',
+          acknowledgedUnknown: true, noBudgetChange: true, noSuccessNotice: true } });
+      return receipt();
+    });
   }
 
   updateCreatorWebCap({ clientId = CREATOR_POLICY_DEFAULTS.clientId, revision, capMinor, actorUserId, now } = {}) {
@@ -4753,7 +4904,7 @@ export class SqliteStore {
   }
 
   acquireCreatorWebPolicyLease({ clientId = CREATOR_POLICY_DEFAULTS.clientId, operationId, revision, now,
-    autoBudget, lineRecipientUserId } = {}) {
+    autoBudget, lineRecipientUserId, campaignId } = {}) {
     assertCreatorWebPolicyClient(clientId);
     if (!validCreatorWebOperationId(operationId)) {
       throw new DomainError('INVALID_REQUEST', 'operationId must be a canonical UUID');
@@ -4765,10 +4916,16 @@ export class SqliteStore {
     positiveInteger(revision, 'revision');
     const at = requiredIsoTime(now, 'now');
     return this.#transaction(() => {
+      const existing = this.db.prepare('SELECT * FROM creator_web_policy_leases WHERE operation_id = ?').get(operationId);
+      if (existing?.quarantined_by_recovery_id) throw new DomainError('CREATOR_WEB_LEASE_QUARANTINED', 'Creator UNKNOWN operation was quarantined and cannot be retried');
       const state = this.getCreatorWebPolicyState({ clientId });
+      if (state?.writeCampaignId ? campaignId !== state.writeCampaignId : campaignId !== undefined) {
+        throw new DomainError('CREATOR_WEB_CAMPAIGN_RESTRICTED', 'Creator recovery only permits the explicitly verified replacement campaign');
+      }
       const policy = state?.policy;
+      const recoveryAt = state?.recoveryId ? this.db.prepare('SELECT created_at FROM creator_web_unknown_recoveries WHERE recovery_id=?').get(state.recoveryId)?.created_at : null;
       if (!policy || policy.revision !== revision || policy.mode !== CREATOR_POLICY_DEFAULTS.mode
-        || policy.executionEnabled !== false || at < policy.updatedAt) {
+        || policy.executionEnabled !== false || at < policy.updatedAt || (state.recoveryId && (!recoveryAt || at < recoveryAt))) {
         throw new DomainError('CREATOR_WEB_POLICY_CHANGED', 'Creator web policy changed or unavailable');
       }
       if (auto) {
@@ -4781,10 +4938,10 @@ export class SqliteStore {
           throw new DomainError('CREATOR_WEB_POLICY_CHANGED', 'Creator automation target exceeds the cap');
         }
       }
-      const existing = this.db.prepare('SELECT * FROM creator_web_policy_leases WHERE operation_id = ?').get(operationId);
       if (existing) {
         const delivery = this.db.prepare('SELECT * FROM creator_web_auto_line_deliveries WHERE operation_id = ?').get(operationId);
-        if (existing.client_id !== clientId || existing.policy_revision !== revision || existing.outcome !== null || at < existing.acquired_at) {
+        if (existing.client_id !== clientId || existing.policy_revision !== revision || existing.outcome !== null || at < existing.acquired_at ||
+          existing.campaign_id !== (campaignId ?? null)) {
           throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator web lease cannot be acquired again');
         }
         if (Boolean(delivery) !== Boolean(auto) || (auto && (delivery.client_id !== clientId || delivery.state !== 'RESERVED' ||
@@ -4793,16 +4950,16 @@ export class SqliteStore {
           throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator automation proof cannot be overwritten');
         }
         if (at >= existing.expires_at) throw new DomainError('CREATOR_WEB_LEASE_EXPIRED', 'Creator web lease has expired');
-        return { policy, locked: true, operationId, expiresAt: existing.expires_at };
+        return { ...state, policy, locked: true, operationId, expiresAt: existing.expires_at };
       }
       if (state.locked) {
         throw new DomainError('CREATOR_WEB_POLICY_LOCKED', 'Another Creator budget operation holds the policy');
       }
       const expiresAt = new Date(Date.parse(at) + CREATOR_WEB_LEASE_MS).toISOString();
       this.db.prepare(`
-        INSERT INTO creator_web_policy_leases (operation_id, client_id, policy_revision, acquired_at, expires_at)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(operationId, clientId, revision, at, expiresAt);
+        INSERT INTO creator_web_policy_leases (operation_id, client_id, policy_revision, acquired_at, expires_at, campaign_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(operationId, clientId, revision, at, expiresAt, campaignId ?? null);
       if (auto) {
         this.db.prepare(`
           INSERT INTO creator_web_auto_line_deliveries (operation_id, client_id, recipient_user_id, previous_budget_minor,
@@ -4814,7 +4971,7 @@ export class SqliteStore {
       this.#insertAudit({ eventType: 'CREATOR_WEB_POLICY_LEASE_ACQUIRED', actorType: 'SYSTEM', occurredAt: at,
         details: { clientId, operationId, policyRevision: revision, expiresAt, ...(auto ? { source: 'AUTO_BUDGET' } : {}),
           ...(auto?.rounding ? { rounding: auto.rounding } : {}) } });
-      return { policy, locked: true, operationId, expiresAt };
+      return { ...state, policy, locked: true, operationId, expiresAt };
     });
   }
 
@@ -4829,6 +4986,7 @@ export class SqliteStore {
         SELECT * FROM creator_web_policy_leases WHERE operation_id = ? AND client_id = ?
       `).get(operationId, clientId);
       if (!existing) throw new DomainError('CREATOR_WEB_LEASE_NOT_FOUND', 'Creator web lease not found');
+      if (existing.quarantined_by_recovery_id) throw new DomainError('CREATOR_WEB_LEASE_QUARANTINED', 'Creator UNKNOWN operation was quarantined and remains unresolved');
       if (at < existing.acquired_at || (existing.outcome_at !== null && at < existing.outcome_at)) {
         throw new DomainError('CREATOR_WEB_LEASE_CONFLICT', 'Creator web lease outcome time is invalid');
       }
